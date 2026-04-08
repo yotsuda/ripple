@@ -11,11 +11,13 @@ public class ShellTools
     [Description("Open a visible terminal window. The user can see and type in this terminal. AI commands sent via execute_command will also appear here. If a standby console of the requested shell exists, it will be reused unless reason is provided. Multiple shell types can be active simultaneously.")]
     public static async Task<string> StartConsole(
         ConsoleManager consoleManager,
-        [Description("Shell to use. Name (bash, pwsh, zsh) or full path. Default: platform default.")]
+        [Description("Shell to use. Name (bash, pwsh, zsh, cmd) or full path. Default: platform default.")]
         string? shell = null,
         [Description("Working directory. Default: home directory.")]
         string? cwd = null,
-        [Description("Forces a new console launch instead of reusing an existing standby. Omit to reuse.")]
+        [Description("Banner message displayed in the console (green text). Shown on both new and reused consoles.")]
+        string? banner = null,
+        [Description("Do NOT specify this parameter unless explicitly needed. Forces a new console launch instead of reusing an existing standby. The reason text is displayed in the console as yellow text.")]
         string? reason = null,
         [Description("Set true for sub-agent isolation. Returns an agent_id for subsequent calls.")]
         bool is_subagent = false,
@@ -31,12 +33,10 @@ public class ShellTools
             return $"Sub-agent allocated: {newId}. Use this agent_id in subsequent calls.";
         }
 
-        var result = await consoleManager.StartConsoleAsync(shell, cwd, reason, agentId);
-        var status = result.Status == "reused"
-            ? $"Reusing standby console {result.DisplayName}."
-            : $"Console {result.DisplayName} opened.";
-
-        return status;
+        var result = await consoleManager.StartConsoleAsync(shell, cwd, reason, agentId, banner);
+        if (result.Status == "reused")
+            return $"Reusing standby console {result.DisplayName}. Did not launch a new console. To force a new console, provide the reason parameter.";
+        return $"Console {result.DisplayName} opened.";
     }
 
     [McpServerTool]

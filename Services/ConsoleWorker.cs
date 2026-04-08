@@ -45,13 +45,17 @@ public class ConsoleWorker
     /// </summary>
     private string Status => _tracker.Busy ? "busy" : (_tracker.HasCachedOutput ? "completed" : "standby");
 
-    public ConsoleWorker(string pipeName, int proxyPid, string shell, string cwd)
+    private readonly string? _banner;
+    private readonly string? _reason;
+
+    public ConsoleWorker(string pipeName, int proxyPid, string shell, string cwd, string? banner = null, string? reason = null)
     {
         _pipeName = pipeName;
         _proxyPid = proxyPid;
         _shell = shell;
         _cwd = cwd;
-        // Unowned pipe name is constructed lazily — uses our own PID
+        _banner = banner;
+        _reason = reason;
         _unownedPipeName = $"{ConsoleManager.PipePrefix}.{Environment.ProcessId}";
     }
 
@@ -68,6 +72,10 @@ public class ConsoleWorker
         // interprets ANSI/VT escape sequences (cursor movement, clear-to-EOL,
         // colors) emitted by the shell instead of writing them as literal chars.
         EnableVirtualTerminalOutput();
+
+        // Display banner/reason immediately, before the shell starts.
+        // This ensures the banner is the first thing visible in the console.
+        WriteBanner();
 
         // Prepare shell integration script BEFORE launching the shell.
         // For pwsh, we pass it via -NoExit -Command so it doesn't echo in the console.
@@ -90,14 +98,23 @@ public class ConsoleWorker
 
         // Wait for shell to fully start (profile + injection via -Command).
         await WaitForOutputSettled(ct);
-        // Shell-specific Enter key: pwsh needs \r, bash/zsh need \n
-        var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
+        // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
+        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
 
         if (shellName is "pwsh" or "powershell")
         {
             // pwsh: injection done via -Command in BuildCommandLine.
             // Kick an Enter to trigger the first prompt + OSC markers.
             await WriteToPty(enter, ct);
+        }
+        else if (shellName is "cmd")
+        {
+            // cmd.exe: inject OSC markers via PROMPT environment variable.
+            // $E = ESC, $E\ = ST (String Terminator), $P = current directory, $G = >
+            _mirrorVisible = false;
+            var prompt = @"prompt $E]633;P;Cwd=$P$E\$E]633;A$E\$P$G$S";
+            await WriteToPty(prompt + enter, ct);
+            await Task.Delay(500, ct);
         }
         else
         {
@@ -208,6 +225,10 @@ public class ConsoleWorker
                 return $"\"{_shell}\" -NoExit -Command \"{cmd}\"";
             }
         }
+
+        // cmd.exe: start with /q (quiet echo off) — integration injected via PROMPT in RunAsync
+        if (shellName is "cmd")
+            return $"\"{_shell}\" /q";
 
         // bash: use --login -i to load profiles normally; integration is injected
         // later via PTY input by InjectShellIntegration().
@@ -474,7 +495,8 @@ public class ConsoleWorker
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
                 var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-                bool needsTranslation = shellName is not "pwsh" and not "powershell";
+                // pwsh and cmd.exe understand win32-input-mode natively; only Unix shells need translation
+                bool needsTranslation = shellName is not "pwsh" and not "powershell" and not "cmd";
 
                 var charBuf = new char[256];
                 var pending = needsTranslation ? new StringBuilder() : null;
@@ -777,6 +799,7 @@ public class ConsoleWorker
             "get_status" => SerializeResponse(new { status = Status, hasCachedOutput = _tracker.HasCachedOutput, shellFamily = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant() }),
             "get_cached_output" => HandleGetCachedOutput(),
             "set_title" => HandleSetTitle(request),
+            "display_banner" => HandleDisplayBanner(request),
             "claim" => HandleClaim(request),
             "ping" => SerializeResponse(new { status = "ok" }),
             _ => SerializeResponse(new { error = $"Unknown request type: {type}" }),
@@ -794,7 +817,7 @@ public class ConsoleWorker
         // Write command to PTY
         // Shell-specific Enter: pwsh → \r, bash/zsh → \n
         var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
-        var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
+        var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
         await WriteToPty(command + enter, ct);
 
         try
@@ -844,6 +867,50 @@ public class ConsoleWorker
         var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
         if (title != null)
             Console.Title = title;
+        return SerializeResponse(new { status = "ok" });
+    }
+
+    /// <summary>
+    /// Write banner/reason text directly to the visible console at startup.
+    /// Called from RunAsync before the first prompt is drawn.
+    /// </summary>
+    private void WriteBanner()
+    {
+        WriteBannerText(_banner, _reason);
+    }
+
+    /// <summary>
+    /// Write banner and/or reason text directly to the visible console.
+    /// Uses ANSI colors: banner in green, reason in dark yellow.
+    /// Shell-agnostic — writes to worker's stdout, not through the shell.
+    /// </summary>
+    private void WriteBannerText(string? banner, string? reason)
+    {
+        var sb = new StringBuilder();
+
+        if (!string.IsNullOrEmpty(banner))
+            sb.Append($"\x1b[32m{banner}\x1b[0m\r\n");
+
+        if (!string.IsNullOrEmpty(reason))
+        {
+            if (sb.Length > 0) sb.Append("\r\n");
+            sb.Append($"\x1b[33mReason: {reason}\x1b[0m\r\n");
+        }
+
+        if (sb.Length > 0)
+        {
+            _stdoutStream ??= Console.OpenStandardOutput();
+            var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+            _stdoutStream.Write(bytes, 0, bytes.Length);
+            _stdoutStream.Flush();
+        }
+    }
+
+    private JsonElement HandleDisplayBanner(JsonElement request)
+    {
+        var banner = request.TryGetProperty("banner", out var bp) ? bp.GetString() : null;
+        var reason = request.TryGetProperty("reason", out var rp) ? rp.GetString() : null;
+        WriteBannerText(banner, reason);
         return SerializeResponse(new { status = "ok" });
     }
 
@@ -927,7 +994,7 @@ public class ConsoleWorker
 
     public static async Task<int> RunConsoleMode(string[] args)
     {
-        string? proxyPid = null, agentId = null, shell = null, cwd = null;
+        string? proxyPid = null, agentId = null, shell = null, cwd = null, banner = null, reason = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -937,6 +1004,8 @@ public class ConsoleWorker
                 case "--agent-id" when i + 1 < args.Length: agentId = args[++i]; break;
                 case "--shell" when i + 1 < args.Length: shell = args[++i]; break;
                 case "--cwd" when i + 1 < args.Length: cwd = args[++i]; break;
+                case "--banner" when i + 1 < args.Length: banner = args[++i]; break;
+                case "--reason" when i + 1 < args.Length: reason = args[++i]; break;
             }
         }
 
@@ -954,7 +1023,7 @@ public class ConsoleWorker
 
         Log($"PID={ownPid} Pipe={pipeName} Shell={shell} Cwd={cwd}");
 
-        var worker = new ConsoleWorker(pipeName, int.Parse(proxyPid), shell, cwd);
+        var worker = new ConsoleWorker(pipeName, int.Parse(proxyPid), shell, cwd, banner, reason);
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 

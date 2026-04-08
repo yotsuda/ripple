@@ -130,14 +130,14 @@ public class ConsoleManager
     /// Start or reuse a console. Enforces single-shell-type per session.
     /// Serialized via _toolLock to prevent concurrent state mutations.
     /// </summary>
-    public async Task<StartConsoleResult> StartConsoleAsync(string? shell, string? cwd, string? reason, string agentId = "default")
+    public async Task<StartConsoleResult> StartConsoleAsync(string? shell, string? cwd, string? reason, string agentId = "default", string? banner = null)
     {
         await _toolLock.WaitAsync();
-        try { return await StartConsoleInnerAsync(shell, cwd, reason, agentId); }
+        try { return await StartConsoleInnerAsync(shell, cwd, reason, agentId, banner); }
         finally { _toolLock.Release(); }
     }
 
-    private async Task<StartConsoleResult> StartConsoleInnerAsync(string? shell, string? cwd, string? reason, string agentId)
+    private async Task<StartConsoleResult> StartConsoleInnerAsync(string? shell, string? cwd, string? reason, string agentId, string? banner = null)
     {
         var resolvedShell = shell ?? GetDefaultShell();
         var shellFamily = NormalizeShellFamily(resolvedShell);
@@ -149,12 +149,22 @@ public class ConsoleManager
             if (standby != null)
             {
                 lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
+
+                // Display banner on reused console via pipe
+                if (!string.IsNullOrEmpty(banner) || !string.IsNullOrEmpty(reason))
+                {
+                    var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
+                    if (reusePipe != null)
+                        try { await SendPipeRequestAsync(reusePipe, new { type = "display_banner", banner, reason }, TimeSpan.FromSeconds(3)); } catch { }
+                }
+
                 return new StartConsoleResult("reused", standby.Value.Pid, standby.Value.DisplayName);
             }
         }
 
         // Launch shellpilot.exe --console mode with ConPTY.
-        int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, resolvedShell, cwd);
+        // Banner/reason passed as CLI args so the worker can display them before the first prompt.
+        int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, resolvedShell, cwd, banner, reason);
 
         var displayName = AssignConsoleName(pid);
         var pipeName = GetPipeName(agentId, pid);
@@ -329,6 +339,28 @@ public class ConsoleManager
         await ReadExactAsync(client, recvBytes, cts.Token);
 
         return JsonSerializer.Deserialize<JsonElement>(recvBytes);
+    }
+
+    /// <summary>
+    /// Display banner and/or reason text in a console's visible window.
+    /// Writes directly to the worker's stdout via pipe command (shell-agnostic).
+    /// </summary>
+    public async Task DisplayBannerAsync(int consolePid, string? banner, string? reason)
+    {
+        string? pipeName;
+        lock (_lock) pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath;
+        if (pipeName == null) return;
+
+        try
+        {
+            await SendPipeRequestAsync(pipeName, new
+            {
+                type = "display_banner",
+                banner,
+                reason
+            }, TimeSpan.FromSeconds(3));
+        }
+        catch { /* best-effort */ }
     }
 
     private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)

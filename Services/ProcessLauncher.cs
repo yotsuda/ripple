@@ -76,18 +76,22 @@ public class ProcessLauncher
     /// The worker constructs its pipe name as SP.{proxyPid}.{agentId}.{ownPid},
     /// matching the name the proxy constructs from the returned PID (same as PowerShell.MCP pattern).
     /// </summary>
-    public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null)
+    public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null, string? banner = null, string? reason = null)
     {
-        // Find our own executable path
         var exePath = Process.GetCurrentProcess().MainModule?.FileName
             ?? throw new InvalidOperationException("Cannot determine shellpilot executable path");
 
         var cwd = workingDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
+        var args = $"--console --proxy-pid {proxyPid} --agent-id {agentId} --shell \"{shell}\" --cwd \"{cwd}\"";
+        if (!string.IsNullOrEmpty(banner))
+            args += $" --banner \"{banner.Replace("\"", "\\\"")}\"";
+        if (!string.IsNullOrEmpty(reason))
+            args += $" --reason \"{reason.Replace("\"", "\\\"")}\"";
+
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var commandLine = $"\"{exePath}\" --console --proxy-pid {proxyPid} --agent-id {agentId} --shell \"{shell}\" --cwd \"{cwd}\"";
-            return LaunchWithCleanEnvironment(commandLine, cwd);
+            return LaunchWithCleanEnvironment($"\"{exePath}\" {args}", cwd);
         }
         else
         {
