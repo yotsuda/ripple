@@ -5,8 +5,10 @@ using System.Runtime.InteropServices;
 namespace ShellPilot.Services;
 
 /// <summary>
-/// Launches console processes with clean environment using Win32 APIs.
-/// Equivalent to PowerShell.MCP's PwshLauncherWindows.
+/// Launches shellpilot console worker processes with clean environment.
+/// Uses Win32 CreateProcessW + CreateEnvironmentBlock (bInherit=false) to ensure
+/// the child process does NOT inherit the MCP server's environment variables.
+/// Equivalent to PowerShell.MCP's PwshLauncherWindows pattern.
 /// </summary>
 public class ProcessLauncher
 {
@@ -67,11 +69,73 @@ public class ProcessLauncher
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 
     /// <summary>
+    /// Launch a shellpilot console worker (--console mode) with clean environment.
+    /// The worker creates a PTY (ConPTY on Windows, forkpty on Linux/macOS),
+    /// launches the shell, and serves commands via Named Pipe.
+    ///
+    /// The worker constructs its pipe name as SP.{proxyPid}.{agentId}.{ownPid},
+    /// matching the name the proxy constructs from the returned PID (same as PowerShell.MCP pattern).
+    /// </summary>
+    public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null)
+    {
+        // Find our own executable path
+        var exePath = Process.GetCurrentProcess().MainModule?.FileName
+            ?? throw new InvalidOperationException("Cannot determine shellpilot executable path");
+
+        var cwd = workingDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var commandLine = $"\"{exePath}\" --console --proxy-pid {proxyPid} --agent-id {agentId} --shell \"{shell}\" --cwd \"{cwd}\"";
+            return LaunchWithCleanEnvironment(commandLine, cwd);
+        }
+        else
+        {
+            return LaunchConsoleWorkerUnix(exePath, proxyPid, agentId, shell, cwd);
+        }
+    }
+
+    /// <summary>
+    /// Launch console worker on Linux/macOS with clean environment.
+    /// Uses env -i to strip inherited environment, then login shell to restore user defaults.
+    /// </summary>
+    private static int LaunchConsoleWorkerUnix(string exePath, int proxyPid, string agentId, string shell, string cwd)
+    {
+        // Use setsid to detach from parent's terminal session
+        var psi = new ProcessStartInfo
+        {
+            FileName = "setsid",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = cwd,
+        };
+
+        // Get user's login shell for clean environment setup
+        var loginShell = Environment.GetEnvironmentVariable("SHELL") ?? "/bin/bash";
+
+        // setsid <loginShell> -l -c 'exec <exePath> --console ...'
+        // Login shell (-l) loads user's profile for clean PATH etc.
+        var workerCmd = $"exec \"{exePath}\" --console --proxy-pid {proxyPid} --agent-id {agentId} --shell \"{shell}\" --cwd \"{cwd}\"";
+
+        psi.ArgumentList.Add(loginShell);
+        psi.ArgumentList.Add("-l");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(workerCmd);
+
+        var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to launch console worker process");
+
+        var pid = process.Id;
+        process.Dispose();
+        return pid;
+    }
+
+    /// <summary>
     /// Launch a process with a clean environment block from the registry.
     /// The process gets its own console window and does NOT inherit
     /// the MCP server's environment variables.
     /// </summary>
-    public int LaunchWithCleanEnvironment(string commandLine, string? workingDirectory = null)
+    private int LaunchWithCleanEnvironment(string commandLine, string? workingDirectory = null)
     {
         IntPtr hToken = IntPtr.Zero;
         IntPtr env = IntPtr.Zero;

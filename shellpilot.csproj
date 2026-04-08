@@ -5,6 +5,7 @@
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>shellpilot</AssemblyName>
     <RootNamespace>ShellPilot</RootNamespace>
   </PropertyGroup>
@@ -12,6 +13,12 @@
   <ItemGroup>
     <PackageReference Include="ModelContextProtocol" Version="1.2.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="ShellIntegration\integration.bash" />
+    <EmbeddedResource Include="ShellIntegration\integration.ps1" />
+    <EmbeddedResource Include="ShellIntegration\integration.zsh" />
   </ItemGroup>
 
 </Project>

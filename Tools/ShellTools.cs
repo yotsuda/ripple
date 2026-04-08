@@ -78,7 +78,24 @@ public class ShellTools
         string? agent_id = null,
         CancellationToken cancellationToken = default)
     {
-        // TODO: Implement wait for completion with polling
-        return "No completed results. Consoles may still be busy — try again later.";
+        var agentId = agent_id ?? "default";
+        var results = await consoleManager.WaitForCompletionAsync(timeout_seconds, agentId);
+
+        if (results.Count == 0)
+            return "No completed results. Consoles may still be busy — try again later.";
+
+        var sb = new System.Text.StringBuilder();
+        foreach (var r in results)
+        {
+            var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
+            var statusLine = r.ExitCode == 0
+                ? $"✓ {r.DisplayName} | Status: Completed | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}"
+                : $"✗ {r.DisplayName} | Status: Failed (exit {r.ExitCode}) | Pipeline: {r.Command} | Duration: {r.Duration}s{cwdInfo}";
+            sb.AppendLine(statusLine);
+            sb.AppendLine();
+            sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
+            sb.AppendLine();
+        }
+        return sb.ToString().TrimEnd();
     }
 }
