@@ -33,8 +33,8 @@ public class ShellTools
 
         var result = await consoleManager.StartConsoleAsync(shell, cwd, reason, agentId);
         var status = result.Status == "reused"
-            ? $"Reusing standby console {result.DisplayName} (PID {result.Pid})."
-            : $"Console {result.DisplayName} opened (PID {result.Pid}).";
+            ? $"Reusing standby console {result.DisplayName}."
+            : $"Console {result.DisplayName} opened.";
 
         return status;
     }
