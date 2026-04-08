@@ -380,8 +380,11 @@ public class ConsoleWorker
                 //   - No ENABLE_PROCESSED_INPUT: Ctrl+C → \x03 (not signal)
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
+                var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+                bool needsTranslation = shellName is not "pwsh" and not "powershell";
+
                 var charBuf = new char[256];
-                var pending = new StringBuilder();
+                var pending = needsTranslation ? new StringBuilder() : null;
                 while (!ct.IsCancellationRequested)
                 {
                     // ReadConsoleW reads Unicode (UTF-16) — handles CJK characters correctly
@@ -393,14 +396,23 @@ public class ConsoleWorker
 
                     try
                     {
-                        // Decode win32-input-mode rich key events into plain text/VT sequences.
-                        // Bash readline does not understand `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` sequences.
-                        pending.Append(charBuf, 0, (int)charsRead);
-                        var translated = TranslateWin32InputMode(pending);
-                        if (translated.Length == 0) continue;
-
-                        var transBytes = Encoding.UTF8.GetBytes(translated);
-                        _pty!.InputStream.Write(transBytes, 0, transBytes.Length);
+                        byte[] utf8;
+                        if (needsTranslation)
+                        {
+                            // Decode win32-input-mode rich key events into plain text/VT sequences.
+                            // Bash/zsh readline does not understand `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` sequences.
+                            pending!.Append(charBuf, 0, (int)charsRead);
+                            var translated = TranslateWin32InputMode(pending);
+                            if (translated.Length == 0) continue;
+                            utf8 = Encoding.UTF8.GetBytes(translated);
+                        }
+                        else
+                        {
+                            // pwsh/powershell: PSReadLine understands win32-input-mode natively.
+                            // Forward the raw sequences without translation.
+                            utf8 = Encoding.UTF8.GetBytes(charBuf, 0, (int)charsRead);
+                        }
+                        _pty!.InputStream.Write(utf8, 0, utf8.Length);
                         _pty.InputStream.Flush();
                     }
                     catch (IOException) { break; }
