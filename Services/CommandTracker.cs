@@ -250,19 +250,19 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Detect common shell prompt formats:
-    ///   bash/zsh: "user@host:~$" or "user@host /path #"
-    ///   pwsh: "PS C:\path>"
-    ///   cmd: "C:\path>"
+    /// Detect shell prompt lines. Used as fallback when OSC markers are unavailable.
+    /// Checks common formats + generic trailing prompt characters.
     /// </summary>
     private static bool IsShellPrompt(string line)
     {
         // pwsh: "PS <path>>"
         if (line.StartsWith("PS ") && line.EndsWith(">")) return true;
-        // cmd: "<drive>:\...>" or any line ending with ">"
+        // cmd: "<drive>:\...>"
         if (line.Length >= 2 && line[1] == ':' && line.EndsWith(">")) return true;
-        // bash/zsh: ends with $, #, %
-        if (line.EndsWith('$') || line.EndsWith('#') || line.EndsWith('%')) return true;
+        // bash/zsh/fish: ends with $, #, %, >, ❯, λ
+        if (line.EndsWith('$') || line.EndsWith('#') || line.EndsWith('%') ||
+            line.EndsWith('>') || line.EndsWith('❯') || line.EndsWith('λ'))
+            return true;
         return false;
     }
 

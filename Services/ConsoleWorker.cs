@@ -791,7 +791,9 @@ public class ConsoleWorker
 
     private async Task<JsonElement> HandleRequestAsync(JsonElement request, CancellationToken ct)
     {
-        var type = request.GetProperty("type").GetString();
+        var type = request.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+        if (type == null)
+            return SerializeResponse(new { error = "Missing 'type' field in request" });
 
         return type switch
         {
@@ -808,7 +810,9 @@ public class ConsoleWorker
 
     private async Task<JsonElement> HandleExecuteAsync(JsonElement request, CancellationToken ct)
     {
-        var command = request.GetProperty("command").GetString()!;
+        var command = request.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(command))
+            return SerializeResponse(new { error = "Missing 'command' field in request" });
         var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : 170_000;
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives)
