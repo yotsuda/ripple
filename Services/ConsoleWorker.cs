@@ -1,5 +1,6 @@
 using System.IO.Pipes;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -76,6 +77,9 @@ public class ConsoleWorker
         await WaitForReady(TimeSpan.FromSeconds(15), ct);
         _ready = true;
         Log($"Shell ready, pipe={_pipeName}");
+
+        // Start forwarding user's keyboard input from visible console to ConPTY
+        var inputTask = InputForwardLoop(ct);
 
         // Run two pipe servers in parallel:
         //   - owned pipe (SP.{proxyPid}.{agentId}.{ourPid}) for the current proxy
@@ -243,6 +247,73 @@ public class ConsoleWorker
         // If no OSC marker arrived, proceed anyway (shell integration may not have loaded)
         Log($"WARNING: No PromptStart received, proceeding without OSC markers");
         _ready = true;
+    }
+
+    // --- User input forwarding ---
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+    private const int STD_INPUT_HANDLE = -10;
+    // VT input: arrow keys become \x1b[A etc., no line buffering, no echo
+    private const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+
+    /// <summary>
+    /// Forward user keyboard input from the worker's visible console to the ConPTY input pipe.
+    /// When AI is executing a command (CommandTracker.Busy), input is held until the command completes.
+    /// </summary>
+    private Task InputForwardLoop(CancellationToken ct)
+    {
+        if (!OperatingSystem.IsWindows()) return Task.CompletedTask;
+
+        var tcs = new TaskCompletionSource();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var hStdIn = GetStdHandle(STD_INPUT_HANDLE);
+                if (hStdIn == IntPtr.Zero || hStdIn == (IntPtr)(-1)) return;
+
+                // Switch stdin to VT input mode:
+                //   - ENABLE_VIRTUAL_TERMINAL_INPUT: special keys → VT sequences
+                //   - No ENABLE_LINE_INPUT: character-at-a-time (not line-buffered)
+                //   - No ENABLE_ECHO_INPUT: ConPTY handles echo via its output pipe
+                //   - No ENABLE_PROCESSED_INPUT: Ctrl+C → \x03 (not signal)
+                SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
+
+                var buffer = new byte[256];
+                while (!ct.IsCancellationRequested)
+                {
+                    if (!ReadFile(hStdIn, buffer, (uint)buffer.Length, out var bytesRead, IntPtr.Zero) || bytesRead == 0)
+                        break;
+
+                    // Don't forward while AI is executing — avoid mixed input
+                    if (_tracker.Busy) continue;
+
+                    try
+                    {
+                        _pty!.InputStream.Write(buffer, 0, (int)bytesRead);
+                        _pty.InputStream.Flush();
+                    }
+                    catch (IOException) { break; }
+                }
+            }
+            catch (Exception ex) { Log($"InputForwardLoop error: {ex.Message}"); }
+            finally { tcs.TrySetResult(); }
+        });
+        thread.IsBackground = true;
+        thread.Name = "Console-Input";
+        thread.Start();
+        return tcs.Task;
     }
 
     // --- PTY output reading ---
