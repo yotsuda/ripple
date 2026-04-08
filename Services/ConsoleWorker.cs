@@ -33,6 +33,11 @@ public class ConsoleWorker
     private readonly CommandTracker _tracker = new();
     private bool _ready;
     private volatile int _outputLength;
+    // Controls whether PTY output is mirrored to the worker's visible console.
+    // Disabled during shell integration injection to hide the source echo.
+    private volatile bool _mirrorVisible = true;
+    // Direct stdout stream — bypasses Console.Out's TextWriter buffering.
+    private Stream? _stdoutStream;
 
     /// <summary>
     /// Current console status for get_status requests.
@@ -55,6 +60,11 @@ public class ConsoleWorker
         Console.InputEncoding = Encoding.UTF8;
         Console.OutputEncoding = Encoding.UTF8;
 
+        // Enable Virtual Terminal Processing on stdout so the visible console
+        // interprets ANSI/VT escape sequences (cursor movement, clear-to-EOL,
+        // colors) emitted by the shell instead of writing them as literal chars.
+        EnableVirtualTerminalOutput();
+
         // Prepare shell integration script BEFORE launching the shell.
         // For pwsh, we pass it via -NoExit -Command so it doesn't echo in the console.
         var commandLine = BuildCommandLine();
@@ -76,23 +86,33 @@ public class ConsoleWorker
         // Shell-specific Enter key: pwsh needs \r, bash/zsh need \n
         var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
 
-        if (shellName is "pwsh" or "powershell" or "bash" or "sh")
+        if (shellName is "pwsh" or "powershell")
         {
-            // Injection done via BuildCommandLine (--rcfile / -Command).
-            // The shell integration emits OSC markers on the first natural prompt,
-            // no kick needed.
+            // pwsh: injection done via -Command in BuildCommandLine.
+            // Kick an Enter to trigger the first prompt + OSC markers.
+            await WriteToPty(enter, ct);
         }
         else
         {
-            // zsh and others: inject via PTY input after startup
+            // bash/zsh and others: inject via PTY input after startup.
+            // Suppress output mirroring during injection to hide the `source` echo
+            // and any noise from sourcing the integration script.
+            _mirrorVisible = false;
             await InjectShellIntegration(ct);
             await Task.Delay(500, ct);
-            await WriteToPty(enter, ct);
         }
 
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
         await WaitForReady(TimeSpan.FromSeconds(15), ct);
         _ready = true;
+        _mirrorVisible = true;
+
+        // For non-pwsh shells, the prompt drawn during injection was suppressed.
+        // Send a kick to make the shell draw a fresh prompt that will be mirrored.
+        if (shellName is not "pwsh" and not "powershell")
+        {
+            await WriteToPty(enter, ct);
+        }
 
         Log($"Shell ready, pipe={_pipeName}");
 
@@ -168,31 +188,10 @@ public class ConsoleWorker
             }
         }
 
-        // For bash: use --rcfile to inject shell integration silently (no echo).
-        // The rcfile sources the user's normal profiles first, then the integration script.
+        // bash: use --login -i to load profiles normally; integration is injected
+        // later via PTY input by InjectShellIntegration().
         if (shellName is "bash" or "sh")
-        {
-            var script = LoadEmbeddedScript("integration.bash");
-            if (script != null)
-            {
-                var tmpFile = Path.Combine(Path.GetTempPath(), $".shellpilot-rcfile-{Environment.ProcessId}.sh");
-                // Convert to MSYS path for Git Bash on Windows
-                var msysPath = OperatingSystem.IsWindows()
-                    ? "/" + char.ToLower(tmpFile[0]) + tmpFile[2..].Replace('\\', '/')
-                    : tmpFile;
-
-                // Build rcfile: load user profiles, then integration, then self-delete
-                var rcContent = $@"
-[ -f /etc/profile ] && . /etc/profile 2>/dev/null
-[ -f ~/.bash_profile ] && . ~/.bash_profile 2>/dev/null || [ -f ~/.bashrc ] && . ~/.bashrc 2>/dev/null
-{script}
-rm -f '{msysPath}'
-";
-                File.WriteAllText(tmpFile, rcContent.Replace("\r\n", "\n"));
-                return $"\"{_shell}\" --rcfile \"{msysPath}\" -i";
-            }
             return $"\"{_shell}\" --login -i";
-        }
 
         if (shellName is "zsh")
             return $"\"{_shell}\" -l -i";
@@ -338,8 +337,25 @@ rm -f '{msysPath}'
     private static extern bool ReadConsoleW(IntPtr hConsoleInput, char[] lpBuffer, uint nNumberOfCharsToRead, out uint lpNumberOfCharsRead, IntPtr pInputControl);
 
     private const int STD_INPUT_HANDLE = -10;
+    private const int STD_OUTPUT_HANDLE = -11;
     // VT input: arrow keys become \x1b[A etc., no line buffering, no echo
     private const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+    private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+    private const uint DISABLE_NEWLINE_AUTO_RETURN = 0x0008;
+
+    /// <summary>
+    /// Enable VT escape sequence processing on the worker's stdout console
+    /// so cursor movement, clear-to-EOL, and color codes from the shell
+    /// are interpreted instead of written as literal characters.
+    /// </summary>
+    private static void EnableVirtualTerminalOutput()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hStdOut == IntPtr.Zero || hStdOut == (IntPtr)(-1)) return;
+        if (!GetConsoleMode(hStdOut, out var mode)) return;
+        SetConsoleMode(hStdOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
+    }
 
     /// <summary>
     /// Forward user keyboard input from the worker's visible console to the ConPTY input pipe.
@@ -365,6 +381,7 @@ rm -f '{msysPath}'
                 SetConsoleMode(hStdIn, ENABLE_VIRTUAL_TERMINAL_INPUT);
 
                 var charBuf = new char[256];
+                var pending = new StringBuilder();
                 while (!ct.IsCancellationRequested)
                 {
                     // ReadConsoleW reads Unicode (UTF-16) — handles CJK characters correctly
@@ -376,9 +393,14 @@ rm -f '{msysPath}'
 
                     try
                     {
-                        // Convert UTF-16 → UTF-8 for ConPTY input pipe
-                        var utf8 = Encoding.UTF8.GetBytes(charBuf, 0, (int)charsRead);
-                        _pty!.InputStream.Write(utf8, 0, utf8.Length);
+                        // Decode win32-input-mode rich key events into plain text/VT sequences.
+                        // Bash readline does not understand `ESC [ Vk;Sc;Uc;Kd;Cs;Rc _` sequences.
+                        pending.Append(charBuf, 0, (int)charsRead);
+                        var translated = TranslateWin32InputMode(pending);
+                        if (translated.Length == 0) continue;
+
+                        var transBytes = Encoding.UTF8.GetBytes(translated);
+                        _pty!.InputStream.Write(transBytes, 0, transBytes.Length);
                         _pty.InputStream.Flush();
                     }
                     catch (IOException) { break; }
@@ -391,6 +413,139 @@ rm -f '{msysPath}'
         thread.Name = "Console-Input";
         thread.Start();
         return tcs.Task;
+    }
+
+    /// <summary>
+    /// Translate win32-input-mode escape sequences (`ESC [ Vk;Sc;Uc;Kd;Cs;Rc _`) into
+    /// plain text or standard VT escape sequences that bash/zsh readline can understand.
+    ///
+    /// The pending buffer is consumed up to the last complete sequence; any partial
+    /// trailing sequence is preserved for the next read.
+    /// </summary>
+    private static string TranslateWin32InputMode(StringBuilder pending)
+    {
+        var output = new StringBuilder();
+        int i = 0;
+        var input = pending.ToString();
+
+        while (i < input.Length)
+        {
+            char c = input[i];
+
+            // Detect ESC [ ... _  (win32-input-mode sequence)
+            if (c == '\x1b' && i + 1 < input.Length && input[i + 1] == '[')
+            {
+                // Find terminator '_'
+                int end = input.IndexOf('_', i + 2);
+                if (end < 0)
+                {
+                    // Incomplete sequence — keep in pending
+                    break;
+                }
+
+                // Parse fields between ESC [ and _
+                var payload = input.Substring(i + 2, end - i - 2);
+                var fields = payload.Split(';');
+                if (fields.Length == 6 &&
+                    int.TryParse(fields[0], out var vk) &&
+                    int.TryParse(fields[2], out var uc) &&
+                    int.TryParse(fields[3], out var kd) &&
+                    int.TryParse(fields[4], out var cs) &&
+                    int.TryParse(fields[5], out var rc))
+                {
+                    // Skip key-up events
+                    if (kd == 1)
+                    {
+                        var seq = MapKeyToVt(vk, uc, cs);
+                        for (int r = 0; r < Math.Max(1, rc); r++)
+                            output.Append(seq);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+
+                // Not a recognized win32-input-mode sequence — pass through as-is
+                output.Append(input, i, end - i + 1);
+                i = end + 1;
+                continue;
+            }
+
+            // Plain character — pass through
+            output.Append(c);
+            i++;
+        }
+
+        // Consume processed portion from pending
+        pending.Remove(0, i);
+        return output.ToString();
+    }
+
+    /// <summary>
+    /// Map a Windows virtual key + Unicode char + control state to the bytes/sequence
+    /// that bash/zsh readline expects.
+    /// </summary>
+    private static string MapKeyToVt(int vk, int uc, int controlState)
+    {
+        const int LEFT_CTRL = 0x0008;
+        const int RIGHT_CTRL = 0x0004;
+        const int LEFT_ALT = 0x0002;
+        const int RIGHT_ALT = 0x0001;
+        bool ctrl = (controlState & (LEFT_CTRL | RIGHT_CTRL)) != 0;
+        bool alt = (controlState & (LEFT_ALT | RIGHT_ALT)) != 0;
+
+        // Special keys (Uc == 0)
+        if (uc == 0)
+        {
+            return vk switch
+            {
+                0x25 => "\x1b[D", // Left
+                0x26 => "\x1b[A", // Up
+                0x27 => "\x1b[C", // Right
+                0x28 => "\x1b[B", // Down
+                0x24 => "\x1b[H", // Home
+                0x23 => "\x1b[F", // End
+                0x21 => "\x1b[5~", // PgUp
+                0x22 => "\x1b[6~", // PgDn
+                0x2D => "\x1b[2~", // Insert
+                0x2E => "\x1b[3~", // Delete
+                0x70 => "\x1bOP",  // F1
+                0x71 => "\x1bOQ",  // F2
+                0x72 => "\x1bOR",  // F3
+                0x73 => "\x1bOS",  // F4
+                0x74 => "\x1b[15~", // F5
+                0x75 => "\x1b[17~", // F6
+                0x76 => "\x1b[18~", // F7
+                0x77 => "\x1b[19~", // F8
+                0x78 => "\x1b[20~", // F9
+                0x79 => "\x1b[21~", // F10
+                0x7A => "\x1b[23~", // F11
+                0x7B => "\x1b[24~", // F12
+                _ => "",
+            };
+        }
+
+        // Backspace (BS or DEL): bash readline expects \x7f (DEL) for the Backspace key
+        if (vk == 0x08)
+            return "\x7f";
+
+        // Tab
+        if (vk == 0x09)
+            return "\t";
+
+        // Enter
+        if (vk == 0x0D)
+            return "\r";
+
+        // Escape
+        if (vk == 0x1B)
+            return "\x1b";
+
+        // Alt + char → ESC + char
+        if (alt && uc >= 0x20 && uc < 0x7f)
+            return "\x1b" + (char)uc;
+
+        // Plain Unicode character
+        return char.ConvertFromUtf32(uc);
     }
 
     // --- PTY output reading ---
@@ -429,7 +584,21 @@ rm -f '{msysPath}'
 
                         // Mirror PTY output (with OSC stripped) to the worker's
                         // visible console so the user can see what AI is doing.
-                        try { Console.Out.Write(result.Cleaned); Console.Out.Flush(); } catch { }
+                        // Skip mirroring during shell integration injection to hide the source echo.
+                        if (_mirrorVisible)
+                        {
+                            try
+                            {
+                                // Write directly to stdout as raw UTF-8 bytes — bypasses
+                                // any TextWriter buffering and preserves the exact byte
+                                // sequence (including \b, \e[K) for atomic console processing.
+                                var outBytes = Encoding.UTF8.GetBytes(result.Cleaned);
+                                _stdoutStream ??= Console.OpenStandardOutput();
+                                _stdoutStream.Write(outBytes, 0, outBytes.Length);
+                                _stdoutStream.Flush();
+                            }
+                            catch { }
+                        }
                     }
                 }
             }
