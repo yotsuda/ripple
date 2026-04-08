@@ -58,6 +58,9 @@ public class CommandTracker
     /// </summary>
     public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = 170_000)
     {
+        // Minimum 1 second to avoid CancellationTokenSource(0) race conditions
+        timeoutMs = Math.Max(timeoutMs, 1000);
+
         lock (_lock)
         {
             if (_isAiCommand)

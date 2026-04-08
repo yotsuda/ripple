@@ -264,11 +264,19 @@ public class ConsoleManager
                 timeout = timeoutSeconds * 1000,
             }, TimeSpan.FromSeconds(timeoutSeconds + 5));
 
+            // Check if the worker reported a command timeout
+            var timedOut = response.TryGetProperty("timedOut", out var toProp) && toProp.GetBoolean();
+            if (timedOut)
+            {
+                var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
+            }
+
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
-            var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            var displayName2 = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
 
             return new ExecuteResult
             {
@@ -276,12 +284,19 @@ public class ConsoleManager
                 ExitCode = exitCode,
                 Duration = duration,
                 Command = command,
-                DisplayName = displayName,
+                DisplayName = displayName2,
                 Cwd = cwdResult,
             };
         }
         catch (TimeoutException)
         {
+            // Pipe communication timeout (worker didn't respond in time)
+            var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
+        }
+        catch (OperationCanceledException)
+        {
+            // Pipe CancellationToken fired
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             return new ExecuteResult { TimedOut = true, DisplayName = displayName, Command = command };
         }
