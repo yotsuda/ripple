@@ -60,7 +60,11 @@ public class ConsoleWorker
         var commandLine = BuildCommandLine();
 
         // Launch shell via platform PTY (ConPTY on Windows, forkpty on Linux/macOS)
-        _pty = PtyFactory.Start(commandLine, _cwd);
+        // MSYS2/Git Bash needs the parent's environment (MSYSTEM, HOME, PATH with Git paths).
+        // pwsh uses a clean environment to avoid inheriting MCP server variables.
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        bool inheritEnv = shellName is not "pwsh" and not "powershell";
+        _pty = PtyFactory.Start(commandLine, _cwd, inheritEnvironment: inheritEnv);
         _writer = _pty.InputStream;
 
         // Start reading PTY output on dedicated thread (feeds OscParser + CommandTracker)
@@ -69,20 +73,19 @@ public class ConsoleWorker
 
         // Wait for shell to fully start (profile + injection via -Command).
         await WaitForOutputSettled(ct);
+        // Shell-specific Enter key: pwsh needs \r, bash/zsh need \n
+        var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
 
-        // For shells that don't support -Command injection (bash/zsh),
-        // inject via PTY input after startup.
-        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
         if (shellName is not "pwsh" and not "powershell")
         {
             await InjectShellIntegration(ct);
             await Task.Delay(500, ct);
-            await WriteToPty("\r", ct);
+            await WriteToPty(enter, ct);
         }
         else
         {
-            // pwsh: injection was done via -Command, just kick a \r to trigger prompt
-            await WriteToPty("\r", ct);
+            // pwsh: injection was done via -Command, just kick to trigger prompt
+            await WriteToPty(enter, ct);
         }
 
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
@@ -163,6 +166,12 @@ public class ConsoleWorker
             }
         }
 
+        // For bash/zsh, add interactive flags
+        if (shellName is "bash" or "sh")
+            return $"\"{_shell}\" --login -i";
+        if (shellName is "zsh")
+            return $"\"{_shell}\" -l -i";
+
         return $"\"{_shell}\"";
     }
 
@@ -235,15 +244,16 @@ public class ConsoleWorker
         }
         else if (OperatingSystem.IsWindows() && shellName is "bash" or "sh")
         {
-            // Git Bash / MSYS2 on Windows
-            tmpFile = $"/tmp/.shellpilot-integration-{Environment.ProcessId}.sh";
-            // Use heredoc via PTY to create the file
-            var injection = new StringBuilder();
-            injection.AppendLine($"cat > {tmpFile} << 'SHELLPILOT_EOF'");
-            injection.AppendLine(script.TrimEnd());
-            injection.AppendLine("SHELLPILOT_EOF");
-            injection.AppendLine($"source {tmpFile}; rm -f {tmpFile}");
-            await WriteToPty(injection.ToString(), ct);
+            // Git Bash / MSYS2 on Windows — write file directly, then source via PTY.
+            // Heredoc via PTY is unreliable because StringBuilder.AppendLine uses \r\n
+            // on Windows, which corrupts the shell script content.
+            var windowsPath = Path.Combine(Path.GetTempPath(), $".shellpilot-integration-{Environment.ProcessId}.sh");
+            // Write with LF-only line endings (Unix format)
+            await File.WriteAllTextAsync(windowsPath, script.Replace("\r\n", "\n"), ct);
+            // Convert Windows path to MSYS path: C:\Users\... → /c/Users/...
+            var msysPath = "/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
+            // bash expects \n for Enter (not \r which pwsh needs)
+            await WriteToPty($"source '{msysPath}'; rm -f '{msysPath}'\n", ct);
         }
         else
         {
@@ -481,7 +491,10 @@ public class ConsoleWorker
         var resultTask = _tracker.RegisterCommand(command, timeoutMs);
 
         // Write command to PTY
-        await WriteToPty(command + "\r", ct);
+        // Shell-specific Enter: pwsh → \r, bash/zsh → \n
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        var enter = shellName is "pwsh" or "powershell" ? "\r" : "\n";
+        await WriteToPty(command + enter, ct);
 
         try
         {

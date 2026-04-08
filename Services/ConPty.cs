@@ -181,7 +181,7 @@ public static class ConPty
     /// Create a ConPTY pseudoconsole and launch a process attached to it.
     /// Uses Named Pipes following node-pty's architecture.
     /// </summary>
-    public static ConPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30)
+    public static ConPtySession Start(string commandLine, string? workingDirectory = null, int cols = 120, int rows = 30, bool inheritEnvironment = false)
     {
         var pipeName = $@"\\.\pipe\shellpilot-{Environment.ProcessId}-{Guid.NewGuid():N}";
 
@@ -189,9 +189,13 @@ public static class ConPty
         var inPipeName = pipeName + "-in";
         var outPipeName = pipeName + "-out";
 
+        // Both pipes are created DUPLEX (INBOUND | OUTBOUND), matching node-pty's pattern.
+        // Using unidirectional pipes causes MSYS2/Git Bash output to not flow through ConPTY.
+        const uint PIPE_ACCESS_DUPLEX = PIPE_ACCESS_INBOUND | PIPE_ACCESS_OUTBOUND;
+
         var hInServer = CreateNamedPipeW(
             inPipeName,
-            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1, PIPE_BUFFER_SIZE, PIPE_BUFFER_SIZE, 30000, IntPtr.Zero);
         if (hInServer.IsInvalid)
@@ -199,7 +203,7 @@ public static class ConPty
 
         var hOutServer = CreateNamedPipeW(
             outPipeName,
-            PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1, PIPE_BUFFER_SIZE, PIPE_BUFFER_SIZE, 30000, IntPtr.Zero);
         if (hOutServer.IsInvalid)
@@ -217,17 +221,17 @@ public static class ConPty
             throw new InvalidOperationException($"CreatePseudoConsole failed: HRESULT 0x{hr:X8}");
         }
 
-        // Create client-side connections to the Named Pipes
-        // Input: client writes → server reads → pseudoconsole input
-        var hInClient = CreateFileW(inPipeName, GENERIC_WRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        // Create client-side connections to the Named Pipes.
+        // Use GENERIC_READ|GENERIC_WRITE (duplex) to match node-pty's pattern.
+        const uint GENERIC_READWRITE = GENERIC_READ | GENERIC_WRITE;
+        var hInClient = CreateFileW(inPipeName, GENERIC_READWRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
         if (hInClient.IsInvalid)
         {
             ClosePseudoConsole(hPC); hInServer.Dispose(); hOutServer.Dispose();
             throw new InvalidOperationException($"CreateFile (in client) failed: {Marshal.GetLastWin32Error()}");
         }
 
-        // Output: pseudoconsole output → server writes → client reads
-        var hOutClient = CreateFileW(outPipeName, GENERIC_READ, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        var hOutClient = CreateFileW(outPipeName, GENERIC_READWRITE, 0, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
         if (hOutClient.IsInvalid)
         {
             ClosePseudoConsole(hPC); hInServer.Dispose(); hOutServer.Dispose(); hInClient.Dispose();
@@ -241,26 +245,39 @@ public static class ConPty
         // Prepare attribute list
         var attrList = CreateAttributeList(hPC);
 
-        // Build clean environment block
+        // Build environment block.
+        // Clean env (bInherit=false): for pwsh/powershell — avoids inheriting MCP server's env vars.
+        // Inherited env (IntPtr.Zero): for bash/zsh/MSYS2 — needs MSYSTEM, HOME, PATH with Git paths.
         IntPtr envBlock = IntPtr.Zero;
-        IntPtr hToken = IntPtr.Zero;
-        try
+        if (!inheritEnvironment)
         {
-            if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out hToken))
-                CreateEnvironmentBlock(out envBlock, hToken, false);
-        }
-        finally
-        {
-            if (hToken != IntPtr.Zero) CloseHandle(hToken);
+            IntPtr hToken = IntPtr.Zero;
+            try
+            {
+                if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out hToken))
+                    CreateEnvironmentBlock(out envBlock, hToken, false);
+            }
+            finally
+            {
+                if (hToken != IntPtr.Zero) CloseHandle(hToken);
+            }
         }
 
-        // Build STARTUPINFOEX manually in unmanaged memory
+        // Build STARTUPINFOEX manually in unmanaged memory.
+        // CRITICAL: STARTF_USESTDHANDLES with NULL handles forces the child process
+        // to use the pseudoconsole for all I/O instead of inheriting parent's handles.
+        // Without this, MSYS2/Git Bash writes to the parent's stdout, bypassing ConPTY.
         const int startupInfoExSize = 112;
+        const int dwFlagsOffset = 60;
         const int lpAttributeListOffset = 104;
+        const int STARTF_USESTDHANDLES = 0x00000100;
+
         var siPtr = Marshal.AllocHGlobal(startupInfoExSize);
         var zeros = new byte[startupInfoExSize];
         Marshal.Copy(zeros, 0, siPtr, startupInfoExSize);
-        Marshal.WriteInt32(siPtr, startupInfoExSize); // cb
+        Marshal.WriteInt32(siPtr, 0, startupInfoExSize); // cb
+        Marshal.WriteInt32(siPtr, dwFlagsOffset, STARTF_USESTDHANDLES); // dwFlags
+        // hStdInput/hStdOutput/hStdError are already zero (NULL) from zero-init
         Marshal.WriteIntPtr(siPtr, lpAttributeListOffset, attrList);
 
         var cwd = workingDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
