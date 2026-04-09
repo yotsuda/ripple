@@ -1,6 +1,6 @@
 {
   "name": "splashshell",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared console MCP server for any shell (bash, pwsh, cmd) — AI and user work in the same terminal. Real-time command visibility, interactive prompt support, session persistence, multi-shell management with automatic cwd handoff.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",

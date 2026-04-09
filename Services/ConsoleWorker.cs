@@ -50,6 +50,14 @@ public class ConsoleWorker
     // Title set by proxy via set_title. Used to override OSC 0 title sequences
     // emitted by shells (e.g., bash's PROMPT_COMMAND sets "user@host: cwd").
     private volatile string? _desiredTitle;
+    // Set to true when a strictly newer proxy tries to claim this worker.
+    // Signals the main loop to stop serving pipes while keeping the PTY alive
+    // so the user can continue working in the terminal.
+    private volatile bool _obsolete;
+    // This worker's own binary version — compared against the proxy_version
+    // field in incoming claim requests to detect cross-version re-claim.
+    private static readonly Version _myVersion =
+        typeof(ConsoleWorker).Assembly.GetName().Version ?? new Version(0, 0);
 
     public ConsoleWorker(string pipeName, int proxyPid, string shell, string cwd, string? banner = null, string? reason = null)
     {
@@ -143,7 +151,7 @@ public class ConsoleWorker
         // Run owned + unowned pipe servers. When proxy dies, stop owned pipe,
         // keep unowned running for re-claim by another proxy.
         // On re-claim, start a new owned pipe for the new proxy.
-        while (!ct.IsCancellationRequested)
+        while (!ct.IsCancellationRequested && !_obsolete)
         {
             using var ownedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var ownedTask = RunPipeServerAsync(_pipeName, ownedCts.Token);
@@ -162,11 +170,30 @@ public class ConsoleWorker
             Console.Title = $"#{Environment.ProcessId} ____";
             Log("Proxy died, waiting for re-claim on unowned pipe...");
 
-            var newPipeName = await _claimTcs.Task;
+            string newPipeName;
+            try
+            {
+                newPipeName = await _claimTcs.Task;
+            }
+            catch (InvalidOperationException) when (_obsolete)
+            {
+                Log("Claim refused (obsolete); exiting pipe service loop. Shell remains available for user.");
+                break;
+            }
             _pipeName = newPipeName;
             _proxyPid = GetProxyPidFromPipeName(newPipeName);
             _claimTcs = null;
             Log($"Re-claimed by proxy {_proxyPid}, new pipe={_pipeName}");
+        }
+
+        // Obsolete mode: the pipe service has stopped, but the shell is still
+        // alive and the user may still be working in it. readTask/inputTask/
+        // resizeTask are running on `ct`; wait here until the user closes the
+        // console window (which cancels `ct`), then fall through to cleanup.
+        if (_obsolete)
+        {
+            try { await Task.Delay(Timeout.Infinite, ct); }
+            catch (OperationCanceledException) { }
         }
 
         // Cleanup
@@ -1010,9 +1037,36 @@ public class ConsoleWorker
         var proxyPid = request.TryGetProperty("proxy_pid", out var pp) ? pp.GetInt32() : 0;
         var agentId = request.TryGetProperty("agent_id", out var ai) ? ai.GetString() : "default";
         var title = request.TryGetProperty("title", out var tp) ? tp.GetString() : null;
+        var proxyVersionStr = request.TryGetProperty("proxy_version", out var vp) ? vp.GetString() : null;
 
         if (proxyPid == 0)
             return SerializeResponse(new { status = "error", error = "proxy_pid required" });
+
+        // Version check: if the calling proxy is strictly newer than this worker,
+        // the pipe protocol may have changed in incompatible ways. Refuse the claim,
+        // mark the console as obsolete, and stop serving pipes. The shell itself
+        // keeps running so the user can continue working in the terminal.
+        if (proxyVersionStr != null
+            && Version.TryParse(proxyVersionStr, out var proxyVer)
+            && proxyVer > _myVersion)
+        {
+            _obsolete = true;
+            _desiredTitle = $"#{Environment.ProcessId} (obsolete v{_myVersion.ToString(3)})";
+            Console.Title = _desiredTitle;
+            // Show a prominent banner so the human user understands what happened:
+            // AI/MCP control has been detached, but the shell itself is still usable.
+            WriteBannerText(
+                $"This console is no longer managed by splashshell (worker v{_myVersion.ToString(3)}).",
+                $"A newer proxy (v{proxyVer}) tried to re-claim this console. The shell is still available for you to use directly, but AI commands via MCP will no longer route here. Close the window when you're done.",
+                isReuse: true);
+            Log($"Claim refused: proxy v{proxyVer} > worker v{_myVersion}. Marking obsolete.");
+            _claimTcs?.TrySetException(new InvalidOperationException("obsolete"));
+            return SerializeResponse(new
+            {
+                status = "obsolete",
+                worker_version = _myVersion.ToString(3)
+            });
+        }
 
         var newPipeName = $"{ConsoleManager.PipePrefix}.{proxyPid}.{agentId}.{Environment.ProcessId}";
         if (title != null) Console.Title = title;

@@ -14,58 +14,16 @@ A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a
 - **Auto cwd handoff.** When a same-shell console is busy, a new one is auto-started in the source console's directory and your command runs immediately — no manual `cd` needed.
 - **Sub-agent isolation.** Allocate per-agent consoles with `is_subagent` + `agent_id` so parallel agents don't clobber each other's shells.
 
-## Architecture
-
-```mermaid
-graph TB
-    Client["MCP Client<br/>(Claude Code, etc.)"]
-
-    subgraph Proxy["splashshell proxy (stdio MCP server)"]
-        CM["Console Manager<br/>(cwd tracking, re-claim,<br/>cache drain, switching)"]
-        Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
-    end
-
-    subgraph Consoles["Visible Console Windows (each runs splash --console)"]
-        subgraph C1["#9876 Sapphire (bash)"]
-            PTY1["ConPTY + bash<br/>(+ OSC 633)"]
-        end
-        subgraph C2["#5432 Cobalt (pwsh)"]
-            PTY2["ConPTY + pwsh<br/>(+ OSC 633)"]
-        end
-        subgraph C3["#1234 Topaz (cmd)"]
-            PTY3["ConPTY + cmd.exe<br/>(+ OSC 633 via PROMPT)"]
-        end
-    end
-
-    User["User"] -- "keyboard" --> C1
-    User -- "keyboard" --> C2
-    User -- "keyboard" --> C3
-    Client -- "stdio" --> Proxy
-    CM -- "Named Pipe" --> C1
-    CM -- "Named Pipe" --> C2
-    CM -- "Named Pipe" --> C3
-    CM -. "auto-switch<br/>if busy" .-> C1
-    CM -. "shell routing" .-> C2
-```
+> **Architecture diagram**: see the [GitHub README](https://github.com/yotsuda/splashshell#architecture) for a mermaid diagram of the proxy/worker/console layout.
 
 ## Install
 
-Requires [.NET 9 Runtime](https://dotnet.microsoft.com/download/dotnet/9.0).
-
-```bash
-git clone https://github.com/yotsuda/splashshell.git
-cd splashshell
-dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
-```
-
-The binary is `./dist/splash.exe`.
-
-## MCP Setup
+No global install is required — `npx` fetches and runs splashshell on demand. The only prerequisite is the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0) (the package bundles a ~5.6 MB native `splash.exe` that needs it).
 
 ### Claude Code
 
 ```bash
-claude mcp add splash -s user -- C:\path\to\splash.exe
+claude mcp add-json splash -s user '{"command":"npx","args":["-y","splashshell"]}'
 ```
 
 ### Claude Desktop
@@ -76,11 +34,22 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 {
   "mcpServers": {
     "splash": {
-      "command": "C:\\path\\to\\splash.exe"
+      "command": "npx",
+      "args": ["-y", "splashshell"]
     }
   }
 }
 ```
+
+### Build from source (for development)
+
+```bash
+git clone https://github.com/yotsuda/splashshell.git
+cd splashshell
+dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
+```
+
+The binary is `./dist/splash.exe`. Use the absolute path instead of the `npx` command in your MCP config.
 
 ## Tools
 

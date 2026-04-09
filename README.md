@@ -50,22 +50,12 @@ graph TB
 
 ## Install
 
-Requires [.NET 9 Runtime](https://dotnet.microsoft.com/download/dotnet/9.0).
-
-```bash
-git clone https://github.com/yotsuda/splashshell.git
-cd splashshell
-dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
-```
-
-The binary is `./dist/splash.exe`.
-
-## MCP Setup
+No global install is required — `npx` fetches and runs splashshell on demand. The only prerequisite is the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0) (the package bundles a ~5.6 MB native `splash.exe` that needs it).
 
 ### Claude Code
 
 ```bash
-claude mcp add splash -s user -- C:\path\to\splash.exe
+claude mcp add-json splash -s user '{"command":"npx","args":["-y","splashshell"]}'
 ```
 
 ### Claude Desktop
@@ -76,11 +66,22 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 {
   "mcpServers": {
     "splash": {
-      "command": "C:\\path\\to\\splash.exe"
+      "command": "npx",
+      "args": ["-y", "splashshell"]
     }
   }
 }
 ```
+
+### Build from source (for development)
+
+```bash
+git clone https://github.com/yotsuda/splashshell.git
+cd splashshell
+dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
+```
+
+The binary is `./dist/splash.exe`. Use the absolute path instead of the `npx` command in your MCP config.
 
 ## Tools
 

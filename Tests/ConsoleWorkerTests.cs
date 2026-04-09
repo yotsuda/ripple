@@ -115,6 +115,35 @@ public class ConsoleWorkerTests
             Assert(status == "standby", $"Status back to standby (got: {status})");
         }
 
+        // Test 6: version check (worker refuses claim from strictly newer proxy)
+        // Send claim with a fake proxy_version that is strictly greater than any real
+        // version. The worker's HandleClaim is version-aware: it marks itself obsolete
+        // and returns status="obsolete". The shell (PTY) must remain alive afterwards
+        // so the human user can keep working in the terminal.
+        {
+            var unownedPipe = $"SP.{workerPid}";
+            var resp = await SendRequest(unownedPipe, new
+            {
+                type = "claim",
+                proxy_pid = proxyPid,
+                proxy_version = "99.99.99",
+                agent_id = "v2test",
+                title = "#fake high version"
+            });
+            var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
+            Assert(status == "obsolete", $"Claim with higher proxy_version returns obsolete (got: {status})");
+
+            var workerVersion = resp.TryGetProperty("worker_version", out var wv) ? wv.GetString() : null;
+            Assert(!string.IsNullOrEmpty(workerVersion), $"Response includes worker_version (got: {workerVersion})");
+
+            // PTY must still be alive so the user can continue working.
+            var execResp = await SendRequest(pipeName,
+                new { type = "execute", command = "Write-Output 'still-alive'", timeout = 10000 },
+                TimeSpan.FromSeconds(15));
+            var execOutput = execResp.TryGetProperty("output", out var eo) ? eo.GetString() ?? "" : "";
+            Assert(execOutput.Contains("still-alive"), $"PTY still alive after obsolete state (output: {execOutput.Replace("\n", "\\n")})");
+        }
+
         // Cleanup
         try
         {

@@ -33,6 +33,12 @@ public class ConsoleManager
 
     public int ProxyPid { get; } = Environment.ProcessId;
 
+    // This proxy's own binary version — sent in claim requests so workers
+    // can detect cross-version re-claim (a strictly newer proxy reaching an
+    // older worker with potentially incompatible pipe protocol).
+    public static readonly string ProxyVersion =
+        (typeof(ConsoleManager).Assembly.GetName().Version ?? new Version(0, 0)).ToString(3);
+
     // Shared memory for category allocation (same pattern as PowerShell.MCP)
     private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "SplashShell.AllocatedConsoleCategories.dat");
     private const string MutexName = "SplashShell.AllocatedConsoleCategories";
@@ -659,13 +665,24 @@ public class ConsoleManager
                 var newPipeName = GetPipeName("default", pid.Value);
                 try
                 {
-                    await SendPipeRequestAsync(pipe, new
+                    var claimResponse = await SendPipeRequestAsync(pipe, new
                     {
                         type = "claim",
                         proxy_pid = ProxyPid,
+                        proxy_version = ProxyVersion,
                         agent_id = "default",
                         title = displayNameNew
                     }, TimeSpan.FromSeconds(3));
+
+                    // Worker refused claim because our proxy is strictly newer than it
+                    // (pipe protocol may be incompatible). Skip this orphan — the worker
+                    // has marked itself obsolete and stopped serving pipes, but its shell
+                    // is still alive for the human user.
+                    if (claimResponse.TryGetProperty("status", out var claimStatus)
+                        && claimStatus.GetString() == "obsolete")
+                    {
+                        continue;
+                    }
 
                     await WaitForPipeReadyAsync(newPipeName, TimeSpan.FromSeconds(5));
                 }
