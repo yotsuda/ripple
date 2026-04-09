@@ -556,6 +556,35 @@ public class ConsoleManager
     /// Collect cached outputs from all owned consoles (single scan, no polling).
     /// Called from every MCP tool to drain completed background commands.
     /// </summary>
+    /// <summary>
+    /// Detect consoles that have been closed since the last check.
+    /// Removes them from _consoles and returns their display names + shell families.
+    /// </summary>
+    public List<(string DisplayName, string ShellFamily)> DetectClosedConsoles(string agentId)
+    {
+        var closed = new List<(string, string)>();
+        lock (_lock)
+        {
+            var deadPids = _consoles
+                .Where(kv => !IsProcessAlive(kv.Key))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var pid in deadPids)
+            {
+                var info = _consoles[pid];
+                closed.Add((info.DisplayName, info.ShellFamily));
+                _consoles.Remove(pid);
+                _pidToTitle.Remove(pid);
+                _busyPids.Remove(pid);
+                var state = GetOrCreateAgentState(agentId);
+                if (state.ActivePid == pid)
+                    state.ActivePid = 0;
+            }
+        }
+        return closed;
+    }
+
     public async Task<List<ExecuteResult>> CollectCachedOutputsAsync(string agentId)
     {
         var results = new List<ExecuteResult>();

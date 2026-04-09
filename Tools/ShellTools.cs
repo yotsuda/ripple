@@ -117,16 +117,29 @@ public class ShellTools
     }
 
     /// <summary>
-    /// Collect cached outputs from all consoles and prepend to the response.
-    /// Called at the very end of each tool, just before returning, so no
-    /// cached results are missed due to processing delays.
+    /// Detect closed consoles and collect cached outputs, prepending notifications
+    /// to the response. Called at the very end of each tool, just before returning,
+    /// so no cached results or close events are missed due to processing delays.
     /// </summary>
     private static async Task<string> AppendCachedOutputs(ConsoleManager consoleManager, string agentId, string response)
     {
+        var closed = consoleManager.DetectClosedConsoles(agentId);
         var cached = await consoleManager.CollectCachedOutputsAsync(agentId);
-        if (cached.Count == 0) return response;
+
+        if (closed.Count == 0 && cached.Count == 0)
+            return response;
 
         var sb = new StringBuilder();
+
+        // Closed console notifications
+        foreach (var (displayName, shellFamily) in closed)
+        {
+            var shellInfo = !string.IsNullOrEmpty(shellFamily) ? $" ({shellFamily})" : "";
+            sb.AppendLine($"Console {displayName}{shellInfo} closed.");
+            sb.AppendLine();
+        }
+
+        // Cached command results
         foreach (var r in cached)
         {
             sb.AppendLine(FormatStatusLine(r));
@@ -134,6 +147,7 @@ public class ShellTools
             sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
             sb.AppendLine();
         }
+
         sb.Append(response);
         return sb.ToString();
     }
