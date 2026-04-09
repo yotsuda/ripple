@@ -105,7 +105,15 @@ Each MCP tool call also drains:
 
 ### File tools
 
-`read_file`, `write_file`, `edit_file`, `find_files`, `search_files` — Claude Code–compatible file primitives, useful when the MCP client doesn't already provide them.
+Claude Code–compatible file primitives, useful when the MCP client doesn't already provide them.
+
+| Tool | Description |
+|------|-------------|
+| `read_file` | Read a file with line numbers. Supports `offset` / `limit` for paging through large files. Detects binary files. |
+| `write_file` | Create or overwrite a file. Creates parent directories as needed. |
+| `edit_file` | Replace an exact string in a file. Old string must be unique by default; pass `replace_all` to replace every occurrence. |
+| `search_files` | Search file contents with a regular expression. Returns matching lines with file paths and line numbers. Supports `glob` filtering. |
+| `find_files` | Find files by glob pattern (e.g., `**/*.cs`). Returns matching paths. |
 
 ## Multi-shell behavior
 
