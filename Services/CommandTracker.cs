@@ -20,9 +20,13 @@ public class CommandTracker
 {
     private const int MaxOutputBytes = 1024 * 1024; // 1MB
 
-    // ANSI escape sequence pattern
+    // Non-SGR ANSI escape sequence pattern.
+    // Strips cursor movement, erase, and other control sequences, but preserves
+    // SGR (Select Graphic Rendition, ending in 'm') so color information is
+    // passed through to the AI for context (e.g. red errors, green success).
+    // OSC sequences (window title etc.) are also stripped.
     private static readonly Regex AnsiRegex = new(
-        @"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]|\r",
+        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]",
         RegexOptions.Compiled);
 
     // pwsh prompt pattern: "PS <drive>:\<path>> "
@@ -233,22 +237,22 @@ public class CommandTracker
 
     private string CleanOutput()
     {
-        var output = StripAnsi(_output);
-        // Strip pwsh prompts that ConPTY glued onto previous lines via cursor positioning
-        output = PwshPromptInline.Replace(output, "");
+        // With OSC B gating, _output starts just after the OSC B signal.
+        // AcceptLine() then renders the command line and emits a hard \r\n.
+        // Everything before (and including) that first \r\n is PSReadLine
+        // rendering noise; actual command output starts after it.
+        var raw = _output;
+        int firstHardNewline = raw.IndexOf("\r\n");
+        if (firstHardNewline >= 0)
+            raw = raw[(firstHardNewline + 2)..];
+
+        var output = StripAnsi(raw);
         var lines = output.Split('\n');
         var cleaned = new List<string>();
 
-        // Find where actual output starts by locating the command echo line.
-        // With OSC B gating: _output is clean but AcceptLine() still renders the command.
-        // Without OSC B (fallback): _output may contain PSReadLine noise before the echo.
-        // In both cases, we find the last line matching _commandSent (or its prefix),
-        // and start capturing from after it.
-        int startLine = FindPostEchoLine(lines);
-
-        for (int i = startLine; i < lines.Length; i++)
+        foreach (var rawLine in lines)
         {
-            var line = lines[i].TrimEnd('\r');
+            var line = rawLine.TrimEnd('\r');
 
             // Skip pwsh continuation prompt ">>" (with or without trailing space)
             var trimmed = line.TrimEnd();
@@ -275,40 +279,6 @@ public class CommandTracker
         if (_truncated)
             result += "\n\n[Output truncated at 1MB]";
         return result;
-    }
-
-    /// <summary>
-    /// Find the line index to start capturing from, by locating the command echo.
-    /// Returns the index of the first line AFTER the echo.
-    /// </summary>
-    private int FindPostEchoLine(string[] lines)
-    {
-        if (string.IsNullOrEmpty(_commandSent)) return 0;
-
-        // Strategy 1: exact match — handles short commands that fit on one terminal line
-        for (int i = 0; i < lines.Length; i++)
-            if (lines[i].Contains(_commandSent))
-                return i + 1;
-
-        // Strategy 2: prefix match — handles long commands wrapped at terminal width.
-        // AcceptLine() may render the command in multiple partial passes;
-        // take the LAST matching line so we start after the final render.
-        if (_commandSent.Length >= 20)
-        {
-            var prefix = _commandSent[..20];
-            int lastMatch = -1;
-            for (int i = 0; i < lines.Length; i++)
-                if (lines[i].Contains(prefix))
-                    lastMatch = i;
-            if (lastMatch >= 0) return lastMatch + 1;
-        }
-
-        // Strategy 3: fallback — first blank line (original behavior)
-        for (int i = 0; i < lines.Length; i++)
-            if (string.IsNullOrWhiteSpace(lines[i]))
-                return i + 1;
-
-        return 0;
     }
 
     /// <summary>
@@ -340,5 +310,11 @@ public class CommandTracker
         _captureEnabled = true;
     }
 
-    private static string StripAnsi(string text) => AnsiRegex.Replace(text, "");
+    private static string StripAnsi(string text)
+    {
+        text = AnsiRegex.Replace(text, "");  // strip non-SGR sequences, keep colors
+        text = text.Replace("\r\n", "\n");   // CRLF → LF
+        text = text.Replace("\r", "");       // remove any remaining standalone CR
+        return text;
+    }
 }
