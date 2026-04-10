@@ -308,9 +308,19 @@ public class ConsoleManager
             }
         }
 
-        // If the active console is busy, force a switch to another console
+        // If the active console is busy, force a switch to another console.
+        // When the caller didn't request a specific shell, pin the search/auto-start
+        // to the busy console's own shell path so we stay same-family — crossing
+        // shell families here would strand the AI in a foreign cwd it doesn't
+        // know how to translate (bash /mnt/c/... vs pwsh C:\...).
         if (activeBusy && consolePid == initialActivePid)
+        {
             consolePid = 0;
+            if (resolvedShell == null)
+            {
+                lock (_lock) resolvedShell = _consoles.GetValueOrDefault(initialActivePid)?.ShellPath;
+            }
+        }
 
         bool isSwitching = false;
 
@@ -331,10 +341,13 @@ public class ConsoleManager
             }
             else
             {
-                // Auto-start a new console, seeding it with the source console's cwd.
-                // StartConsoleInnerAsync queries the worker for the actual cwd
-                // in shell-native format and stores it in LastAiCwd.
-                var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), sourceCwd, null, agentId);
+                // Auto-start a new console. We pass cwd=null so the worker starts
+                // in the default user profile: the source cwd is in shell-native
+                // format (e.g. bash returns /mnt/c/foo) and cannot be handed to
+                // Windows CreateProcess as a workingDirectory. The same-family
+                // cd preamble a few lines below positions the new console correctly
+                // before the user's command runs.
+                var startResult = await StartConsoleInnerAsync(resolvedShell ?? GetDefaultShell(), null, null, agentId);
                 consolePid = startResult.Pid;
                 lock (_lock)
                     pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
@@ -366,10 +379,16 @@ public class ConsoleManager
         else if (isSwitching)
         {
             // Cases requiring user confirmation:
-            //   - Cross-shell switch with cwd (path translation not implemented)
+            //   - Explicit cross-shell switch by the caller (shell=X with a
+            //     different active console). Path translation between bash
+            //     and Windows-native shells is not attempted — the caller
+            //     asked for a different shell on purpose, so we warn and let
+            //     the AI re-execute with the cwd it actually wants.
             //   - Fresh start (no previous active console — AI doesn't know cwd)
             //   - Switch to standby with no source cwd
-            // Warn so AI verifies cwd and re-executes intentionally.
+            // Involuntary cross-shell switches (active busy with no shell param)
+            // no longer reach this branch — resolvedShell is pinned to the busy
+            // source earlier, so the find/auto-start above stays same-family.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             return new ExecuteResult
             {
