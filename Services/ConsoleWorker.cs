@@ -1043,6 +1043,32 @@ public class ConsoleWorker
         return SerializeResponse(w => w.WriteStringOrNull("delta", delta));
     }
 
+    /// <summary>
+    /// Write a colorized echo of the AI command to the visible console for
+    /// pwsh / powershell.exe, matching PSReadLine's own rendering style.
+    /// We bypass the usual PTY mirror path because PSReadLine is idle in the
+    /// input loop between commands and writes prediction ghost text /
+    /// cursor moves that would clash with the echo. Instead we suppress
+    /// the mirror (flipped back on by OSC B), reset the current line via
+    /// \r + \e[2K, paint a synthetic prompt, then write the colorized
+    /// command. Crucially the echo does NOT end with \r\n — PSReadLine's
+    /// own AcceptLine finalize emits the newline once OSC B re-enables
+    /// the mirror, so adding our own here would leave a blank line
+    /// between the echo and the first line of real command output.
+    /// </summary>
+    private void RenderPwshCommandEcho(string command)
+    {
+        _mirrorVisible = false;
+        _stdoutStream ??= Console.OpenStandardOutput();
+
+        var echoText = PwshColorizer.Colorize(command);
+        var cwd = _tracker.LastKnownCwd ?? _cwd;
+        var synthPrompt = $"PS {cwd}> ";
+        var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}");
+        _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
+        _stdoutStream.Flush();
+    }
+
     private async Task<JsonElement> HandleExecuteAsync(JsonElement request, CancellationToken ct)
     {
         var command = request.TryGetProperty("command", out var cmdProp) ? cmdProp.GetString() ?? "" : "";
@@ -1059,51 +1085,8 @@ public class ConsoleWorker
         var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
 
-        // For pwsh: suppress PTY mirroring while PSReadLine renders prediction noise,
-        // and display the command directly in the visible console.
-        // OSC B (emitted by the Enter key handler in integration.ps1) re-enables
-        // mirroring and starts output capture.
         if (shellName is "pwsh" or "powershell")
-        {
-            _mirrorVisible = false;
-            _stdoutStream ??= Console.OpenStandardOutput();
-
-            // pwsh 7+ ships a modern PSReadLine with vivid syntax highlighting
-            // in the interactive prompt, so colorize the echo to match what
-            // the human user would see if they'd typed the command. Windows
-            // PowerShell 5.1 (powershell.exe) bundles an older PSReadLine
-            // Both pwsh and powershell.exe (Windows PowerShell 5.1) get the
-            // colorizer treatment so AI-echoed commands look the same as
-            // what PSReadLine renders for human-typed input.
-            var echoText = shellName is "pwsh" or "powershell"
-                ? PwshColorizer.Colorize(command)
-                : command;
-
-            // Wipe the current line first and re-emit a synthetic prompt
-            // before our echo. Between commands pwsh is idle in the
-            // PSReadLine input loop, which writes prediction ghost text and
-            // moves the cursor around while rendering. Without the clear,
-            // our echo would land at whatever column PSReadLine left the
-            // cursor at and the previous line would end up with our text
-            // overlaid on the prompt — the "command overwrites the prompt"
-            // glitch. \r moves to column 0, \e[2K clears the entire line,
-            // then we re-emit a default-format prompt and the colorized
-            // command on a clean slate.
-            //
-            // Crucially, the echo does NOT end with \r\n. Leaving the cursor
-            // at the end of the command text mirrors what a human typing the
-            // same command would see just before pressing Enter. PSReadLine's
-            // AcceptLine finalize (mirrored to the visible console once
-            // _mirrorVisible flips true on OSC B) then emits its own newline,
-            // moving the cursor to the next line exactly once. Adding our own
-            // \r\n would double up and leave a blank line between the echo
-            // and the command's output.
-            var cwd = _tracker.LastKnownCwd ?? _cwd;
-            var synthPrompt = $"PS {cwd}> ";
-            var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}");
-            _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
-            _stdoutStream.Flush();
-        }
+            RenderPwshCommandEcho(command);
 
         // Register command with tracker (it will resolve when OSC PromptStart arrives).
         // With concurrent pipe listeners, two execute requests can race between
