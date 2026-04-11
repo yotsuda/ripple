@@ -472,6 +472,33 @@ public class ConsoleManager
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var displayName2 = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
 
+            // Drain any trailing bytes the shell streamed after OSC PromptStart
+            // (pwsh prompt repaint, Format-Table rows still finishing, etc.).
+            // With the worker's fixed 500ms settle removed, this call
+            // adaptively waits until the post-primary buffer has been stable
+            // for stable_ms, capped at max_ms. Fast commands return in ~100ms,
+            // slow streaming waits as long as needed up to max_ms. Runs on
+            // the second pipe instance since the execute call freed the first.
+            try
+            {
+                var drainResp = await SendPipeRequestAsync(pipeName, w =>
+                {
+                    w.WriteString("type", "drain_post_output");
+                    w.WriteNumber("stable_ms", 100);
+                    w.WriteNumber("max_ms", 500);
+                }, TimeSpan.FromSeconds(2));
+
+                var delta = drainResp.TryGetProperty("delta", out var dp) ? dp.GetString() : null;
+                if (!string.IsNullOrEmpty(delta))
+                {
+                    output = string.IsNullOrEmpty(output) ? delta : output + "\n" + delta;
+                }
+            }
+            catch
+            {
+                // Best-effort — if drain fails the primary output is still returned.
+            }
+
             // Update LastAiCwd with the result cwd (the cwd the command ended at)
             lock (_lock)
             {

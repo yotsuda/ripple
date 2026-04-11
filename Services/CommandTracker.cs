@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace SplashShell.Services;
@@ -19,6 +20,7 @@ namespace SplashShell.Services;
 public class CommandTracker
 {
     private const int MaxOutputBytes = 1024 * 1024; // 1MB
+    private const int PostPrimaryMaxBytes = 64 * 1024; // 64 KB for trailing-output delta
 
     // Non-SGR ANSI escape sequence pattern.
     // Strips cursor movement, erase, and other control sequences, but preserves
@@ -50,7 +52,12 @@ public class CommandTracker
     private bool _captureEnabled = true;
     private bool _stripAcceptLineNoise = false; // true for pwsh: strip AcceptLine rendering before first \r\n
     private Stopwatch? _stopwatch;
-    private CancellationTokenSource? _settleCts;
+
+    // Trailing output that arrives AFTER Resolve() has returned the primary
+    // CommandResult — e.g. the pwsh prompt repaint or pwsh Format-Table rows
+    // that finish streaming after the OSC A marker. The proxy drains this via
+    // the drain_post_output pipe message after each successful execute.
+    private readonly StringBuilder _postPrimaryOutput = new();
 
     // Cached result from timed-out commands
     private CommandResult? _cachedResult;
@@ -104,6 +111,7 @@ public class CommandTracker
             _cwd = null;
             _commandSent = commandText;
             _cachedResult = null;
+            _postPrimaryOutput.Clear();
             _stopwatch = Stopwatch.StartNew();
 
             // Setup timeout
@@ -215,21 +223,32 @@ public class CommandTracker
     {
         lock (_lock)
         {
-            if (!_isAiCommand || !_captureEnabled) return;
-
-            if (_output.Length < MaxOutputBytes)
+            if (_isAiCommand)
             {
-                _output += text;
-                if (_output.Length > MaxOutputBytes)
+                if (!_captureEnabled) return;
+
+                if (_output.Length < MaxOutputBytes)
                 {
-                    _output = _output[..MaxOutputBytes];
-                    _truncated = true;
+                    _output += text;
+                    if (_output.Length > MaxOutputBytes)
+                    {
+                        _output = _output[..MaxOutputBytes];
+                        _truncated = true;
+                    }
                 }
+                return;
             }
 
-            // If settle timer is running, restart it (more output arriving)
-            if (_settleCts != null)
-                ScheduleResolve();
+            // No AI command active: this is either pre-first-prompt shell boot
+            // noise, a user-typed command's output, or trailing bytes arriving
+            // after a primary Resolve() has returned. Capture into the
+            // post-primary buffer — the proxy drains it via drain_post_output.
+            // Bounded at PostPrimaryMaxBytes so a runaway shell can't grow the
+            // buffer forever if the proxy never drains.
+            var remaining = PostPrimaryMaxBytes - _postPrimaryOutput.Length;
+            if (remaining <= 0) return;
+            if (text.Length <= remaining) _postPrimaryOutput.Append(text);
+            else _postPrimaryOutput.Append(text, 0, remaining);
         }
     }
 
@@ -248,19 +267,105 @@ public class CommandTracker
 
     private void ScheduleResolve()
     {
-        // Cancel previous settle timer
-        _settleCts?.Cancel();
-        _settleCts = new CancellationTokenSource();
-        var token = _settleCts.Token;
+        // Resolve immediately on OSC PromptStart — no fixed settle delay.
+        // Trailing output that arrives after this (pwsh prompt repaint,
+        // Format-Table rows still streaming, etc.) lands in _postPrimaryOutput
+        // and the proxy drains it via the drain_post_output pipe message.
+        Resolve();
+    }
 
-        // 500ms settle — wait for any trailing output after PromptStart.
-        // pwsh Format-Table output may arrive in chunks after the prompt is drawn,
-        // so we need a generous settle window.
-        _ = Task.Delay(500, token).ContinueWith(_ =>
+    /// <summary>
+    /// Discard whatever is in the post-primary buffer without waiting. Used
+    /// by shells (pwsh/powershell) where nothing useful ever arrives after
+    /// OSC PromptStart — the trailing bytes are just the prompt repaint and
+    /// PSReadLine prediction animation, which would otherwise leak into the
+    /// next command's delta capture.
+    /// </summary>
+    public void ClearPostPrimary()
+    {
+        lock (_lock) _postPrimaryOutput.Clear();
+    }
+
+    /// <summary>
+    /// Wait for the post-primary output buffer to stabilise (no growth for
+    /// stableMs), then drain it and return the cleaned delta. Called from
+    /// the worker's drain_post_output pipe handler after the primary execute
+    /// response has been delivered to the proxy.
+    /// </summary>
+    public async Task<string> WaitAndDrainPostOutputAsync(int stableMs, int maxMs, CancellationToken ct)
+    {
+        stableMs = Math.Max(1, stableMs);
+        maxMs = Math.Max(stableMs, maxMs);
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(maxMs);
+
+        int lastLen;
+        lock (_lock) lastLen = _postPrimaryOutput.Length;
+        var lastChange = DateTime.UtcNow;
+
+        while (DateTime.UtcNow < deadline)
         {
-            if (!token.IsCancellationRequested)
-                Resolve();
-        }, TaskContinuationOptions.OnlyOnRanToCompletion);
+            var remaining = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+            var pollMs = Math.Clamp(Math.Min(30, stableMs / 2), 5, remaining);
+            try { await Task.Delay(pollMs, ct); }
+            catch (OperationCanceledException) { break; }
+
+            int currentLen;
+            lock (_lock) currentLen = _postPrimaryOutput.Length;
+
+            if (currentLen != lastLen)
+            {
+                lastLen = currentLen;
+                lastChange = DateTime.UtcNow;
+                continue;
+            }
+
+            if ((DateTime.UtcNow - lastChange).TotalMilliseconds >= stableMs)
+                break;
+        }
+
+        string raw;
+        lock (_lock)
+        {
+            raw = _postPrimaryOutput.ToString();
+            _postPrimaryOutput.Clear();
+        }
+        return CleanDelta(raw);
+    }
+
+    /// <summary>
+    /// Clean a trailing-output delta — strip ANSI, drop trailing prompt and
+    /// blank lines, normalise CRLF. Unlike CleanOutput this does NOT strip
+    /// AcceptLine noise (no command echo in the delta) and does NOT trim
+    /// leading blanks (they might be meaningful Format-Table spacing).
+    /// </summary>
+    private static string CleanDelta(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+
+        var output = StripAnsi(raw);
+        var lines = output.Split('\n');
+        var cleaned = new List<string>(lines.Length);
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine.TrimEnd('\r');
+            var trimmed = line.TrimEnd();
+            if (trimmed == ">>" || trimmed.StartsWith(">> ")) continue;
+            cleaned.Add(line);
+        }
+
+        while (cleaned.Count > 0)
+        {
+            var last = cleaned[^1].Trim();
+            if (string.IsNullOrEmpty(last) ||
+                last is "$" or "#" or "%" or ">>" ||
+                IsShellPrompt(last))
+            {
+                cleaned.RemoveAt(cleaned.Count - 1);
+            }
+            else break;
+        }
+
+        return string.Join('\n', cleaned).TrimEnd();
     }
 
     private void Resolve()
@@ -355,8 +460,6 @@ public class CommandTracker
 
     private void Cleanup()
     {
-        _settleCts?.Cancel();
-        _settleCts = null;
         _tcs = null;
         _isAiCommand = false;
         _output = "";

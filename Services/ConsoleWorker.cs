@@ -764,15 +764,25 @@ public class ConsoleWorker
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
 
+                    // First pass: dispatch every event EXCEPT PromptStart.
+                    // CommandInputStart/CommandExecuted/CommandFinished/Cwd only
+                    // mutate tracker state; they must run before FeedOutput so
+                    // that e.g. OSC B's _output="" happens before the chunk's
+                    // text is appended.
+                    bool sawPromptStart = false;
                     foreach (var evt in result.Events)
                     {
-                        _tracker.HandleEvent(evt);
-                        if (!_ready && evt.Type == OscParser.OscEventType.PromptStart)
+                        if (evt.Type == OscParser.OscEventType.PromptStart)
                         {
-                            _ready = true;
-                            _readyEvent.Set();
+                            sawPromptStart = true;
+                            if (!_ready)
+                            {
+                                _ready = true;
+                                _readyEvent.Set();
+                            }
+                            continue;
                         }
-                        // Re-enable PTY mirroring when PSReadLine signals command execution start
+                        _tracker.HandleEvent(evt);
                         if (_ready && evt.Type == OscParser.OscEventType.CommandInputStart)
                             _mirrorVisible = true;
                     }
@@ -805,6 +815,15 @@ public class ConsoleWorker
                             }
                             catch { }
                         }
+                    }
+
+                    // Second pass: PromptStart fires Resolve, and Resolve
+                    // needs the chunk's text already in _output. Deferring
+                    // to here prevents the "OSC A handled before feed →
+                    // Cleanup wipes _output → command output lost" race.
+                    if (sawPromptStart)
+                    {
+                        _tracker.HandleEvent(new OscParser.OscEvent(OscParser.OscEventType.PromptStart));
                     }
                 }
             }
@@ -903,12 +922,42 @@ public class ConsoleWorker
                 else w.WriteNull("runningElapsedSeconds");
             }),
             "get_cached_output" => HandleGetCachedOutput(),
+            "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),
             "display_banner" => HandleDisplayBanner(request),
             "claim" => HandleClaim(request),
             "ping" => SerializeResponse(w => w.WriteString("status", "ok")),
             _ => SerializeResponse(w => w.WriteString("error", $"Unknown request type: {type}")),
         };
+    }
+
+    /// <summary>
+    /// Wait for trailing output (bytes arriving after the primary Resolve)
+    /// to stabilise, then return the cleaned delta. Called by the proxy
+    /// immediately after a successful execute response so the AI receives
+    /// any output the shell streamed after OSC PromptStart.
+    ///
+    /// For pwsh/powershell the drain is skipped entirely and an empty delta
+    /// is returned: pwsh emits OSC A as part of its prompt function return
+    /// value, so by the time the worker sees OSC A all command output has
+    /// already been captured. The only bytes that arrive after OSC A are
+    /// the prompt text ("PS C:\foo> ") and PSReadLine prediction rendering
+    /// (ghost text based on history), both of which are noise for the AI
+    /// and would otherwise leak into the delta.
+    /// </summary>
+    private async Task<JsonElement> HandleDrainPostOutputAsync(JsonElement request, CancellationToken ct)
+    {
+        var shellName = Path.GetFileNameWithoutExtension(_shell).ToLowerInvariant();
+        if (shellName is "pwsh" or "powershell")
+        {
+            _tracker.ClearPostPrimary();
+            return SerializeResponse(w => w.WriteNull("delta"));
+        }
+
+        var stableMs = request.TryGetProperty("stable_ms", out var sm) && sm.ValueKind == JsonValueKind.Number ? sm.GetInt32() : 100;
+        var maxMs = request.TryGetProperty("max_ms", out var mm) && mm.ValueKind == JsonValueKind.Number ? mm.GetInt32() : 500;
+        var delta = await _tracker.WaitAndDrainPostOutputAsync(stableMs, maxMs, ct);
+        return SerializeResponse(w => w.WriteStringOrNull("delta", delta));
     }
 
     private async Task<JsonElement> HandleExecuteAsync(JsonElement request, CancellationToken ct)
