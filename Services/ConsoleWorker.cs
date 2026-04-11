@@ -1002,9 +1002,18 @@ public class ConsoleWorker
             // glitch. \r moves to column 0, \e[2K clears the entire line,
             // then we re-emit a default-format prompt and the colorized
             // command on a clean slate.
+            //
+            // Crucially, the echo does NOT end with \r\n. Leaving the cursor
+            // at the end of the command text mirrors what a human typing the
+            // same command would see just before pressing Enter. PSReadLine's
+            // AcceptLine finalize (mirrored to the visible console once
+            // _mirrorVisible flips true on OSC B) then emits its own newline,
+            // moving the cursor to the next line exactly once. Adding our own
+            // \r\n would double up and leave a blank line between the echo
+            // and the command's output.
             var cwd = _tracker.LastKnownCwd ?? _cwd;
             var synthPrompt = $"PS {cwd}> ";
-            var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}\r\n");
+            var cmdDisplay = Encoding.UTF8.GetBytes($"\r\x1b[2K{synthPrompt}{echoText}");
             _stdoutStream.Write(cmdDisplay, 0, cmdDisplay.Length);
             _stdoutStream.Flush();
         }
