@@ -367,6 +367,11 @@ public class ConsoleManager
         bool sameShellFamily = sourceShellFamily != null && targetShellFamily != null &&
                                 sourceShellFamily.Equals(targetShellFamily, StringComparison.OrdinalIgnoreCase);
 
+        // What actually gets written to the PTY (may grow by a cd preamble).
+        // The status/busy lines keep showing `command` unchanged so the AI
+        // sees the pipeline it asked for, not the proxy-injected cd.
+        var executedCommand = command;
+
         if (isSwitching && sourceCwd != null && sameShellFamily)
         {
             // Same-shell switch with a known source cwd: prepend cd preamble so
@@ -374,7 +379,7 @@ public class ConsoleManager
             var cdPreamble = BuildCdPreamble(targetShellFamily!, sourceCwd);
             if (cdPreamble != null)
             {
-                command = cdPreamble + command;
+                executedCommand = cdPreamble + command;
                 lock (_lock)
                 {
                     var info = _consoles.GetValueOrDefault(consolePid);
@@ -433,11 +438,20 @@ public class ConsoleManager
 
         try
         {
+            // Record the AI-visible command for this console so background
+            // busy reports can show what the AI asked for, not the preamble-
+            // augmented string the worker actually runs.
+            lock (_lock)
+            {
+                var ci = _consoles.GetValueOrDefault(consolePid);
+                if (ci != null) ci.LastAiCommand = command;
+            }
+
             var response = await SendPipeRequestAsync(pipeName, w =>
             {
                 w.WriteString("type", "execute");
                 w.WriteString("id", Guid.NewGuid().ToString());
-                w.WriteString("command", command);
+                w.WriteString("command", executedCommand);
                 w.WriteNumber("timeout", timeoutSeconds * 1000);
             }, TimeSpan.FromSeconds(timeoutSeconds + 5));
 
@@ -914,7 +928,12 @@ public class ConsoleManager
                     continue;
                 }
 
-                var cmd = statusResp.TryGetProperty("runningCommand", out var rc) ? rc.GetString() : null;
+                // Prefer the proxy-tracked LastAiCommand (original user input)
+                // over the worker's runningCommand (which includes any cd
+                // preamble the proxy injected before sending). Fall back if
+                // the proxy never recorded one.
+                var cmd = info?.LastAiCommand
+                    ?? (statusResp.TryGetProperty("runningCommand", out var rc) ? rc.GetString() : null);
                 double? elapsed = null;
                 if (statusResp.TryGetProperty("runningElapsedSeconds", out var esProp)
                     && esProp.ValueKind == JsonValueKind.Number)
@@ -945,7 +964,7 @@ public class ConsoleManager
     /// </summary>
     public record WaitForCompletionResult(
         List<ExecuteResult> Completed,
-        List<(int Pid, string DisplayName, string? ShellFamily)> StillBusy,
+        List<BusyStatus> StillBusy,
         bool HadNoBusyPids);
 
     /// <summary>
@@ -982,7 +1001,7 @@ public class ConsoleManager
         {
             return new WaitForCompletionResult(
                 new List<ExecuteResult>(),
-                new List<(int, string, string?)>(),
+                new List<BusyStatus>(),
                 HadNoBusyPids: true);
         }
 
@@ -1074,13 +1093,11 @@ public class ConsoleManager
             await Task.Delay(300);
         }
 
-        var stillBusy = busyPids
-            .Select(pid =>
-            {
-                var info = _consoles.GetValueOrDefault(pid);
-                return (pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily);
-            })
-            .ToList();
+        // Report the still-busy consoles via the same BusyStatus shape the
+        // per-tool background busy report uses, so the AI sees a consistent
+        // `⧗ #pid Name (shell) | Status: Busy (Ns) | Pipeline: cmd` format
+        // everywhere.
+        var stillBusy = await CollectBusyStatusesAsync(agentId);
 
         return new WaitForCompletionResult(completed, stillBusy, HadNoBusyPids: false);
     }
@@ -1312,6 +1329,11 @@ public class ConsoleManager
         // Cwd as of the most recent AI command. Used to detect manual user cd
         // and to skip the "NOT executed" warning when cwd is consistent.
         public string? LastAiCwd { get; set; }
+
+        // Original AI-visible command text (without proxy-injected cd preamble).
+        // Used by CollectBusyStatusesAsync so background busy lines show what
+        // the AI asked for, not the preamble-augmented string.
+        public string? LastAiCommand { get; set; }
     }
 
     /// <summary>

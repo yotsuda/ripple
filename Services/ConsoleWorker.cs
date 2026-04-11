@@ -22,6 +22,28 @@ public class ConsoleWorker
     private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"splashshell-worker-{Environment.ProcessId}.log");
     private static void Log(string msg) { try { File.AppendAllText(LogFile, $"{DateTime.Now:HH:mm:ss.fff} {msg}\n"); } catch { } }
 
+    /// <summary>
+    /// Delete worker log files older than 24 hours so long-running sessions
+    /// don't accumulate files in %TEMP%. Best-effort — failures are silent.
+    /// </summary>
+    private static void CleanupOldLogs()
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow.AddHours(-24);
+            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), "splashshell-worker-*.log"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(path) < cutoff)
+                        File.Delete(path);
+                }
+                catch { /* in use by another live worker, or locked — skip */ }
+            }
+        }
+        catch { /* TEMP not readable — skip */ }
+    }
+
     private string _pipeName;
     private readonly string _unownedPipeName;
     private int _proxyPid;
@@ -107,32 +129,33 @@ public class ConsoleWorker
         var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var readTask = ReadOutputLoop(readCts.Token);
 
-        // Wait for shell to fully start (profile + injection via -Command).
-        await WaitForOutputSettled(ct);
         // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
 
-        if (shellName is "cmd")
+        if (shellName is "pwsh" or "powershell")
+        {
+            // pwsh with -NoExit -Command sources the integration script during
+            // startup, then drops into interactive mode where the overridden
+            // prompt function emits the first OSC A automatically. Go straight
+            // to WaitForReady — no settle wait, no kick Enter. This was the
+            // biggest contributor to auto-start latency (~2s).
+        }
+        else if (shellName is "cmd")
         {
             // cmd.exe with /k prompt doesn't paint the first prompt until it
-            // reads input. Send a harmless Enter so the OSC-aware prompt runs
-            // and the proxy can pick up the cwd marker.
+            // reads input. Let the welcome banner finish, then kick an Enter
+            // so the OSC-aware prompt runs.
+            await WaitForOutputSettled(ct);
             await WriteToPty(enter, ct);
-        }
-        else if (shellName is "pwsh" or "powershell")
-        {
-            // pwsh with -NoExit -Command paints its first prompt automatically
-            // when -Command finishes, so the OSC markers fire without any
-            // external kick. Sending a spurious Enter here would run the
-            // PSReadLine Enter handler, emit an OSC B, and leave CommandTracker
-            // in "user busy" state right before the proxy's first execute
-            // request arrives — causing HandleExecuteAsync to reject it.
         }
         else
         {
-            // bash/zsh and others: inject via PTY input after startup.
-            // Suppress output mirroring during injection to hide the `source` echo
-            // and any noise from sourcing the integration script.
+            // bash/zsh and others: wait for initial output to settle so the
+            // shell is past its welcome banner and ready to accept input,
+            // then inject the integration script via PTY stdin. Output
+            // mirroring is suppressed during injection to hide the `source`
+            // echo and any noise from loading the script.
+            await WaitForOutputSettled(ct);
             _mirrorVisible = false;
             await InjectShellIntegration(ct);
             await Task.Delay(500, ct);
@@ -827,6 +850,12 @@ public class ConsoleWorker
                 var response = await HandleRequestAsync(request, ct);
                 await WriteMessageAsync(server, response, ct);
             }
+            catch (IOException)
+            {
+                // Pipe closed mid-handshake (proxy disconnected before the
+                // worker's response fully drained). Benign; the proxy already
+                // has whatever response it was going to get.
+            }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 Log($"Pipe error: {ex.Message}");
@@ -1174,6 +1203,7 @@ public class ConsoleWorker
 
     public static async Task<int> RunConsoleMode(string[] args)
     {
+        CleanupOldLogs();
         string? proxyPid = null, agentId = null, shell = null, cwd = null, banner = null, reason = null;
 
         for (int i = 0; i < args.Length; i++)

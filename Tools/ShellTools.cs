@@ -38,7 +38,7 @@ public class ShellTools
         var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
         var cwdInfo = !string.IsNullOrEmpty(result.Cwd) ? $" at {result.Cwd}" : "";
         var response = result.Status == "reused"
-            ? $"Reusing standby console {result.DisplayName}{shellInfo}{cwdInfo}. Did not launch a new console. To force a new console, provide the reason parameter."
+            ? $"Reusing standby {result.DisplayName}{shellInfo}{cwdInfo}."
             : $"Console {result.DisplayName}{shellInfo} opened{cwdInfo}.";
 
         return await AppendCachedOutputs(consoleManager, agentId, response);
@@ -107,11 +107,8 @@ public class ShellTools
         if (result.StillBusy.Count > 0)
         {
             sb.AppendLine($"Still busy after {timeout_seconds}s. Call wait_for_completion again to keep waiting:");
-            foreach (var (_, displayName, shellFamily) in result.StillBusy)
-            {
-                var shell = shellFamily != null ? $" ({shellFamily})" : "";
-                sb.AppendLine($"  ⧗ {displayName}{shell}");
-            }
+            foreach (var b in result.StillBusy)
+                sb.AppendLine(FormatBusyLine(b));
         }
 
         return await AppendCachedOutputs(consoleManager, agentId, sb.ToString().TrimEnd());
