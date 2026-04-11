@@ -1007,9 +1007,10 @@ public class ConsoleWorker
             // in the interactive prompt, so colorize the echo to match what
             // the human user would see if they'd typed the command. Windows
             // PowerShell 5.1 (powershell.exe) bundles an older PSReadLine
-            // that doesn't color command input by default — keep that echo
-            // plain so splash's fake echo matches the shell's native style.
-            var echoText = shellName == "pwsh"
+            // Both pwsh and powershell.exe (Windows PowerShell 5.1) get the
+            // colorizer treatment so AI-echoed commands look the same as
+            // what PSReadLine renders for human-typed input.
+            var echoText = shellName is "pwsh" or "powershell"
                 ? PwshColorizer.Colorize(command)
                 : command;
 
