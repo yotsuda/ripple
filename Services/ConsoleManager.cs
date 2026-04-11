@@ -512,6 +512,27 @@ public class ConsoleManager
                 return new ExecuteResult { Pid = consolePid, TimedOut = true, DisplayName = displayName, ShellFamily = shellFamily, Command = command, Notice = routingNotice };
             }
 
+            // Worker reported that its shell process exited before the
+            // command could complete (user typed `exit`, shell crashed,
+            // etc). Clean up our tracking of the dead console and
+            // auto-start a fresh same-family replacement so a simple
+            // re-execute from the AI just works.
+            var shellExited = response.TryGetProperty("shellExited", out var seProp) && seProp.GetBoolean();
+            if (shellExited)
+            {
+                var deadName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                var deadShell = _consoles.GetValueOrDefault(consolePid)?.ShellPath;
+                ClearDeadConsole(agentId, consolePid);
+                var replacement = await StartConsoleInnerAsync(deadShell ?? shell ?? GetDefaultShell(), null, null, agentId);
+                return new ExecuteResult
+                {
+                    Pid = replacement.Pid,
+                    Switched = true,
+                    DisplayName = replacement.DisplayName,
+                    Output = $"Previous console {deadName} exited (shell process gone). Switched to {replacement.DisplayName}. Pipeline NOT executed — re-execute.",
+                };
+            }
+
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";

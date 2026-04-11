@@ -76,6 +76,13 @@ public class ConsoleWorker
     // Signals the main loop to stop serving pipes while keeping the PTY alive
     // so the user can continue working in the terminal.
     private volatile bool _obsolete;
+    // Fires when ReadOutputLoop sees EOF on the PTY output stream, i.e. the
+    // child shell process has exited (e.g. user typed `exit`). The main loop
+    // watches this so the worker process shuts down cleanly instead of
+    // hanging forever on a dead PTY while pending execute requests sit
+    // stuck waiting for OSC markers that will never come.
+    private readonly TaskCompletionSource _shellExitedTcs =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     // This worker's own binary version — compared against the proxy_version
     // field in incoming claim requests to detect cross-version re-claim.
     private static readonly Version _myVersion =
@@ -134,6 +141,13 @@ public class ConsoleWorker
         // Start reading PTY output on dedicated thread (feeds OscParser + CommandTracker)
         var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var readTask = ReadOutputLoop(readCts.Token);
+
+        // Watch the child shell process. ConPTY does NOT close the output
+        // pipe when the child exits, so ReadOutputLoop's blocking Read
+        // would sit waiting forever if we relied on EOF. Instead wait on
+        // the process handle directly and, when it fires, signal the main
+        // loop via _shellExitedTcs so the worker can tear itself down.
+        _ = WaitForShellExitAsync(ct);
 
         // Shell-specific Enter key: Unix shells use \n, Windows shells use \r
         var enter = shellName is "bash" or "sh" or "zsh" ? "\n" : "\r";
@@ -203,8 +217,19 @@ public class ConsoleWorker
             var unownedTask = RunPipeServerAsync(_unownedPipeName, ct);
             var monitorTask = MonitorParentProxyAsync(ct);
 
-            // Wait for proxy death or external cancellation
-            await monitorTask;
+            // Wait for proxy death, shell exit, or external cancellation.
+            // Shell exit (user typed `exit`, or the shell crashed) wins and
+            // shuts the whole worker down so the proxy's next pipe request
+            // gets a clean IOException and reports "Previous console died"
+            // to the AI. Otherwise proxy death triggers re-claim flow.
+            var mainWaitWinner = await Task.WhenAny(monitorTask, _shellExitedTcs.Task);
+            if (mainWaitWinner == _shellExitedTcs.Task)
+            {
+                Log("Shell process exited; worker shutting down");
+                ownedCts.Cancel();
+                await Task.WhenAll(ownedTasks).ContinueWith(_ => { });
+                break;
+            }
 
             // Proxy died — stop owned listeners, keep unowned running
             ownedCts.Cancel();
@@ -234,16 +259,23 @@ public class ConsoleWorker
         // Obsolete mode: the pipe service has stopped, but the shell is still
         // alive and the user may still be working in it. readTask/inputTask/
         // resizeTask are running on `ct`; wait here until the user closes the
-        // console window (which cancels `ct`), then fall through to cleanup.
+        // console window (which cancels `ct`) or the shell process exits,
+        // then fall through to cleanup.
         if (_obsolete)
         {
-            try { await Task.Delay(Timeout.Infinite, ct); }
+            try { await Task.WhenAny(Task.Delay(Timeout.Infinite, ct), _shellExitedTcs.Task); }
             catch (OperationCanceledException) { }
         }
 
-        // Cleanup
-        readCts.Cancel();
-        _pty?.Dispose();
+        // Cleanup — guarded so any late-stage race (ReadOutputLoop still
+        // blocked on the now-dead PTY, double-dispose of handles, etc.)
+        // can't escape and turn an otherwise-clean shutdown into a non-
+        // zero process exit. Windows Terminal's "close on exit" default
+        // only fires on exit code 0, so a thrown exception here would
+        // leave the visible window stuck after the shell died.
+        try { readCts.Cancel(); } catch { }
+        try { _pty?.Dispose(); } catch (Exception ex) { Log($"PTY dispose: {ex.GetType().Name}: {ex.Message}"); }
+        Log("RunAsync completed cleanly");
     }
 
     /// <summary>
@@ -785,6 +817,29 @@ public class ConsoleWorker
         catch { }
     }
 
+    /// <summary>
+    /// Wait for the child shell process to exit, then signal the main loop.
+    /// Needed because ConPTY keeps the output pipe open indefinitely even
+    /// after the child process dies, so ReadOutputLoop's blocking Read is
+    /// not a reliable shell-death signal. We watch the Windows process
+    /// handle directly via Process.WaitForExitAsync.
+    /// </summary>
+    private async Task WaitForShellExitAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var proc = System.Diagnostics.Process.GetProcessById(_pty!.ProcessId);
+            await proc.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException) { return; }
+        catch (ArgumentException) { /* already gone */ }
+        catch (Exception ex) { Log($"WaitForShellExit: {ex.GetType().Name}: {ex.Message}"); }
+
+        Log("Shell process exited");
+        _tracker.AbortPending();
+        _shellExitedTcs.TrySetResult();
+    }
+
     private Task ReadOutputLoop(CancellationToken ct)
     {
         // Dedicated thread with synchronous ReadFile in a tight loop.
@@ -847,7 +902,17 @@ public class ConsoleWorker
             }
             catch (IOException) { }
             catch (Exception ex) { Log($"ReadOutputLoop error: {ex.GetType().Name}: {ex.Message}"); }
-            finally { tcs.TrySetResult(); }
+            finally
+            {
+                // Signal the main loop that the child shell process is gone
+                // (Read returned 0 or threw). The main loop wakes up and
+                // tears the worker down so the pipe closes promptly and the
+                // proxy can surface a "Previous console died" to the AI.
+                Log("ReadOutputLoop exited; shell process has gone");
+                _tracker.AbortPending();
+                _shellExitedTcs.TrySetResult();
+                tcs.TrySetResult();
+            }
         });
         thread.IsBackground = true;
         thread.Name = "ConPTY-Reader";
@@ -1079,6 +1144,22 @@ public class ConsoleWorker
                 w.WriteNull("cwd");
                 w.WriteString("duration", (timeoutMs / 1000.0).ToString("F1"));
                 w.WriteBoolean("timedOut", true);
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Raised by _tracker.AbortPending() when the child shell process
+            // exited before delivering OSC A. Return a synthetic error result
+            // so the proxy-side execute call unwinds instead of waiting for
+            // an IOException from the worker process termination.
+            return SerializeResponse(w =>
+            {
+                w.WriteString("output", ex.Message);
+                w.WriteNumber("exitCode", -1);
+                w.WriteNull("cwd");
+                w.WriteString("duration", "0.0");
+                w.WriteBoolean("timedOut", false);
+                w.WriteBoolean("shellExited", true);
             });
         }
     }
@@ -1367,6 +1448,16 @@ public class ConsoleWorker
             await worker.RunAsync(cts.Token);
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            // Swallow any late-stage exception so Program.cs still sees
+            // exit code 0. Windows Terminal's "close on exit" default is
+            // graceful, which means exit != 0 leaves the window open with
+            // "[process exited with code ...]" instead of closing. A
+            // clean exit 0 after shell death lets the console window
+            // close automatically alongside the dead shell.
+            Log($"RunConsoleMode exception: {ex.GetType().Name}: {ex.Message}");
+        }
 
         return 0;
     }

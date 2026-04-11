@@ -142,6 +142,26 @@ public class CommandTracker
     }
 
     /// <summary>
+    /// Fail any in-flight RegisterCommand with a "shell exited" error so the
+    /// HandleExecuteAsync call blocked on it unwinds promptly. Called from
+    /// the worker's read loop when the child shell process goes away.
+    /// </summary>
+    public void AbortPending()
+    {
+        lock (_lock)
+        {
+            if (_tcs != null && !_tcs.Task.IsCompleted)
+            {
+                var tcs = _tcs;
+                _tcs = null;
+                _timeoutReg.Dispose();
+                Cleanup();
+                tcs.TrySetException(new InvalidOperationException("Shell process exited before the command completed."));
+            }
+        }
+    }
+
+    /// <summary>
     /// Feed an OSC event from the parser. The caller must pass events in
     /// source order, interleaved with matching FeedOutput calls, so that
     /// _output.Length at event-dispatch time is the offset at which the
