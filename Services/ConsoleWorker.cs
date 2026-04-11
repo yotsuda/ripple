@@ -385,13 +385,17 @@ public class ConsoleWorker
 
     private async Task InjectShellIntegration(CancellationToken ct)
     {
+        // This path is only reached for POSIX-style shells (bash / sh / zsh
+        // and whatever else falls through the RunAsync shell dispatch into
+        // the "inject via PTY" branch). pwsh/powershell integration is
+        // injected via BuildCommandLine's -Command argument, and cmd sets
+        // its PROMPT at /k startup. So the old dead pwsh branch here used
+        // to never fire — it's gone now.
         var shellName = ConsoleManager.NormalizeShellFamily(_shell);
         string? script = shellName switch
         {
-            "bash" or "sh" => LoadEmbeddedScript("integration.bash"),
-            "pwsh" or "powershell" => LoadEmbeddedScript("integration.ps1"),
             "zsh" => LoadEmbeddedScript("integration.zsh"),
-            _ => LoadEmbeddedScript("integration.bash"), // fallback to bash
+            _    => LoadEmbeddedScript("integration.bash"),
         };
 
         if (script == null)
@@ -400,49 +404,29 @@ public class ConsoleWorker
             return;
         }
 
-        // Inject script via PTY — write it as a temporary file, source it, then delete
-        // This avoids quoting issues with multi-line heredocs in different shells
-        var tmpFile = ConsoleManager.IsPowerShellFamily(shellName)
-            ? Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1")
-            : $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh";
-
-        // For Windows paths, use pwsh-compatible approach
-        if (OperatingSystem.IsWindows() && ConsoleManager.IsPowerShellFamily(shellName))
+        if (OperatingSystem.IsWindows())
         {
-            tmpFile = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.ps1");
-            // Write file directly from worker process (we share filesystem with shell)
-            await File.WriteAllTextAsync(tmpFile, script, ct);
-
-            // Re-import PSReadLine (ConPTY may disable it due to screen reader detection)
-            // Then source integration script. Use \r only — pwsh interprets \n as LF
-            // which opens a multi-line continuation (>> prompt). \r alone = Enter.
-            var injection = shellName == "pwsh"
-                ? $"Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue\r"
-                : $". '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue\r";
-            await WriteToPty(injection, ct);
-        }
-        else if (OperatingSystem.IsWindows() && shellName is "bash" or "sh")
-        {
-            // Bash on Windows — write file directly, then source via PTY.
+            // Windows bash (WSL, MSYS2, Git Bash) — write the script to a
+            // Windows temp path directly since the worker and child share
+            // the filesystem, then teach the shell how to find it in its
+            // own namespace (/mnt/c/... for WSL, /c/... for MSYS2).
             var windowsPath = Path.Combine(Path.GetTempPath(), $".splashshell-integration-{Environment.ProcessId}.sh");
             var scriptContent = script.Replace("\r\n", "\n");
             await File.WriteAllTextAsync(windowsPath, scriptContent, ct);
 
-            // Determine the Unix-style path depending on whether bash is WSL or MSYS2/Git Bash.
-            // WSL: C:\Users\... → /mnt/c/Users/...
-            // MSYS2: C:\Users\... → /c/Users/...
             var unixPath = IsWslBash(_shell)
                 ? "/mnt/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/')
                 : "/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
 
             Log($"Integration script: {windowsPath} → {unixPath} (exists={File.Exists(windowsPath)}, wsl={IsWslBash(_shell)})");
 
-            // bash expects \n for Enter (not \r which pwsh needs)
             await WriteToPty($"source '{unixPath}'; rm -f '{unixPath}'\n", ct);
         }
         else
         {
-            // Linux/macOS
+            // Linux/macOS: heredoc the script into the child's own /tmp so
+            // we don't need the worker to see the child's filesystem.
+            var tmpFile = $"/tmp/.splashshell-integration-{Environment.ProcessId}.sh";
             var injection = new StringBuilder();
             injection.AppendLine($"cat > {tmpFile} << 'SPLASHSHELL_EOF'");
             injection.AppendLine(script.TrimEnd());
