@@ -20,10 +20,12 @@ A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a
 
 No global install is required — `npx` fetches and runs splashshell on demand. The only prerequisite is the [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0) (the package bundles a ~5.6 MB native `splash.exe` that needs it).
 
+> The `@latest` tag is important: without it, npx will happily keep reusing a stale cached copy even after a new version ships.
+
 ### Claude Code
 
 ```bash
-claude mcp add-json splash -s user '{"command":"npx","args":["-y","splashshell"]}'
+claude mcp add-json splash -s user '{"command":"npx","args":["-y","splashshell@latest"]}'
 ```
 
 ### Claude Desktop
@@ -35,7 +37,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
   "mcpServers": {
     "splash": {
       "command": "npx",
-      "args": ["-y", "splashshell"]
+      "args": ["-y", "splashshell@latest"]
     }
   }
 }
