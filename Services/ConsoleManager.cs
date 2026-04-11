@@ -480,6 +480,37 @@ public class ConsoleManager
             }
         }
 
+        return await ExecutePlannedCommandAsync(
+            consolePid: consolePid,
+            pipeName: pipeName,
+            command: command,
+            executedCommand: executedCommand,
+            timeoutSeconds: timeoutSeconds,
+            agentId: agentId,
+            shell: shell,
+            routingNotice: routingNotice);
+    }
+
+    /// <summary>
+    /// Run the pipe-level execute call after routing is done. Writes the
+    /// (possibly preamble-augmented) command to the worker, waits for the
+    /// response, drains any trailing post-prompt output, updates
+    /// LastAiCwd, and translates pipe-level exceptions (timeout, cancel,
+    /// I/O error) into an appropriate ExecuteResult. The routing notice
+    /// chosen by the planner is carried through every success / busy /
+    /// timeout path so the AI sees source-drift context even when the
+    /// command itself fails.
+    /// </summary>
+    private async Task<ExecuteResult> ExecutePlannedCommandAsync(
+        int consolePid,
+        string pipeName,
+        string command,
+        string executedCommand,
+        int timeoutSeconds,
+        string agentId,
+        string? shell,
+        string? routingNotice)
+    {
         try
         {
             // Record the AI-visible command for this console so background
