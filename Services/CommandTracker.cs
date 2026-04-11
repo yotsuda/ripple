@@ -230,7 +230,23 @@ public class CommandTracker
                     break;
 
                 case OscParser.OscEventType.PromptStart:
-                    Resolve();
+                    // Only treat OSC A as the end of an AI command when we
+                    // actually saw a command cycle — both OSC C (command
+                    // started) and OSC D (command finished) must have
+                    // fired since RegisterCommand. A bare OSC A without
+                    // that framing means the shell just printed a prompt
+                    // unrelated to our AI command — most commonly the
+                    // very first prompt after pwsh startup, which can
+                    // arrive AFTER RegisterCommand if the shell was slow
+                    // to initialize (Defender first-scan, Import-Module
+                    // PSReadLine, sourcing the banner prefix, etc) and
+                    // WaitForReady's timeout fell through. Resolving here
+                    // would hand the AI the reason banner / PSReadLine
+                    // prediction rendering as "command output" and leave
+                    // the real command unanswered. Ignore this OSC A and
+                    // wait for the real one.
+                    if (_commandStart >= 0 && _commandEnd >= 0)
+                        Resolve();
                     break;
             }
         }

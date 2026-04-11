@@ -85,6 +85,16 @@ public class ConsoleManager
     {
         public int ActivePid { get; set; }
         public readonly HashSet<int> KnownBusyPids = new();
+
+        // Snapshot of the most recently-active console's state, captured
+        // the moment the console stopped being available (shell exited,
+        // pipe broken, window closed). Lets the next execute_command spin
+        // up a fresh same-family console and cd to where the AI was last
+        // working, instead of making the AI verify-and-retry from scratch.
+        // Consumed by PlanExecutionAsync on the following call and then
+        // cleared.
+        public string? LastActiveCwd;
+        public string? LastActiveShellPath;
     }
 
     private AgentSessionState GetOrCreateAgentState(string agentId)
@@ -110,6 +120,27 @@ public class ConsoleManager
     private List<int> SnapshotBusyPids(string agentId)
     {
         lock (_lock) return GetOrCreateAgentState(agentId).KnownBusyPids.ToList();
+    }
+
+    /// <summary>
+    /// If the given pid is the agent's currently-active console, snapshot
+    /// its last-known cwd and shell path into the agent session so the
+    /// next execute_command can seamlessly auto-start a same-family
+    /// replacement at the same cwd. No-op for non-active consoles and for
+    /// consoles not in the tracking table. Call this BEFORE ClearDeadConsole
+    /// so the ConsoleInfo is still readable.
+    /// </summary>
+    private void RememberClosedActive(string agentId, int pid)
+    {
+        lock (_lock)
+        {
+            var state = GetOrCreateAgentState(agentId);
+            if (state.ActivePid != pid) return;
+            var info = _consoles.GetValueOrDefault(pid);
+            if (info == null) return;
+            state.LastActiveCwd = info.LastAiCwd;
+            state.LastActiveShellPath = info.ShellPath;
+        }
     }
 
     public string AllocateSubAgentId()
@@ -177,10 +208,19 @@ public class ConsoleManager
 
                 var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
 
-                // If cwd was explicitly specified, cd the reused console to it
-                if (!string.IsNullOrEmpty(cwd) && reusePipe != null)
+                // Always reposition the reused standby. An explicit cwd wins;
+                // otherwise default to the user's home directory so an
+                // unspecified start_console acts like a fresh session rather
+                // than inheriting wherever the standby happened to be left
+                // by earlier AI activity. Matches the new-console path,
+                // which also lands at home when cwd is null (ProcessLauncher
+                // falls back to SpecialFolder.UserProfile).
+                var targetCwd = !string.IsNullOrEmpty(cwd)
+                    ? cwd
+                    : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (reusePipe != null)
                 {
-                    var cdPreamble = BuildCdPreamble(shellFamily, cwd);
+                    var cdPreamble = BuildCdPreamble(shellFamily, targetCwd);
                     if (cdPreamble != null)
                     {
                         try
@@ -191,7 +231,7 @@ public class ConsoleManager
                                 w.WriteString("command", cdPreamble.TrimEnd('&', ' '));
                                 w.WriteNumber("timeout", 5000);
                             }, TimeSpan.FromSeconds(8));
-                            UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = cwd);
+                            UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = targetCwd);
                         }
                         catch { /* best-effort */ }
                     }
@@ -295,12 +335,31 @@ public class ConsoleManager
         int consolePid;
         string pipeName;
         string? sourceShellFamily;
+        // Snapshot of a recently-closed active console (shell exited,
+        // pipe broken, window closed by user). If present, it seeds
+        // sourceShellFamily + sourceCwd + resolvedShell so the auto-start
+        // path below can spin up a same-family replacement at the AI's
+        // last known cwd and run the command there in one shot, instead
+        // of a "switched to Foo, please re-execute" warning.
+        string? cachedDeadCwd = null;
 
         lock (_lock)
         {
-            initialActivePid = GetOrCreateAgentState(agentId).ActivePid;
+            var state = GetOrCreateAgentState(agentId);
+            initialActivePid = state.ActivePid;
             consolePid = initialActivePid;
             sourceShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
+
+            if (initialActivePid == 0 && state.LastActiveCwd != null)
+            {
+                cachedDeadCwd = state.LastActiveCwd;
+                resolvedShell ??= state.LastActiveShellPath;
+                if (state.LastActiveShellPath != null)
+                    sourceShellFamily = NormalizeShellFamily(state.LastActiveShellPath);
+                // Consume once so subsequent calls don't keep re-applying.
+                state.LastActiveCwd = null;
+                state.LastActiveShellPath = null;
+            }
 
             // Check if active console matches the requested shell (by full path)
             if (consolePid != 0 && resolvedShell != null)
@@ -317,7 +376,7 @@ public class ConsoleManager
 
         // Query the active console's status: get cwd (for cd preamble) and detect busy.
         // If busy, treat it like the active console is unavailable → trigger switch.
-        string? sourceCwd = null;
+        string? sourceCwd = cachedDeadCwd;
         bool activeBusy = false;
         if (initialActivePid != 0 && IsProcessAlive(initialActivePid))
         {
@@ -385,14 +444,35 @@ public class ConsoleManager
             }
             else
             {
-                // Auto-start a new console. We pass cwd=null so the worker starts
-                // in the default user profile: the source cwd is in shell-native
-                // format (e.g. bash returns /mnt/c/foo) and cannot be handed to
-                // Windows CreateProcess as a workingDirectory. The same-family
-                // cd preamble a few lines below positions the new console correctly
-                // before the user's command runs.
-                var startResult = await StartConsoleInnerAsync(resolvedShell ?? GetDefaultShell(), null, null, agentId);
-                consolePid = startResult.Pid;
+                // Auto-start a new console. When we're in the lazy-recovery
+                // path (cachedDeadCwd populated from a freshly-dead active
+                // console) and the target shell is Windows-native (pwsh,
+                // powershell, cmd) we can hand the cached Windows path
+                // straight to CreateProcess as workingDirectory — the
+                // shell comes up in the right place from its very first
+                // prompt, so no cd preamble or Set-Location injection is
+                // needed at all. Bypass the rest of the planning phase
+                // in that case. For bash/zsh on Windows we still pass
+                // null and fall through to the cd preamble branch below,
+                // because those shells report POSIX paths
+                // (/mnt/c/... or /c/...) that CreateProcess can't use as
+                // a working directory.
+                var targetShellPath = resolvedShell ?? GetDefaultShell();
+                if (cachedDeadCwd != null && IsWindowsNativeShellFamily(NormalizeShellFamily(targetShellPath)))
+                {
+                    var startResult = await StartConsoleInnerAsync(targetShellPath, cachedDeadCwd, null, agentId);
+                    consolePid = startResult.Pid;
+                    lock (_lock)
+                        pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
+                    // StartConsoleInnerAsync has already set LastAiCwd to
+                    // the freshly-started console's live cwd (which is
+                    // cachedDeadCwd). Return a plan that points directly
+                    // at the new console — no preamble, no warning.
+                    return new ExecutionPlan(consolePid, pipeName, command, RoutingNotice: null, EarlyResult: null);
+                }
+
+                var fallbackStart = await StartConsoleInnerAsync(targetShellPath, null, null, agentId);
+                consolePid = fallbackStart.Pid;
                 lock (_lock)
                     pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
             }
@@ -558,22 +638,25 @@ public class ConsoleManager
 
             // Worker reported that its shell process exited before the
             // command could complete (user typed `exit`, shell crashed,
-            // etc). Clean up our tracking of the dead console and
-            // auto-start a fresh same-family replacement so a simple
-            // re-execute from the AI just works.
+            // etc). Clear our tracking of the dead console and return a
+            // "died" notification — deliberately NOT auto-starting a
+            // replacement. If the AI meant to close the console, auto-
+            // spawning a new one would resurrect it against the AI's
+            // intent. The next execute_command will go through the
+            // normal no-active-console path in PlanExecutionAsync and
+            // spin up a fresh same-family console lazily.
             var shellExited = response.TryGetProperty("shellExited", out var seProp) && seProp.GetBoolean();
             if (shellExited)
             {
                 var deadName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-                var deadShell = _consoles.GetValueOrDefault(consolePid)?.ShellPath;
+                RememberClosedActive(agentId, consolePid);
                 ClearDeadConsole(agentId, consolePid);
-                var replacement = await StartConsoleInnerAsync(deadShell ?? shell ?? GetDefaultShell(), null, null, agentId);
                 return new ExecuteResult
                 {
-                    Pid = replacement.Pid,
+                    Pid = consolePid,
                     Switched = true,
-                    DisplayName = replacement.DisplayName,
-                    Output = $"Previous console {deadName} exited (shell process gone). Switched to {replacement.DisplayName}. Pipeline NOT executed — re-execute.",
+                    DisplayName = deadName,
+                    Output = $"Console {deadName} exited (shell process gone). Pipeline NOT executed — re-execute and splash will spin up a fresh console if needed.",
                 };
             }
 
@@ -643,14 +726,15 @@ public class ConsoleManager
         }
         catch (IOException)
         {
+            var deadName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+            RememberClosedActive(agentId, consolePid);
             ClearDeadConsole(agentId, consolePid);
-            var startResult = await StartConsoleInnerAsync(shell ?? GetDefaultShell(), null, null, agentId);
             return new ExecuteResult
             {
-                Pid = startResult.Pid,
+                Pid = consolePid,
                 Switched = true,
-                DisplayName = startResult.DisplayName,
-                Output = $"Previous console died. Switched to {startResult.DisplayName}. Pipeline NOT executed — re-execute.",
+                DisplayName = deadName,
+                Output = $"Console {deadName} died (pipe broken). Pipeline NOT executed — re-execute and splash will spin up a fresh console.",
             };
         }
     }
@@ -961,12 +1045,21 @@ public class ConsoleManager
             {
                 var info = _consoles[pid];
                 closed.Add((info.DisplayName, info.ShellFamily));
+                var state = GetOrCreateAgentState(agentId);
+                // If this was the AI's active console, snapshot its cwd /
+                // shell path before removing it so the next execute_command
+                // can seamlessly spin up a same-family replacement at the
+                // same working directory. Inlined rather than calling
+                // RememberClosedActive because we're already under _lock.
+                if (state.ActivePid == pid)
+                {
+                    state.LastActiveCwd = info.LastAiCwd;
+                    state.LastActiveShellPath = info.ShellPath;
+                    state.ActivePid = 0;
+                }
                 _consoles.Remove(pid);
                 _pidToTitle.Remove(pid);
-                var state = GetOrCreateAgentState(agentId);
                 state.KnownBusyPids.Remove(pid);
-                if (state.ActivePid == pid)
-                    state.ActivePid = 0;
             }
         }
         return closed;
@@ -1576,6 +1669,19 @@ public class ConsoleManager
     /// </summary>
     internal static string EnterKeyFor(string shellName)
         => IsUnixShell(shellName) ? "\n" : "\r";
+
+    /// <summary>
+    /// True for shells whose cwd format matches what Windows CreateProcess
+    /// expects as a workingDirectory parameter — pwsh, powershell and cmd
+    /// all report and accept Windows-native paths (`C:\foo`). bash and
+    /// zsh on Windows (WSL, MSYS2, Git Bash) are excluded because they
+    /// report POSIX paths (`/mnt/c/foo`, `/c/foo`) that CreateProcess
+    /// can't use directly. Used by the auto-start path to decide whether
+    /// a cached cwd can be handed to the new console via workingDirectory
+    /// instead of injected as a cd preamble.
+    /// </summary>
+    internal static bool IsWindowsNativeShellFamily(string shellName)
+        => shellName is "pwsh" or "powershell" or "cmd";
 
     /// <summary>
     /// Resolve a shell name to its full path. If already rooted, returns as-is.

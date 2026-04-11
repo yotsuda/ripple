@@ -180,7 +180,18 @@ public class ConsoleWorker
         }
 
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
-        await WaitForReady(TimeSpan.FromSeconds(15), ct);
+        // Wait until the shell reports its first OSC A (PromptStart).
+        // No wall-clock timeout: a cold pwsh startup + Defender first-
+        // scan of splash.exe + Import-Module PSReadLine + sourcing
+        // integration.ps1 can take arbitrary real time, and any fallback
+        // "proceed without OSC markers" path lets the worker accept AI
+        // commands before the shell is actually interactive — the next
+        // stray first-prompt OSC A then resolves them against a stale
+        // pre-command buffer, returning reason banner / PSReadLine
+        // prediction rendering as if it were command output. Instead we
+        // patiently wait; if the shell process dies during startup
+        // WaitForShellExitAsync fires _shellExitedTcs and bails us out.
+        await WaitForReady(ct);
         _ready = true;
         _mirrorVisible = true;
 
@@ -455,17 +466,21 @@ public class ConsoleWorker
 
     private readonly ManualResetEventSlim _readyEvent = new(false);
 
-    private async Task WaitForReady(TimeSpan timeout, CancellationToken ct)
+    private async Task WaitForReady(CancellationToken ct)
     {
-        // Wait for PromptStart signal from ReadOutputLoop (set via _readyEvent)
-        // instead of polling _ready every 100ms.
-        await Task.Run(() => _readyEvent.Wait(timeout, ct), ct).ConfigureAwait(false);
-
-        if (!_ready)
+        // Wait for the first PromptStart signal from ReadOutputLoop, or
+        // the shell process dying. No timeout — see the call site in
+        // RunAsync for the reasoning.
+        var readyTask = Task.Run(() => _readyEvent.Wait(ct), ct);
+        var winner = await Task.WhenAny(readyTask, _shellExitedTcs.Task).ConfigureAwait(false);
+        if (winner == _shellExitedTcs.Task)
         {
-            Log($"WARNING: No PromptStart received, proceeding without OSC markers");
-            _ready = true;
+            Log("Shell process exited before first prompt; aborting startup");
+            throw new InvalidOperationException("Shell process exited during startup");
         }
+        // Surface any exception from readyTask (e.g. OperationCanceledException
+        // if the worker ct cancelled while we were waiting).
+        await readyTask.ConfigureAwait(false);
     }
 
     // --- User input forwarding ---

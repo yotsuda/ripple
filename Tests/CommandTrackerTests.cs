@@ -133,6 +133,44 @@ public class CommandTrackerTests
             Assert(threw, "AI cmd: second RegisterCommand throws");
         }
 
+        // Test 8: a late first-prompt OSC A that arrives AFTER RegisterCommand
+        // but BEFORE the command's own OSC C / OSC D boundary must NOT resolve
+        // the pending task. Reproduces the "slow pwsh startup + timeout
+        // fallback" case where the pre-command buffer (reason banner etc.)
+        // would otherwise be returned as the command's output.
+        {
+            var t = new CommandTracker();
+            var task = t.RegisterCommand("Get-Location", timeoutMs: 30_000);
+
+            // Simulate the bytes that arrived between worker-ready and the
+            // real first prompt: the Write-Host reason text + the first
+            // prompt's OSC sequence arriving AFTER RegisterCommand has
+            // already fired. OSC B from integration.ps1's init-time write,
+            // then the delayed first prompt's OSC D/P/A.
+            t.FeedOutput("Reason: test\n\n");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\Users\\foo"));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+
+            Assert(!task.IsCompleted, "late first-prompt OSC A does NOT resolve before OSC C");
+            Assert(t.Busy, "AI cmd: still Busy after stray first prompt");
+
+            // Now simulate the real command actually running, which will
+            // deliver OSC C + output + OSC D + OSC A in proper order.
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.FeedOutput("C:\\MyProj\\splashshell\n");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\MyProj\\splashshell"));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+
+            Assert(task.IsCompleted, "real OSC C/D/A resolves the task");
+            var result = task.Result;
+            Assert(!result.Output.Contains("Reason"), "reason banner is NOT in captured output");
+            Assert(result.Output.Contains("C:\\MyProj\\splashshell"), "real command output is captured");
+            Assert(result.Cwd == "C:\\MyProj\\splashshell", "post-command cwd is reported");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
