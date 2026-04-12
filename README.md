@@ -12,6 +12,9 @@ A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a
 - **Shell integration built in.** OSC 633 markers delimit command boundaries cleanly, so output parsing is reliable even for interleaved prompts and long-running commands.
 - **Console re-claim.** Consoles outlive their parent MCP process. When the AI client restarts, the next session reattaches to existing consoles.
 - **Auto cwd handoff.** When a same-shell console is busy, a new one is auto-started in the source console's directory and your command runs immediately — no manual `cd` needed.
+- **Peek at busy consoles.** `peek_console` reads the terminal's current display — on Windows via the native screen buffer API, on other platforms via a built-in VT interpreter. Diagnose stuck commands, watch mode, and interactive prompts without interrupting.
+- **Send input to running commands.** `send_input` feeds keystrokes (Enter, Ctrl+C, arrow keys, text) to a busy console's PTY. Respond to `Read-Host` prompts, dismiss pauses, or interrupt runaway processes.
+- **Multi-line command support.** Multi-line PowerShell (heredocs, foreach, try/catch, nested scriptblocks) is handled via tempfile dot-sourcing — session state persists, history stays clean.
 - **Sub-agent isolation.** Allocate per-agent consoles with `is_subagent` + `agent_id` so parallel agents don't clobber each other's shells.
 
 ## Architecture
@@ -22,7 +25,7 @@ graph TB
 
     subgraph Proxy["splashshell proxy (stdio MCP server)"]
         CM["Console Manager<br/>(cwd tracking, re-claim,<br/>cache drain, switching)"]
-        Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
+        Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>peek_console / send_input<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
     end
 
     subgraph Consoles["Visible Console Windows (each runs splash --console)"]
@@ -92,14 +95,18 @@ The binary is `./dist/splash.exe`. Use the absolute path instead of the `npx` co
 | Tool | Description |
 |------|-------------|
 | `start_console` | Open a visible terminal window. Pick a shell (bash, pwsh, powershell, cmd, or a full path). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same shell unless `reason` is provided. |
-| `execute_command` | Run a pipeline. Optionally specify `shell` to target a specific shell type — finds an existing console of that shell, or auto-starts one. Times out cleanly with output cached for `wait_for_completion`. |
+| `execute_command` | Run a pipeline. Optionally specify `shell` to target a specific shell type — finds an existing console of that shell, or auto-starts one. Times out cleanly with output cached for `wait_for_completion`. On timeout, includes a `partialOutput` snapshot so the AI can diagnose stuck commands immediately. |
 | `wait_for_completion` | Block until busy consoles finish and retrieve cached output (use after a command times out). |
+| `peek_console` | Read-only snapshot of what a console is currently displaying. On Windows, reads the console screen buffer directly (exact match with the visible terminal). On Linux/macOS, uses a built-in VT terminal interpreter as fallback. Specify a console by display name or PID, or omit to peek at the active console. Reports busy/idle state, running command, and elapsed time. |
+| `send_input` | Send raw keystrokes to a **busy** console's PTY input. Use `\r` for Enter, `\x03` for Ctrl+C, `\x1b[A` for arrow up, etc. Rejected when the console is idle (use `execute_command` instead). Console must be specified explicitly — no implicit routing, for safety. Max 256 chars per call. |
 
 Status lines include the console name, shell family, exit code, duration, and current directory:
 
 ```
 ✓ #12345 Sapphire (bash) | Status: Completed | Pipeline: ls /tmp | Duration: 0.6s | Location: /tmp
 ```
+
+**Busy console workflow:** When `execute_command` times out, the AI can `peek_console` to see what's happening (watch mode? interactive prompt? stalled progress?), then either `send_input` to respond (Enter, Ctrl+C, y/n) or `wait_for_completion` to wait for the natural finish.
 
 Each MCP tool call also drains:
 
