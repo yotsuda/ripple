@@ -148,7 +148,10 @@ Status lines include the console name, shell family, exit code, duration, and cu
 ✓ #12345 Sapphire (bash) | Status: Completed | Pipeline: ls /tmp | Duration: 0.6s | Location: /tmp
 ```
 
-**Busy console workflow:** When `execute_command` times out, the AI can `peek_console` to see what's happening (watch mode? interactive prompt? stalled progress?), then either `send_input` to respond (Enter, Ctrl+C, y/n) or `wait_for_completion` to wait for the natural finish.
+**Busy console workflow:** When `execute_command` times out, the response includes a `partialOutput` snapshot of what the console is currently displaying, so the AI can diagnose the situation immediately — watch mode, interactive prompt, stalled progress. From there:
+- `send_input` to respond (Enter, Ctrl+C, y/n) or interrupt, or
+- `wait_for_completion` to wait for the natural finish, or
+- `peek_console` to get a fresher snapshot if more time has passed since the timeout.
 
 Each MCP tool call also drains:
 
