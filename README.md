@@ -6,11 +6,53 @@
 
 A universal MCP server that exposes any shell (bash, pwsh, powershell, cmd) as a Model Context Protocol server, so AI assistants can run real commands in a real terminal — visible to you, with session state that persists across calls.
 
+## Why splashshell?
+
+**A persistent shell session changes what AI can do.**
+
+Most MCP tool servers run each command in an isolated subprocess — no state carries over, no modules stay loaded, no authentication survives between calls. splashshell gives AI assistants a real, continuous shell session: authenticate once to Azure and every subsequent `Get-AzVM` just works; `Import-Module` a library and it stays available; define a variable or function and use it ten commands later.
+
+This means:
+- **Authenticate once, stay authenticated** — Azure (`Connect-AzAccount`), AWS (`Set-AWSCredential`), Microsoft 365 (`Connect-MgGraph`), and any other service that stores credentials in the session
+- **Modules persist** — `Install-Module` and `Import-Module` once, use the cmdlets across all subsequent calls without re-importing
+- **Variables and functions carry over** — define `$results` in one command, filter it in the next, export it in the third. Build up complex state incrementally
+- **One server, many ecosystems** — 10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/), plus any CLI tool (git, docker, kubectl, terraform, gh, az cli)
+- **Cross-service workflows** — pipe Azure output into Graph API calls into CSV exports, all in a single session
+
+**Examples: persistent session in action**
+
+*Authenticate and query across multiple commands:*
+```powershell
+# Command 1: authenticate
+Connect-AzAccount
+
+# Command 2 (later): use the live session
+Get-AzVM -Status | Where-Object PowerState -eq "VM running" |
+    Select-Object Name, @{N='Size';E={$_.HardwareProfile.VmSize}}, Location
+
+# Command 3 (later still): session is still alive
+Get-AzStorageAccount | Select-Object StorageAccountName, Location, Kind
+```
+
+*Build up data across calls:*
+```powershell
+# Command 1: collect data
+$issues = gh issue list --repo PowerShell/PowerShell --json title,author,labels | ConvertFrom-Json
+
+# Command 2: filter (variable persists)
+$bugs = $issues | Where-Object { $_.labels.name -contains "Issue-Bug" }
+
+# Command 3: report
+$bugs | Select-Object title, @{N='by';E={$_.author.login}} | Format-Table
+```
+
+## Features
+
 - **Real terminal, real output.** Commands run in a visible ConPTY-backed console. You see every character the AI types, just as if you typed it yourself.
 - **Multiple shells side by side.** bash, pwsh, cmd, and others can all be active at the same time. Switch between them per command.
-- **Session state persists.** `cd`, environment variables, and shell history carry across calls — it's one continuous shell, not isolated subprocess spawns.
+- **Session state persists.** Authentication, modules, variables, functions, `cd`, and shell history all carry across calls — it's one continuous shell, not isolated subprocess spawns.
 - **Shell integration built in.** OSC 633 markers delimit command boundaries cleanly, so output parsing is reliable even for interleaved prompts and long-running commands.
-- **Console re-claim.** Consoles outlive their parent MCP process. When the AI client restarts, the next session reattaches to existing consoles.
+- **Console re-claim.** Consoles outlive their parent MCP process. When the AI client restarts, the next session reattaches to existing consoles — including any authenticated sessions.
 - **Auto cwd handoff.** When a same-shell console is busy, a new one is auto-started in the source console's directory and your command runs immediately — no manual `cd` needed.
 - **Peek at busy consoles.** `peek_console` reads the terminal's current display — on Windows via the native screen buffer API, on other platforms via a built-in VT interpreter. Diagnose stuck commands, watch mode, and interactive prompts without interrupting.
 - **Send input to running commands.** `send_input` feeds keystrokes (Enter, Ctrl+C, arrow keys, text) to a busy console's PTY. Respond to `Read-Host` prompts, dismiss pauses, or interrupt runaway processes.
