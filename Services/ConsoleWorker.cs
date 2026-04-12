@@ -1389,12 +1389,12 @@ public class ConsoleWorker
         }
         catch (TimeoutException)
         {
-            // Include the tail of the recent-output ring as partialOutput so
-            // the AI can diagnose why the command is still running (watch
-            // mode, stuck at an interactive prompt, etc.) without paying
-            // for the full _aiOutput buffer. Bounded by the ring's fixed
-            // capacity so token cost stays predictable.
-            var partial = _tracker.GetRecentOutputSnapshot();
+            // Snapshot what the console is currently displaying so the AI
+            // can diagnose why the command is still running (watch mode,
+            // stuck at an interactive prompt, etc.). On Windows, prefer
+            // the native screen buffer read (same as peek_console); fall
+            // back to the VT-medium ring buffer on other platforms.
+            var partial = ReadConsoleScreenText() ?? _tracker.GetRecentOutputSnapshot();
             return SerializeResponse(w =>
             {
                 w.WriteString("output", "");
