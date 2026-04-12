@@ -208,33 +208,42 @@ public class ConsoleManager
 
                 var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
 
-                // Always reposition the reused standby. An explicit cwd wins;
-                // otherwise default to the user's home directory so an
-                // unspecified start_console acts like a fresh session rather
-                // than inheriting wherever the standby happened to be left
-                // by earlier AI activity. Matches the new-console path,
-                // which also lands at home when cwd is null (ProcessLauncher
-                // falls back to SpecialFolder.UserProfile).
+                // Reposition the reused standby to the target cwd. An
+                // explicit cwd wins; otherwise default to the user's home
+                // directory so an unspecified start_console acts like a
+                // fresh session. Skip the cd if the console is already at
+                // the target directory — avoids unnecessary noise in the
+                // terminal when the standby happens to be at home already.
                 var targetCwd = !string.IsNullOrEmpty(cwd)
                     ? cwd
                     : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 if (reusePipe != null)
                 {
-                    var cdPreamble = BuildCdPreamble(shellFamily, targetCwd);
-                    if (cdPreamble != null)
+                    // Query current cwd to decide whether cd is needed.
+                    var currentCwd = await QueryConsoleCwdAsync(reusePipe);
+                    var needsCd = currentCwd == null
+                        || !string.Equals(
+                            Path.GetFullPath(currentCwd), Path.GetFullPath(targetCwd),
+                            StringComparison.OrdinalIgnoreCase);
+
+                    if (needsCd)
                     {
-                        try
+                        var cdPreamble = BuildCdPreamble(shellFamily, targetCwd);
+                        if (cdPreamble != null)
                         {
-                            await SendPipeRequestAsync(reusePipe, w =>
+                            try
                             {
-                                w.WriteString("type", "execute");
-                                w.WriteString("command", cdPreamble.TrimEnd('&', ' '));
-                                w.WriteNumber("timeout", 5000);
-                            }, TimeSpan.FromSeconds(8));
-                            UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = targetCwd);
+                                await SendPipeRequestAsync(reusePipe, w =>
+                                {
+                                    w.WriteString("type", "execute");
+                                    w.WriteString("command", cdPreamble.TrimEnd('&', ' '));
+                                    w.WriteNumber("timeout", 5000);
+                                }, TimeSpan.FromSeconds(8));
+                            }
+                            catch { /* best-effort */ }
                         }
-                        catch { /* best-effort */ }
                     }
+                    UpdateConsoleInfo(standby.Value.Pid, info => info.LastAiCwd = targetCwd);
                 }
 
                 // Display banner on reused console via pipe
