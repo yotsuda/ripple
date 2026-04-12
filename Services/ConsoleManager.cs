@@ -1146,6 +1146,46 @@ public class ConsoleManager
         }
     }
 
+    public record SendInputResult(int Pid, string DisplayName, string Status, string? Error = null);
+
+    /// <summary>
+    /// Send raw input to a busy console's PTY. The console is resolved
+    /// via the same selector as PeekConsoleAsync (PID or display-name
+    /// substring). Returns a result with status "ok" or an error.
+    /// </summary>
+    public async Task<SendInputResult?> SendInputAsync(string agentId, string console, string input)
+    {
+        int? pid;
+        string? pipeName;
+        string? displayName;
+
+        lock (_lock)
+        {
+            pid = ResolveConsoleSelector(console);
+            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info))
+                return null;
+            pipeName = info.PipePath;
+            displayName = info.DisplayName;
+        }
+
+        try
+        {
+            var resp = await SendPipeRequestAsync(pipeName, w =>
+            {
+                w.WriteString("type", "send_input");
+                w.WriteString("input", input);
+            }, TimeSpan.FromSeconds(5));
+
+            var status = resp.TryGetProperty("status", out var stProp) ? stProp.GetString() ?? "" : "";
+            var error = resp.TryGetProperty("error", out var errProp) ? errProp.GetString() : null;
+            return new SendInputResult(pid.Value, displayName!, status, error);
+        }
+        catch (Exception ex)
+        {
+            return new SendInputResult(pid.Value, displayName!, "error", ex.Message);
+        }
+    }
+
     /// <summary>
     /// Detect consoles that have been closed since the last check.
     /// Removes them from _consoles and returns their display names + shell families.

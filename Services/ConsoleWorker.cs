@@ -1133,6 +1133,7 @@ public class ConsoleWorker
                     w.WriteString("rawBase64", Convert.ToBase64String(rawBytes));
                 }
             }),
+            "send_input" => await HandleSendInputAsync(request, ct),
             "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),
             "display_banner" => HandleDisplayBanner(request),
@@ -1438,6 +1439,70 @@ public class ConsoleWorker
             w.WriteStringOrNull("command", cached.Command);
             w.WriteStringOrNull("duration", cached.Duration);
         });
+    }
+
+    /// <summary>
+    /// Send raw input to the PTY while a command is running. Rejects
+    /// if the console is idle — use execute_command for that. The
+    /// input is written as-is: the caller is responsible for including
+    /// \r for Enter, \x03 for Ctrl+C, escape sequences for arrow keys,
+    /// etc. Capped at 256 chars to prevent accidental bulk injection.
+    /// </summary>
+    private async Task<JsonElement> HandleSendInputAsync(JsonElement request, CancellationToken ct)
+    {
+        if (!_tracker.Busy)
+            return SerializeResponse(w => { w.WriteString("status", "rejected"); w.WriteString("error", "Console is not busy. Use execute_command to run commands."); });
+
+        var input = request.TryGetProperty("input", out var inputProp) ? inputProp.GetString() ?? "" : "";
+        if (string.IsNullOrEmpty(input))
+            return SerializeResponse(w => { w.WriteString("status", "error"); w.WriteString("error", "Missing 'input' field"); });
+
+        if (input.Length > 256)
+            return SerializeResponse(w => { w.WriteString("status", "error"); w.WriteString("error", $"Input too long ({input.Length} chars, max 256)"); });
+
+        // Interpret C-style escape sequences so the AI can express
+        // control characters naturally: \r for Enter, \n for LF,
+        // \t for Tab, \x03 for Ctrl+C, \x1b for ESC, \\ for literal \.
+        var unescaped = UnescapeInput(input);
+        await WriteToPty(unescaped, ct);
+        Log($"SendInput: {EscapeForLog(unescaped)}");
+
+        return SerializeResponse(w =>
+        {
+            w.WriteString("status", "ok");
+            w.WriteNumber("bytesSent", unescaped.Length);
+        });
+    }
+
+    private static string UnescapeInput(string input)
+    {
+        var sb = new StringBuilder(input.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            if (input[i] == '\\' && i + 1 < input.Length)
+            {
+                switch (input[i + 1])
+                {
+                    case 'r': sb.Append('\r'); i++; break;
+                    case 'n': sb.Append('\n'); i++; break;
+                    case 't': sb.Append('\t'); i++; break;
+                    case 'a': sb.Append('\a'); i++; break;
+                    case '\\': sb.Append('\\'); i++; break;
+                    case 'x' when i + 3 < input.Length:
+                        var hex = input.Substring(i + 2, 2);
+                        if (byte.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out var b))
+                        { sb.Append((char)b); i += 3; }
+                        else sb.Append(input[i]);
+                        break;
+                    default: sb.Append(input[i]); break;
+                }
+            }
+            else
+            {
+                sb.Append(input[i]);
+            }
+        }
+        return sb.ToString();
     }
 
     /// <summary>

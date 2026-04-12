@@ -126,6 +126,36 @@ public class ShellTools
     }
 
     [McpServerTool]
+    [Description("Send raw keystrokes to a busy console's PTY input. ONLY works when the target console is busy (idle consoles are rejected — use execute_command instead). Use this to: respond to an interactive prompt (Read-Host, password, y/n confirmation); send Ctrl+C (\\x03) to interrupt a stuck or runaway command; exit a watch-mode TUI (q, Ctrl+C); send Enter (\\r) to dismiss a 'Press Enter to continue' pause; send arrow keys (\\x1b[A/B/C/D) to navigate a TUI menu. Always peek_console first to verify what the console is waiting for, then send_input with the appropriate response. Input is sent as-is — include \\r for Enter, \\x03 for Ctrl+C, \\x1b[A for arrow-up, etc. Max 256 chars per call.")]
+    public static async Task<string> SendInput(
+        ConsoleManager consoleManager,
+        [Description("Which console to send input to. Accepts a PID number or a display-name substring (e.g. \"Poseidon\" matches \"#10612 Poseidon\"). Required — you must specify the target.")]
+        string console,
+        [Description("The raw input to send to the PTY. Sent as-is. Use \\r for Enter, \\x03 for Ctrl+C, \\x1b[A for arrow up, etc. Max 256 chars.")]
+        string input,
+        [Description("Agent ID for sub-agent console isolation.")]
+        string? agent_id = null,
+        CancellationToken cancellationToken = default)
+    {
+        var agentId = agent_id ?? "default";
+
+        if (string.IsNullOrEmpty(console))
+            return "Error: 'console' parameter is required. Specify the target console by display name or PID.";
+        if (string.IsNullOrEmpty(input))
+            return "Error: 'input' parameter is required.";
+
+        var result = await consoleManager.SendInputAsync(agentId, console, input);
+        if (result == null)
+            return $"No console matches \"{console}\". Use the display name (e.g. \"Poseidon\") or PID shown in previous tool responses.";
+
+        if (result.Status == "ok")
+            return $"✓ Sent {input.Length} char(s) to {result.DisplayName}.";
+        if (result.Status == "rejected")
+            return $"✗ {result.DisplayName} is not busy. Use execute_command to run commands on idle consoles.";
+        return $"✗ {result.DisplayName}: {result.Error}";
+    }
+
+    [McpServerTool]
     [Description("Snapshot what a console has been printing recently — the output from the currently running command (since it started executing), plus the next prompt once it finishes. Use this to: check a busy console's progress without waiting for wait_for_completion (the peek pipe works during a running command); diagnose a timed-out execute_command (watch mode, interactive prompt, stalled progress); look in on a console that's busy with a user-typed command the AI can see is blocked. Read-only — does not interrupt or change anything. Returns the live rolling window (ANSI-stripped) plus busy / running-command / elapsed metadata. Works on any console — if you need to observe one other than your active one, pass its display name or PID in `console`.")]
     public static async Task<string> PeekConsole(
         ConsoleManager consoleManager,
