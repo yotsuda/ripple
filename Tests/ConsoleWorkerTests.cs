@@ -364,6 +364,23 @@ public class ConsoleWorkerTests
                 // cmd's PROMPT fires a fake D;0 after every command — exit code
                 // assertions would always see 0, so don't bother.
                 assertExitCode: false),
+            new ShellProfile(
+                label: "bash",
+                shellExe: "bash.exe",
+                simpleEcho: "echo hello bash",
+                simpleEchoExpect: "hello bash",
+                setVar: "export SPLASH_MS_TEST=bash-persist",
+                getVar: "echo \"$SPLASH_MS_TEST\"",
+                getVarExpect: "bash-persist",
+                // Multi-line bash goes through a tempfile .sh dot-source
+                // (see HandleExecuteAsync). Also exercises the bash
+                // integration's "single OSC C per command line submit"
+                // gate — without that gate, the for-loop's per-iteration
+                // DEBUG trap firings would clobber _commandStart and the
+                // tracker would only capture the last iteration.
+                multiLine: "for i in 1 2 3; do\n    echo \"bash-iter $i\"\ndone",
+                multiLineExpects: new[] { "bash-iter 1", "bash-iter 2", "bash-iter 3" },
+                assertExitCode: true),
         };
 
         foreach (var profile in profiles)

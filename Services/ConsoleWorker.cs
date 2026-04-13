@@ -1320,6 +1320,7 @@ public class ConsoleWorker
         // echo directly here for single-line commands.
         bool isMultiLinePwsh = ConsoleManager.IsPowerShellFamily(shellName) && command.Contains('\n');
         bool isMultiLineCmd = shellName is "cmd" && command.Contains('\n');
+        bool isMultiLinePosix = shellName is "bash" or "sh" or "zsh" && command.Contains('\n');
         if (ConsoleManager.IsPowerShellFamily(shellName) && !isMultiLinePwsh)
             RenderPwshCommandEcho(command);
 
@@ -1396,6 +1397,38 @@ public class ConsoleWorker
             var body = "@echo off\r\n" + command.Replace("\r\n", "\n").Replace("\n", "\r\n") + "\r\n";
             await File.WriteAllTextAsync(tmpFile, body, ct);
             ptyPayload = $"call \"{tmpFile}\" & del \"{tmpFile}\"" + enter;
+        }
+        else if (isMultiLinePosix)
+        {
+            // bash/zsh/sh share the same problem cmd does: writing newlines
+            // into the PTY makes the shell submit each line as Enter, so
+            // multi-line constructs (for/done, if/fi, function definitions)
+            // either capture wrong output (the tracker resolves on the first
+            // OSC A) or drop iterations entirely. Drop the body into a temp
+            // .sh file and dot-source it so the shell parses the whole block
+            // as a single source file. State (variables, functions, cwd)
+            // persists because dot-sourcing runs in the caller's scope.
+            var windowsPath = Path.Combine(Path.GetTempPath(), $"splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.sh");
+            var body = command.Replace("\r\n", "\n");
+            if (!body.EndsWith('\n')) body += "\n";
+            await File.WriteAllTextAsync(windowsPath, body, ct);
+
+            // bash sees the Windows temp dir under its own mount namespace —
+            // /mnt/c/... for WSL, /c/... for MSYS2 / Git Bash. On Linux/macOS
+            // the worker and shell share a real POSIX filesystem so the
+            // Windows-path translation is skipped.
+            string unixPath;
+            if (OperatingSystem.IsWindows())
+            {
+                unixPath = IsWslBash(_shell)
+                    ? "/mnt/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/')
+                    : "/" + char.ToLower(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
+            }
+            else
+            {
+                unixPath = windowsPath;
+            }
+            ptyPayload = $". '{unixPath}'; rm -f '{unixPath}'" + enter;
         }
         else
         {
