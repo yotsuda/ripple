@@ -403,27 +403,48 @@ public class ConsoleWorker
                 ?? LoadEmbeddedScript("integration.ps1");
             if (script != null)
             {
+                // Milestone 2e-3: assemble the tempfile body, init invocation,
+                // and outer command line by expanding adapter templates. The
+                // fallbacks below match the pre-adapter hardcoded strings so
+                // unknown pwsh-family shells still boot.
+                //
                 // Prepend Write-Host banner/reason lines so they're emitted by
                 // pwsh itself AFTER ConPTY's initial `\e[?9001h...\e[2J\e[H`
                 // screen-clear payload. If we wrote them to the worker's
                 // stdout before the PTY started (the old WriteBanner path),
                 // ConPTY wipes them almost immediately, which the user saw
                 // as banner text flashing on screen for ~0.5s.
+                var bannerTpl = _adapter?.Init.BannerInjection?.BannerTemplate
+                    ?? "Write-Host '{banner}' -ForegroundColor Green\n";
+                var reasonTpl = _adapter?.Init.BannerInjection?.ReasonTemplate
+                    ?? "Write-Host 'Reason: {reason}' -ForegroundColor DarkYellow\n";
+
                 var prefix = new StringBuilder();
                 if (!string.IsNullOrEmpty(_banner))
-                    prefix.AppendLine($"Write-Host '{_banner.Replace("'", "''")}' -ForegroundColor Green");
+                    prefix.Append(ExpandTemplate(bannerTpl, ("banner", _banner.Replace("'", "''"))));
                 if (!string.IsNullOrEmpty(_banner) && !string.IsNullOrEmpty(_reason))
                     prefix.AppendLine("Write-Host");
                 if (!string.IsNullOrEmpty(_reason))
-                    prefix.AppendLine($"Write-Host 'Reason: {_reason.Replace("'", "''")}' -ForegroundColor DarkYellow");
+                    prefix.Append(ExpandTemplate(reasonTpl, ("reason", _reason.Replace("'", "''"))));
                 if (prefix.Length > 0) prefix.AppendLine("Write-Host");
 
-                var tmpFile = Path.Combine(Path.GetTempPath(), $".splash-integration-{Environment.ProcessId}.ps1");
+                var tmpPrefix = _adapter?.Init.Tempfile?.Prefix ?? ".splash-integration-";
+                var tmpExt = _adapter?.Init.Tempfile?.Extension ?? ".ps1";
+                var tmpFile = Path.Combine(
+                    Path.GetTempPath(),
+                    $"{tmpPrefix}{Environment.ProcessId}{tmpExt}");
                 File.WriteAllText(tmpFile, prefix.ToString() + script);
-                // -NoExit keeps the shell alive after -Command completes.
-                // The command imports PSReadLine + sources the integration script silently.
-                var cmd = $"Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
-                return $"\"{_shell}\" -NoExit -Command \"{cmd}\"";
+
+                var initInvocationTpl = _adapter?.Init.InitInvocationTemplate
+                    ?? "Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tempfile_path}'; Remove-Item '{tempfile_path}' -ErrorAction SilentlyContinue";
+                var initInvocation = ExpandTemplate(initInvocationTpl,
+                    ("tempfile_path", tmpFile));
+
+                var commandTpl = _adapter?.Process.CommandTemplate
+                    ?? "\"{shell_path}\" -NoExit -Command \"{init_invocation}\"";
+                return ExpandTemplate(commandTpl,
+                    ("shell_path", _shell),
+                    ("init_invocation", initInvocation));
             }
         }
 
@@ -433,14 +454,41 @@ public class ConsoleWorker
         // PROMPT-display time, so the reported exit code is always 0 — a
         // documented limitation. Without this marker, AI commands hang
         // forever because Resolve() requires _commandEnd >= 0.
+        //
+        // Milestone 2e-2: command_template + prompt_template come from the
+        // adapter. The prompt_template payload is substituted into the outer
+        // command_template first (so any literal braces in it don't collide
+        // with subsequent {shell_path} expansion).
         if (shellName is "cmd")
         {
+            if (_adapter is { } a2e2 &&
+                !string.IsNullOrEmpty(a2e2.Process.CommandTemplate) &&
+                !string.IsNullOrEmpty(a2e2.Process.PromptTemplate))
+            {
+                return ExpandTemplate(
+                    ExpandTemplate(a2e2.Process.CommandTemplate,
+                        ("prompt_template", a2e2.Process.PromptTemplate)),
+                    ("shell_path", _shell));
+            }
+
             var prompt = "$E]633;P;Cwd=$P$E\\$E]633;D;0$E\\$E]633;A$E\\$P$G$S";
             return $"\"{_shell}\" /q /k \"prompt {prompt}\"";
         }
 
-        // bash: use --login -i to load profiles normally; integration is injected
-        // later via PTY input by InjectShellIntegration().
+        // Milestone 2e-1: bash / zsh (and any future simple shell) can
+        // be driven entirely from adapter.process.command_template with
+        // just {shell_path} substitution. The integration script is
+        // injected later via PTY input by InjectShellIntegration().
+        if (_adapter is { } a2e1 &&
+            !string.IsNullOrEmpty(a2e1.Process.CommandTemplate) &&
+            shellName is "bash" or "sh" or "zsh")
+        {
+            return ExpandTemplate(a2e1.Process.CommandTemplate,
+                ("shell_path", _shell));
+        }
+
+        // Fallback: no YAML adapter for this shell family — keep the
+        // hardcoded launch strings so unknown shells still boot.
         if (shellName is "bash" or "sh")
             return $"\"{_shell}\" --login -i";
 
@@ -448,6 +496,21 @@ public class ConsoleWorker
             return $"\"{_shell}\" -l -i";
 
         return $"\"{_shell}\"";
+    }
+
+    /// <summary>
+    /// Minimal {name} → value substitution for adapter templates.
+    /// Deliberately non-recursive: placeholder values are inserted as-is so
+    /// they can't reference other placeholders. Callers that need layered
+    /// expansion (pwsh's init_invocation inside command_template) call this
+    /// multiple times from innermost to outermost.
+    /// </summary>
+    private static string ExpandTemplate(string template, params (string Name, string Value)[] vars)
+    {
+        var result = template;
+        foreach (var (name, value) in vars)
+            result = result.Replace("{" + name + "}", value);
+        return result;
     }
 
     private async Task WaitForOutputSettled(CancellationToken ct)
