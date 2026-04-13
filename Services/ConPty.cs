@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -170,16 +171,6 @@ public static class ConPty
     /// Create a ConPTY pseudoconsole and launch a process attached to it.
     /// Uses Named Pipes following node-pty's architecture.
     /// </summary>
-    /// <summary>
-    /// Serializes ConPty launches when adapter env overrides are in play.
-    /// Env overrides for inherit_environment=true are applied by
-    /// temporarily SetEnvironmentVariable-ing the parent process, which
-    /// is racy across concurrent launches. The rare cost (console
-    /// creation happens once per shell, not per command) easily pays
-    /// for the simplicity of not building a manual env block.
-    /// </summary>
-    private static readonly object _envOverrideLock = new();
-
     public static ConPtySession Start(
         string commandLine,
         string? workingDirectory = null,
@@ -187,40 +178,15 @@ public static class ConPty
         int rows = 30,
         bool inheritEnvironment = false,
         IReadOnlyDictionary<string, string>? envOverrides = null)
-    {
-        // Callers may declare adapter.process.env in YAML. For the
-        // inherit_environment=true path (python, bash/zsh) we serialise
-        // launches under _envOverrideLock and mutate the parent's env
-        // briefly so CreateProcessW(envBlock=NULL) picks the overrides
-        // up. For inherit_environment=false (pwsh) we would need to
-        // parse/rebuild the CreateEnvironmentBlock output — TODO when
-        // an actual clean-env adapter needs overrides.
-        if (envOverrides != null && envOverrides.Count > 0 && inheritEnvironment)
-        {
-            lock (_envOverrideLock)
-            {
-                var backup = new Dictionary<string, string?>(envOverrides.Count);
-                foreach (var kv in envOverrides)
-                {
-                    backup[kv.Key] = Environment.GetEnvironmentVariable(kv.Key);
-                    Environment.SetEnvironmentVariable(kv.Key, kv.Value);
-                }
-                try
-                {
-                    return StartImpl(commandLine, workingDirectory, cols, rows, inheritEnvironment);
-                }
-                finally
-                {
-                    foreach (var kv in backup)
-                        Environment.SetEnvironmentVariable(kv.Key, kv.Value);
-                }
-            }
-        }
+        => StartImpl(commandLine, workingDirectory, cols, rows, inheritEnvironment, envOverrides);
 
-        return StartImpl(commandLine, workingDirectory, cols, rows, inheritEnvironment);
-    }
-
-    private static ConPtySession StartImpl(string commandLine, string? workingDirectory, int cols, int rows, bool inheritEnvironment)
+    private static ConPtySession StartImpl(
+        string commandLine,
+        string? workingDirectory,
+        int cols,
+        int rows,
+        bool inheritEnvironment,
+        IReadOnlyDictionary<string, string>? envOverrides)
     {
         var pipeName = $@"\\.\pipe\splash-{Environment.ProcessId}-{Guid.NewGuid():N}";
 
@@ -285,10 +251,73 @@ public static class ConPty
         var attrList = CreateAttributeList(hPC);
 
         // Build environment block.
-        // Clean env (bInherit=false): for pwsh/powershell — avoids inheriting MCP server's env vars.
-        // Inherited env (IntPtr.Zero): for bash/zsh/MSYS2 — needs MSYSTEM, HOME, PATH with Git paths.
+        //
+        // Four cases, controlled by (inheritEnvironment, envOverrides):
+        //
+        // (inherit=true,  overrides=null): envBlock=NULL →
+        //     CreateProcessW inherits the parent's env verbatim. Used
+        //     by the bash/zsh adapters that need MSYSTEM, HOME, PATH
+        //     with Git paths preserved.
+        //
+        // (inherit=false, overrides=null): envBlock from
+        //     CreateEnvironmentBlock(bInherit=false). The unmanaged
+        //     memory is owned by Win32 and freed via
+        //     DestroyEnvironmentBlock. Used by pwsh when the adapter
+        //     has no env: block — give pwsh a clean registry-default
+        //     env so it doesn't see the MCP server's variables.
+        //
+        // (inherit=true,  overrides=X) OR
+        // (inherit=false, overrides=X): manually build a merged env
+        //     block. Seed from GetEnvironmentVariables (inherit) or
+        //     from the parsed CreateEnvironmentBlock output (clean),
+        //     apply overrides, sort case-insensitive (Win32 requires
+        //     sorted blocks), and serialise to AllocHGlobal'd memory.
+        //     Freed via Marshal.FreeHGlobal.
+        //
+        // Milestone Phase C(c): the fourth case replaces the earlier
+        // SetEnvironmentVariable-with-a-lock hack — no more mutating
+        // the parent process, no racy cleanup on concurrent launches,
+        // and pwsh's POWERSHELL_TELEMETRY_OPTOUT (and any future
+        // clean-env adapter's overrides) finally takes effect.
         IntPtr envBlock = IntPtr.Zero;
-        if (!inheritEnvironment)
+        bool envBlockIsOwnedByUs = false;
+        if (envOverrides != null && envOverrides.Count > 0)
+        {
+            var merged = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (inheritEnvironment)
+            {
+                foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
+                {
+                    var key = e.Key as string;
+                    if (!string.IsNullOrEmpty(key))
+                        merged[key] = e.Value as string ?? "";
+                }
+            }
+            else
+            {
+                IntPtr userBlock = IntPtr.Zero, hToken = IntPtr.Zero;
+                try
+                {
+                    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, out hToken) &&
+                        CreateEnvironmentBlock(out userBlock, hToken, false))
+                    {
+                        ParseEnvBlockInto(userBlock, merged);
+                    }
+                }
+                finally
+                {
+                    if (userBlock != IntPtr.Zero) DestroyEnvironmentBlock(userBlock);
+                    if (hToken != IntPtr.Zero) CloseHandle(hToken);
+                }
+            }
+
+            foreach (var kv in envOverrides)
+                merged[kv.Key] = kv.Value;
+
+            envBlock = SerializeEnvBlock(merged);
+            envBlockIsOwnedByUs = true;
+        }
+        else if (!inheritEnvironment)
         {
             IntPtr hToken = IntPtr.Zero;
             try
@@ -330,7 +359,13 @@ public static class ConPty
             flags, envBlock, cwd, siPtr, out var pi);
 
         Marshal.FreeHGlobal(siPtr);
-        if (envBlock != IntPtr.Zero) DestroyEnvironmentBlock(envBlock);
+        if (envBlock != IntPtr.Zero)
+        {
+            if (envBlockIsOwnedByUs)
+                Marshal.FreeHGlobal(envBlock);
+            else
+                DestroyEnvironmentBlock(envBlock);
+        }
 
         if (!ok)
         {
@@ -360,6 +395,59 @@ public static class ConPty
         session.SetAttrList(attrList);
 
         return session;
+    }
+
+    /// <summary>
+    /// Parse a Win32 Unicode environment block (VAR=VAL\0VAR=VAL\0...\0\0)
+    /// into a case-insensitive dictionary. Skips cmd.exe drive-letter
+    /// state entries like "=C:=C:\\cwd" which start with '=' and would
+    /// otherwise corrupt the serialised block downstream.
+    /// </summary>
+    private static void ParseEnvBlockInto(IntPtr block, Dictionary<string, string> dict)
+    {
+        if (block == IntPtr.Zero) return;
+
+        int offset = 0;
+        while (true)
+        {
+            var sb = new StringBuilder();
+            while (true)
+            {
+                char c = (char)Marshal.ReadInt16(block, offset);
+                offset += 2;
+                if (c == '\0') break;
+                sb.Append(c);
+            }
+            if (sb.Length == 0) break; // double-null terminator reached
+
+            var entry = sb.ToString();
+            var eq = entry.IndexOf('=');
+            if (eq <= 0) continue; // "=C:=..." entries or malformed
+            dict[entry[..eq]] = entry[(eq + 1)..];
+        }
+    }
+
+    /// <summary>
+    /// Serialise a dictionary to a Win32 Unicode environment block in
+    /// unmanaged memory. The returned pointer must be freed via
+    /// Marshal.FreeHGlobal. Keys are sorted case-insensitively because
+    /// CreateProcessW requires a sorted environment block under
+    /// CREATE_UNICODE_ENVIRONMENT.
+    /// </summary>
+    private static IntPtr SerializeEnvBlock(IDictionary<string, string> vars)
+    {
+        var sb = new StringBuilder();
+        foreach (var kv in vars.OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrEmpty(kv.Key)) continue;
+            sb.Append(kv.Key).Append('=').Append(kv.Value ?? "").Append('\0');
+        }
+        sb.Append('\0'); // double-null terminator
+
+        var bytes = Encoding.Unicode.GetBytes(sb.ToString());
+        var ptr = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, ptr, bytes.Length);
+        return ptr;
     }
 
     private static IntPtr CreateAttributeList(IntPtr hPC)
