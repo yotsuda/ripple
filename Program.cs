@@ -33,7 +33,10 @@ public class Program
             Tests.ConsoleManagerTests.Run();
             Tests.ConsoleWorkerTests.RunUnitTests();
             if (args.Contains("--e2e"))
+            {
                 await Tests.ConsoleWorkerTests.Run();
+                await Tests.ConsoleWorkerTests.RunMultiShell();
+            }
             return;
         }
 

@@ -146,7 +146,127 @@ public class ConsoleWorkerTests
             Assert(status == "standby", $"Status back to standby (got: {status})");
         }
 
-        // Test 6: version check (worker refuses claim from strictly newer proxy)
+        // Test 6: session persistence — a variable set in one execute is readable in the next.
+        // This guards the core value proposition of splashshell: persistent shell state across
+        // AI tool calls. If the worker ever loses state (e.g. spawns a subshell per execute),
+        // this test catches it immediately.
+        {
+            var setCmd = OperatingSystem.IsWindows()
+                ? "$script:SPLASH_SESSION_TEST = 'persistent-42'"
+                : "export SPLASH_SESSION_TEST='persistent-42'";
+            var getCmd = OperatingSystem.IsWindows()
+                ? "Write-Output $script:SPLASH_SESSION_TEST"
+                : "echo \"$SPLASH_SESSION_TEST\"";
+
+            await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", setCmd); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
+            var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", getCmd); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
+            var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+            Assert(output.Contains("persistent-42"), $"Session variable persists across execute calls (got: {output.Replace("\n", "\\n")})");
+        }
+
+        // Test 7: multi-line command (foreach loop).
+        // Multi-line input flows through tempfile dot-sourcing on pwsh and
+        // heredoc-style delivery on bash; either path must preserve output ordering.
+        // Note: we don't assert exitCode here because pwsh's $LASTEXITCODE only updates
+        // on native-command invocations; a prior `cmd /c exit 42` leaks into this test.
+        // That is a pwsh semantic, not a splash bug.
+        {
+            var multilineCmd = OperatingSystem.IsWindows()
+                ? "foreach ($i in 1..3) {\n    Write-Output \"line $i\"\n}"
+                : "for i in 1 2 3; do\n    echo \"line $i\"\ndone";
+            var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", multilineCmd); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
+            var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+            Assert(output.Contains("line 1") && output.Contains("line 2") && output.Contains("line 3"),
+                $"Multi-line: all three lines emitted (got: {output.Replace("\n", "\\n")})");
+        }
+
+        // Test 8: timeout → get_cached_output retrieval.
+        // Execute a command with a very short timeout so it times out, then verify the
+        // worker reports busy, and after the command completes, get_cached_output returns
+        // the result. This exercises the busy-tracking + cache path that AI clients rely on
+        // when commands exceed their wall-clock budget.
+        {
+            var slowCmd = OperatingSystem.IsWindows()
+                ? "Start-Sleep -Milliseconds 1500; Write-Output 'slow done'"
+                : "sleep 1.5; echo 'slow done'";
+
+            // Short timeout forces busy return.
+            var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", slowCmd); w.WriteNumber("timeout", 300); }, TimeSpan.FromSeconds(5));
+            var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+            Assert(timedOut, "Slow command: timedOut flag set");
+
+            // Worker should be busy.
+            var statusResp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+            var status = statusResp.TryGetProperty("status", out var s) ? s.GetString() : null;
+            Assert(status == "busy", $"Status is busy while command runs (got: {status})");
+
+            // Poll for cached output until it's ready (max ~3s).
+            string? cachedOutput = null;
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < deadline)
+            {
+                var cacheResp = await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
+                var cacheStatus = cacheResp.TryGetProperty("status", out var cs) ? cs.GetString() : null;
+                if (cacheStatus == "ok")
+                {
+                    cachedOutput = cacheResp.TryGetProperty("output", out var co) ? co.GetString() : null;
+                    break;
+                }
+                await Task.Delay(200);
+            }
+            Assert(cachedOutput != null && cachedOutput.Contains("slow done"),
+                $"Cached output contains expected result (got: {(cachedOutput ?? "<null>").Replace("\n", "\\n")})");
+        }
+
+        // Test 9: send_input rejected on idle console.
+        // The worker must refuse send_input when there is no running command, so the AI
+        // can't accidentally inject keystrokes into the next prompt.
+        {
+            var resp = await SendRequest(pipeName, w =>
+            {
+                w.WriteString("type", "send_input");
+                w.WriteString("input", "garbage\\r");
+            });
+            var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
+            Assert(status == "rejected", $"send_input on idle console rejected (got: {status})");
+        }
+
+        // Test 10: send_input Ctrl+C interrupts a running command.
+        // Start a long sleep, send \x03, and confirm the next get_status shows standby
+        // (shell returned to prompt) within a couple of seconds.
+        {
+            var sleepCmd = OperatingSystem.IsWindows()
+                ? "Start-Sleep -Seconds 60"
+                : "sleep 60";
+
+            var execResp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", sleepCmd); w.WriteNumber("timeout", 300); }, TimeSpan.FromSeconds(5));
+            var execTimedOut = execResp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+            Assert(execTimedOut, "Long sleep: timed out as expected");
+
+            var inputResp = await SendRequest(pipeName, w =>
+            {
+                w.WriteString("type", "send_input");
+                w.WriteString("input", "\\x03");
+            });
+            var inputStatus = inputResp.TryGetProperty("status", out var isp) ? isp.GetString() : null;
+            Assert(inputStatus == "ok", $"send_input Ctrl+C accepted while busy (got: {inputStatus})");
+
+            // Drain cached output so the tracker clears HasCachedOutput and the next
+            // get_status can return "standby" instead of "completed".
+            var interrupted = false;
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < deadline)
+            {
+                await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
+                var statusResp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+                var st = statusResp.TryGetProperty("status", out var s) ? s.GetString() : null;
+                if (st == "standby") { interrupted = true; break; }
+                await Task.Delay(200);
+            }
+            Assert(interrupted, "Shell returned to standby after Ctrl+C interrupt");
+        }
+
+        // Test 11: version check (worker refuses claim from strictly newer proxy)
         // Send claim with a fake proxy_version that is strictly greater than any real
         // version. The worker's HandleClaim is version-aware: it marks itself obsolete
         // and returns status="obsolete". The shell (PTY) must remain alive afterwards
@@ -186,6 +306,176 @@ public class ConsoleWorkerTests
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
+    }
+
+    /// <summary>
+    /// Cross-shell smoke test. The main <see cref="Run"/> suite only covers pwsh
+    /// because that's splashshell's primary target; this runs a smaller set of
+    /// assertions against Windows PowerShell 5.1 (powershell.exe) and cmd.exe so
+    /// both are exercised end-to-end from the Pipe protocol.
+    ///
+    /// Each shell profile declares how to echo a literal, set a session variable,
+    /// and read it back. cmd.exe has a documented limitation: its PROMPT can't
+    /// expand %ERRORLEVEL% at display time, so the exit code is always reported
+    /// as 0 and the command echo from ConPTY appears in the output — the cmd
+    /// assertions here are deliberately loose about both.
+    /// </summary>
+    public static async Task RunMultiShell()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("=== ConsoleWorker Multi-Shell Tests === SKIP (Windows-only)");
+            return;
+        }
+
+        var totalPass = 0;
+        var totalFail = 0;
+
+        Console.WriteLine("=== ConsoleWorker Multi-Shell Tests ===");
+
+        var profiles = new[]
+        {
+            new ShellProfile(
+                label: "powershell (5.1)",
+                shellExe: "powershell.exe",
+                simpleEcho: "Write-Output 'hello ps51'",
+                simpleEchoExpect: "hello ps51",
+                setVar: "$script:SPLASH_MS_TEST = 'ps51-persist'",
+                getVar: "$global:LASTEXITCODE = 0; Write-Output $script:SPLASH_MS_TEST",
+                getVarExpect: "ps51-persist",
+                assertExitCode: true),
+            new ShellProfile(
+                label: "cmd",
+                shellExe: "cmd.exe",
+                simpleEcho: "echo hello cmd",
+                simpleEchoExpect: "hello cmd",
+                setVar: "set SPLASH_MS_TEST=cmd-persist",
+                getVar: "echo %SPLASH_MS_TEST%",
+                getVarExpect: "cmd-persist",
+                // cmd's PROMPT fires a fake D;0 after every command — exit code
+                // assertions would always see 0, so don't bother.
+                assertExitCode: false),
+        };
+
+        foreach (var profile in profiles)
+        {
+            Console.WriteLine($"\n--- {profile.label} ---");
+            var (pass, fail) = await RunShellProfileAsync(profile);
+            totalPass += pass;
+            totalFail += fail;
+            Console.WriteLine($"  {profile.label}: {pass} passed, {fail} failed");
+        }
+
+        Console.WriteLine($"\n{totalPass} passed, {totalFail} failed");
+        if (totalFail > 0) Environment.Exit(1);
+    }
+
+    private record ShellProfile(
+        string label,
+        string shellExe,
+        string simpleEcho,
+        string simpleEchoExpect,
+        string setVar,
+        string getVar,
+        string getVarExpect,
+        bool assertExitCode);
+
+    private static async Task<(int pass, int fail)> RunShellProfileAsync(ShellProfile profile)
+    {
+        var pass = 0;
+        var fail = 0;
+        void Assert(bool condition, string name)
+        {
+            if (condition) { pass++; Console.WriteLine($"  PASS: {name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
+        }
+
+        var proxyPid = Environment.ProcessId;
+        var agentId = "multi";
+        var cwd = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        var launcher = new Services.ProcessLauncher();
+        int workerPid;
+        try
+        {
+            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, profile.shellExe, cwd);
+        }
+        catch (Exception ex)
+        {
+            Assert(false, $"{profile.label}: launch worker ({ex.GetType().Name}: {ex.Message})");
+            return (pass, fail);
+        }
+
+        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+
+        try
+        {
+            var ready = await WaitForPipeAsync(pipeName, TimeSpan.FromSeconds(30));
+            Assert(ready, $"{profile.label}: worker pipe became ready");
+            if (!ready) return (pass, fail);
+
+            // get_status should report standby once the shell is fully initialised.
+            {
+                var resp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+                var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
+                Assert(status == "standby", $"{profile.label}: initial status is standby (got: {status})");
+
+                var shellFamily = resp.TryGetProperty("shellFamily", out var sf) ? sf.GetString() : null;
+                Assert(!string.IsNullOrEmpty(shellFamily), $"{profile.label}: shellFamily reported ({shellFamily})");
+            }
+
+            // Basic echo command returns expected text.
+            {
+                var resp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", profile.simpleEcho); w.WriteNumber("timeout", 15000); },
+                    TimeSpan.FromSeconds(20));
+                var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+                var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+                Assert(!timedOut, $"{profile.label}: simple echo did not time out");
+                Assert(output.Contains(profile.simpleEchoExpect),
+                    $"{profile.label}: simple echo output contains expected text (got: {output.Replace("\n", "\\n")})");
+                if (profile.assertExitCode)
+                {
+                    var exitCode = resp.TryGetProperty("exitCode", out var e) ? e.GetInt32() : -1;
+                    Assert(exitCode == 0, $"{profile.label}: simple echo exit code 0 (got: {exitCode})");
+                }
+            }
+
+            // Session variable persists across separate execute calls.
+            {
+                var setResp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", profile.setVar); w.WriteNumber("timeout", 15000); },
+                    TimeSpan.FromSeconds(20));
+                var setTimedOut = setResp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+                Assert(!setTimedOut, $"{profile.label}: set variable did not time out");
+
+                var getResp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", profile.getVar); w.WriteNumber("timeout", 15000); },
+                    TimeSpan.FromSeconds(20));
+                var getOutput = getResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+                Assert(getOutput.Contains(profile.getVarExpect),
+                    $"{profile.label}: session variable persists (got: {getOutput.Replace("\n", "\\n")})");
+            }
+
+            // After commands finish, the worker goes back to standby.
+            {
+                var resp = await SendRequest(pipeName, w => w.WriteString("type", "get_status"));
+                var status = resp.TryGetProperty("status", out var s) ? s.GetString() : null;
+                Assert(status == "standby", $"{profile.label}: status back to standby (got: {status})");
+            }
+        }
+        finally
+        {
+            try
+            {
+                var proc = Process.GetProcessById(workerPid);
+                proc.Kill();
+                await proc.WaitForExitAsync();
+            }
+            catch { }
+        }
+
+        return (pass, fail);
     }
 
     private static async Task<bool> WaitForPipeAsync(string pipeName, TimeSpan timeout)
