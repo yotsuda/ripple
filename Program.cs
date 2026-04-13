@@ -35,6 +35,16 @@ public class Program
             return;
         }
 
+        // --list-adapters: print what the registry loaded and exit.
+        // Useful for debugging missing/stale external adapters under
+        // ~/.splash/adapters and for verifying an adapter override is
+        // actually taking effect.
+        if (args.Contains("--list-adapters"))
+        {
+            PrintAdapterList(registry, adapterReport);
+            return;
+        }
+
         // --test mode: run tests
         if (args.Contains("--test"))
         {
@@ -89,5 +99,69 @@ public class Program
         consoleManager.Initialize();
 
         await host.RunAsync();
+    }
+
+    private static void PrintAdapterList(
+        Splash.Services.Adapters.AdapterRegistry registry,
+        Splash.Services.Adapters.AdapterRegistry.LoadReport report)
+    {
+        Console.WriteLine($"splash — {registry.Count} adapter(s) loaded");
+        Console.WriteLine();
+
+        foreach (var adapter in registry.All.OrderBy(a => a.Name, StringComparer.Ordinal))
+        {
+            Console.WriteLine($"  {adapter.Name}");
+            Console.WriteLine($"    family    : {adapter.Family}");
+            Console.WriteLine($"    version   : {adapter.Version}");
+            Console.WriteLine($"    schema    : v{adapter.Schema}");
+            if (!string.IsNullOrEmpty(adapter.Description))
+                Console.WriteLine($"    summary   : {FirstLine(adapter.Description)}");
+            if (adapter.Aliases is { Count: > 0 })
+                Console.WriteLine($"    aliases   : {string.Join(", ", adapter.Aliases)}");
+            Console.WriteLine($"    init      : {adapter.Init.Strategy} / {adapter.Init.Delivery}");
+            Console.WriteLine($"    prompt    : {adapter.Prompt.Strategy}");
+            if (!string.IsNullOrEmpty(adapter.Capabilities.ShellIntegration))
+                Console.WriteLine($"    osc       : {adapter.Capabilities.ShellIntegration}");
+            if (adapter.Capabilities.CwdTracking)
+                Console.WriteLine($"    cwd       : {adapter.Capabilities.CwdFormat}");
+            Console.WriteLine($"    exit_code : {adapter.Capabilities.ExitCode}");
+            Console.WriteLine($"    tests     : {(adapter.Tests?.Count ?? 0)}");
+            Console.WriteLine();
+        }
+
+        if (report.Overrides.Count > 0)
+        {
+            Console.WriteLine("Overrides:");
+            foreach (var line in report.Overrides)
+                Console.WriteLine($"  {line}");
+            Console.WriteLine();
+        }
+
+        if (report.ParseErrors.Count > 0)
+        {
+            Console.WriteLine("Parse errors:");
+            foreach (var (resource, error) in report.ParseErrors)
+                Console.WriteLine($"  {resource}: {error}");
+            Console.WriteLine();
+        }
+
+        if (report.Collisions.Count > 0)
+        {
+            Console.WriteLine("Collisions:");
+            foreach (var line in report.Collisions)
+                Console.WriteLine($"  {line}");
+            Console.WriteLine();
+        }
+
+        Console.WriteLine($"External adapter directory: {Splash.Services.Adapters.AdapterRegistry.DefaultExternalDirectory}");
+        Console.WriteLine(Directory.Exists(Splash.Services.Adapters.AdapterRegistry.DefaultExternalDirectory)
+            ? "  (exists — YAMLs here override embedded adapters of the same name)"
+            : "  (not present — drop YAMLs here to override embedded adapters)");
+    }
+
+    private static string FirstLine(string s)
+    {
+        var idx = s.IndexOfAny(new[] { '\n', '\r' });
+        return idx >= 0 ? s[..idx] : s;
     }
 }
