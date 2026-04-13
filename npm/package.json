@@ -6,9 +6,9 @@
   "author": "Yoshifumi Tsuda",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yotsuda/splashshell.git"
+    "url": "git+https://github.com/yotsuda/SplashShell.git"
   },
-  "homepage": "https://github.com/yotsuda/splashshell",
+  "homepage": "https://github.com/yotsuda/SplashShell",
   "keywords": [
     "mcp",
     "mcp-server",

@@ -154,8 +154,8 @@ graph TB
 ### Build from source
 
 ```bash
-git clone https://github.com/yotsuda/splashshell.git
-cd splashshell
+git clone https://github.com/yotsuda/SplashShell.git
+cd SplashShell
 dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
 ```
 

@@ -91,7 +91,7 @@ Status lines include console name, shell family, exit code, duration, and cwd:
 - **Sub-agent isolation** — parallel AI agents each get their own consoles so they don't clobber each other's shells.
 - **Cwd drift detection** — manual `cd` in the terminal is detected and the AI is warned before it runs the wrong command in the wrong place.
 
-> **Architecture diagram, full routing matrix, and source**: see [yotsuda/splashshell](https://github.com/yotsuda/splashshell#readme).
+> **Architecture diagram, full routing matrix, and source**: see [yotsuda/SplashShell](https://github.com/yotsuda/SplashShell#readme).
 
 ## Platform support
 
@@ -104,4 +104,4 @@ Status lines include console name, shell family, exit code, duration, and cwd:
 
 ## License
 
-MIT. Full release notes and source at [yotsuda/splashshell](https://github.com/yotsuda/splashshell).
+MIT. Full release notes and source at [yotsuda/SplashShell](https://github.com/yotsuda/SplashShell).
