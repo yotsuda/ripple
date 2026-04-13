@@ -661,7 +661,7 @@ public class ConsoleWorkerTests
         return (pass, fail);
     }
 
-    private static async Task<bool> WaitForPipeAsync(string pipeName, TimeSpan timeout)
+    internal static async Task<bool> WaitForPipeAsync(string pipeName, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
@@ -679,7 +679,7 @@ public class ConsoleWorkerTests
         return false;
     }
 
-    private static async Task<JsonElement> SendRequest(string pipeName, Action<Utf8JsonWriter> writeBody, TimeSpan? timeout = null)
+    internal static async Task<JsonElement> SendRequest(string pipeName, Action<Utf8JsonWriter> writeBody, TimeSpan? timeout = null)
     {
         timeout ??= TimeSpan.FromSeconds(5);
         using var cts = new CancellationTokenSource(timeout.Value);

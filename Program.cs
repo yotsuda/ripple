@@ -55,6 +55,8 @@ public class Program
                 await Tests.ConsoleWorkerTests.Run();
                 await Tests.ConsoleWorkerTests.RunMultiShell();
                 await Tests.ConsoleWorkerTests.RunIntegrationScriptGuardTest();
+                var failed = await Tests.AdapterDeclaredTestsRunner.RunAsync(registry);
+                if (failed > 0) Environment.Exit(1);
             }
             return;
         }

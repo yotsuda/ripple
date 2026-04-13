@@ -115,7 +115,13 @@ tests:
       double 21
     expect: '^42$'
   - name: error_surfaces_nonzero_exit
-    eval: "Get-Item /does/not/exist"
+    # PowerShell cmdlet errors (Get-Item /nope) only set $? and write
+    # to the error stream; they do NOT update $LASTEXITCODE, so
+    # splash's OSC D;0 path reports exit 0 even on failure. Use a
+    # native command instead so the non-zero exit actually propagates
+    # via the integration's prompt-function read of $LASTEXITCODE.
+    eval: "cmd /c exit 7"
+    expect_exit_code: 7
     expect_error: true
   - name: cwd_change_tracked
     setup: "Set-Location $env:TEMP"
