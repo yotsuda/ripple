@@ -343,6 +343,8 @@ public class ConsoleWorkerTests
                 setVar: "$script:SPLASH_MS_TEST = 'ps51-persist'",
                 getVar: "$global:LASTEXITCODE = 0; Write-Output $script:SPLASH_MS_TEST",
                 getVarExpect: "ps51-persist",
+                multiLine: "foreach ($i in 1..3) {\n    Write-Output \"ps51-line $i\"\n}",
+                multiLineExpects: new[] { "ps51-line 1", "ps51-line 2", "ps51-line 3" },
                 assertExitCode: true),
             new ShellProfile(
                 label: "cmd",
@@ -352,6 +354,13 @@ public class ConsoleWorkerTests
                 setVar: "set SPLASH_MS_TEST=cmd-persist",
                 getVar: "echo %SPLASH_MS_TEST%",
                 getVarExpect: "cmd-persist",
+                // Multi-line cmd goes through a tempfile .cmd batch (see
+                // HandleExecuteAsync). Verifies both that the tempfile path
+                // works and that cmd batch block syntax (nested blocks with
+                // line breaks) survives the round-trip. cwd-independent —
+                // uses a variable set inside the block.
+                multiLine: "set _SPLASH_MSH=ok\nif \"%_SPLASH_MSH%\"==\"ok\" (\n    echo cmd-line-a\n    echo cmd-line-b\n) else (\n    echo cmd-else\n)",
+                multiLineExpects: new[] { "cmd-line-a", "cmd-line-b" },
                 // cmd's PROMPT fires a fake D;0 after every command — exit code
                 // assertions would always see 0, so don't bother.
                 assertExitCode: false),
@@ -378,6 +387,8 @@ public class ConsoleWorkerTests
         string setVar,
         string getVar,
         string getVarExpect,
+        string multiLine,
+        string[] multiLineExpects,
         bool assertExitCode);
 
     private static async Task<(int pass, int fail)> RunShellProfileAsync(ShellProfile profile)
@@ -455,6 +466,31 @@ public class ConsoleWorkerTests
                 var getOutput = getResp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
                 Assert(getOutput.Contains(profile.getVarExpect),
                     $"{profile.label}: session variable persists (got: {getOutput.Replace("\n", "\\n")})");
+            }
+
+            // Multi-line commands: powershell uses tempfile dot-sourcing,
+            // cmd uses tempfile `call`. Both must preserve newlines through
+            // the PTY round-trip so block-level syntax (if/else, foreach)
+            // still works. Each expected fragment must appear in the output
+            // in order of declaration.
+            {
+                var resp = await SendRequest(pipeName,
+                    w => { w.WriteString("type", "execute"); w.WriteString("command", profile.multiLine); w.WriteNumber("timeout", 15000); },
+                    TimeSpan.FromSeconds(20));
+                var output = resp.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+                var timedOut = resp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
+                Assert(!timedOut, $"{profile.label}: multi-line did not time out");
+
+                int cursor = 0;
+                bool allInOrder = true;
+                foreach (var frag in profile.multiLineExpects)
+                {
+                    var idx = output.IndexOf(frag, cursor, StringComparison.Ordinal);
+                    if (idx < 0) { allInOrder = false; break; }
+                    cursor = idx + frag.Length;
+                }
+                Assert(allInOrder,
+                    $"{profile.label}: multi-line output contains all fragments in order (got: {output.Replace("\n", "\\n")})");
             }
 
             // After commands finish, the worker goes back to standby.

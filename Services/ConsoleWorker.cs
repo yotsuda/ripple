@@ -1319,6 +1319,7 @@ public class ConsoleWorker
         // console shows — see BuildMultiLineTempfileBody. Only render the
         // echo directly here for single-line commands.
         bool isMultiLinePwsh = ConsoleManager.IsPowerShellFamily(shellName) && command.Contains('\n');
+        bool isMultiLineCmd = shellName is "cmd" && command.Contains('\n');
         if (ConsoleManager.IsPowerShellFamily(shellName) && !isMultiLinePwsh)
             RenderPwshCommandEcho(command);
 
@@ -1381,6 +1382,20 @@ public class ConsoleWorker
 
             await File.WriteAllTextAsync(tmpFile, BuildMultiLineTempfileBody(command, wrapRowCount), ct);
             ptyPayload = ptyInput + enter;
+        }
+        else if (isMultiLineCmd)
+        {
+            // cmd can't parse embedded newlines from a PTY keystroke stream —
+            // each \n is treated as Enter and the second line drops into a
+            // fresh prompt, fragmenting command parsing and the OSC markers.
+            // Mirror the pwsh tempfile strategy: write the body to a .cmd
+            // batch file, `call` it from the PTY as a single-line input, then
+            // `del` it. `@echo off` up front suppresses re-echo of each line
+            // inside the batch so the output mirrors single-line cmd usage.
+            var tmpFile = Path.Combine(Path.GetTempPath(), $"splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.cmd");
+            var body = "@echo off\r\n" + command.Replace("\r\n", "\n").Replace("\n", "\r\n") + "\r\n";
+            await File.WriteAllTextAsync(tmpFile, body, ct);
+            ptyPayload = $"call \"{tmpFile}\" & del \"{tmpFile}\"" + enter;
         }
         else
         {
