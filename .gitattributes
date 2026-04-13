@@ -1,0 +1,50 @@
+# Normalize line endings so files authored on different platforms, or
+# files written by splash's own MCP write_file tool (which emits LF),
+# don't trigger "LF will be replaced by CRLF" warnings every commit.
+#
+# `text=auto` lets git detect text vs binary. For detected text files,
+# the repo canonical form is LF; working-tree line endings depend on
+# core.autocrlf. Explicit `eol=lf` on most source types locks that in
+# regardless of the developer's autocrlf setting.
+#
+# .ps1 files keep CRLF because Windows PowerShell 5.1's ISE and a few
+# old cmdlets are cranky about LF-only .ps1 files. pwsh 7 doesn't care.
+
+* text=auto
+
+# Source files — always LF in repo.
+*.cs          text eol=lf
+*.yaml        text eol=lf
+*.yml         text eol=lf
+*.md          text eol=lf
+*.json        text eol=lf
+*.csproj      text eol=lf
+*.gitattributes text eol=lf
+*.gitignore   text eol=lf
+
+# Shell integration scripts — LF even on Windows (pwsh/cmd/bash all
+# handle LF just fine as content, and the embedded resource bytes
+# should be stable across platforms).
+*.py          text eol=lf
+*.js          text eol=lf
+*.bash        text eol=lf
+*.zsh         text eol=lf
+*.sh          text eol=lf
+
+# Windows-native scripts — CRLF for PowerShell 5.1 ISE compatibility
+# and the occasional Windows batch tool that reads them.
+*.ps1         text eol=crlf
+*.cmd         text eol=crlf
+*.bat         text eol=crlf
+
+# Binary assets — never convert.
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.ico         binary
+*.pdf         binary
+*.exe         binary
+*.dll         binary
+*.zip         binary
+*.gz          binary
