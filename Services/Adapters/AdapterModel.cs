@@ -285,7 +285,14 @@ public class BuiltinCommand
 
 public class SignalsSpec
 {
-    public string Interrupt { get; set; } = "\x03";
+    // Nullable: groovy and any future adapter whose host has a
+    // destructive Ctrl-C handler (kills the process instead of
+    // interrupting the running command) declares this as null so
+    // AI clients and the runtime know there is no safe byte to
+    // send for interrupt. The common case is still "\x03" — the
+    // YAML default `interrupt: "\x03"` keeps shell/REPL adapters
+    // that support cooperative interrupt concise.
+    public string? Interrupt { get; set; } = "\x03";
     public string? Eof { get; set; } = "\x04";
     public string? Suspend { get; set; }
     public string? InterruptConfirm { get; set; }

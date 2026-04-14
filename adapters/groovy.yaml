@@ -95,7 +95,18 @@ input:
   chunk_delay_ms: 0
 
 signals:
-  interrupt: "\x03"
+  # groovysh's Ctrl-C handler is destructive: instead of interrupting
+  # the currently-running command, it terminates the entire JVM and
+  # closes the shell. Empirical test (2026-04-15): sending `\x03`
+  # during a `while (true) { ... }` loop destroyed the console
+  # outright — the AI's MCP-side session cannot recover from this.
+  # We declare interrupt as null so AI clients don't even try
+  # send_input "\x03" on groovy; use :quit as the clean exit path
+  # instead (see lifecycle.shutdown.command below). The destructive
+  # Ctrl-C behaviour is a groovysh design choice that predates the
+  # adapter; no groovysh command-line flag has been identified to
+  # downgrade it to an interrupt.
+  interrupt: null
   eof: "\x04"
 
 lifecycle:
@@ -107,7 +118,13 @@ lifecycle:
 
 capabilities:
   stateful: true
-  interrupt: true
+  # groovysh has no safe interrupt: Ctrl-C terminates the JVM, and
+  # no alternate keystroke has been identified that would unwind a
+  # running command back to the prompt. Declared false so MCP
+  # clients know they can't rescue a runaway Groovy command —
+  # their only option is to let it run to completion or close the
+  # console. See signals.interrupt above for the empirical detail.
+  interrupt: false
   # groovysh has :help, :load, :save, :exit, :inspect, :show vars,
   # :record, :history, ... (colon-prefixed meta commands, similar
   # to irb/pry flavor).

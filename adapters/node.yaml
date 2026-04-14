@@ -88,6 +88,16 @@ input:
   chunk_delay_ms: 0
 
 signals:
+  # Node's REPL runs the event loop and the user-supplied code on the
+  # same thread, so a Ctrl-C signal handler cannot fire while a sync
+  # JS loop (`while (true) { ... }`) or an unresolved top-level
+  # `await` is blocking the thread. Empirical test (2026-04-15):
+  # sending `\x03` to a REPL stuck in either pattern was a no-op.
+  # We keep the byte declared because Ctrl-C *does* work at natural
+  # yield points (between microtasks, during I/O waits, a second
+  # Ctrl-C exits the REPL) — but see `capabilities.interrupt: false`
+  # below for the honest story about whether AI clients can rely on
+  # it to rescue a runaway command.
   interrupt: "\x03"
   eof: "\x04"
 
@@ -100,7 +110,13 @@ lifecycle:
 
 capabilities:
   stateful: true
-  interrupt: true
+  # Node's single-threaded event loop cannot interrupt a sync JS loop
+  # or a pending top-level await via Ctrl-C — the signal handler is
+  # scheduled on the event loop, which is exactly what's blocked.
+  # Declared false so MCP clients steer AI away from depending on
+  # send_input "\x03" as a rescue mechanism. See signals.interrupt
+  # above for the cases where Ctrl-C *does* fire (async yield points).
+  interrupt: false
   meta_commands: true   # Node REPL has .help / .editor / .exit / .load
   async_output: false
   exit_code: "unreliable"

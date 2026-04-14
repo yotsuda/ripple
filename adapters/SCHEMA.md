@@ -385,11 +385,28 @@ descriptions; it doesn't enforce or parse the commands itself.
 
 ```yaml
 signals:
-  interrupt: "\x03"          # Ctrl-C
+  interrupt: "\x03"          # Ctrl-C — null if no safe interrupt byte exists
   eof: "\x04"                # Ctrl-D
   suspend: "\x1a"            # Ctrl-Z (null if unsupported)
   interrupt_confirm: null    # optional second keystroke (erl BREAK menu "a")
 ```
+
+`interrupt` is nullable and must be set to `null` when the adapter's
+host has a **destructive** Ctrl-C handler — i.e. one that kills the
+entire process instead of unwinding the running command. Setting it
+to `null` tells MCP clients not to attempt a `send_input "\x03"` as
+a rescue mechanism; their only recovery path is `lifecycle.shutdown`
+or waiting for the command to finish. `capabilities.interrupt` must
+also be `false` in that case, so adapter consumers have two
+consistent signals for the same truth. Example: `groovy` sets
+`interrupt: null` because `groovysh`'s Ctrl-C terminates the JVM.
+
+If the host *does* deliver Ctrl-C as a cooperative interrupt but
+the delivery is unreliable (e.g. Node's event-loop-bound signal
+handler can't fire while a sync JS loop or pending top-level await
+blocks the thread), keep `signals.interrupt: "\x03"` and set
+`capabilities.interrupt: false`. The split says "the byte exists
+but don't count on it".
 
 ---
 
