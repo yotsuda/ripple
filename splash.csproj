@@ -37,6 +37,7 @@
     <EmbeddedResource Include="ShellIntegration\integration.py" />
     <EmbeddedResource Include="ShellIntegration\integration.js" />
     <EmbeddedResource Include="ShellIntegration\integration.rkt" />
+    <EmbeddedResource Include="ShellIntegration\integration.abcl.lisp" />
     <EmbeddedResource Include="ShellIntegration\integration.fsx" />
     <EmbeddedResource Include="adapters\pwsh.yaml" />
     <EmbeddedResource Include="adapters\bash.yaml" />
@@ -45,6 +46,7 @@
     <EmbeddedResource Include="adapters\python.yaml" />
     <EmbeddedResource Include="adapters\node.yaml" />
     <EmbeddedResource Include="adapters\racket.yaml" />
+    <EmbeddedResource Include="adapters\abcl.yaml" />
     <EmbeddedResource Include="adapters\fsi.yaml" />
     <EmbeddedResource Include="adapters\jshell.yaml" />
     <EmbeddedResource Include="adapters\groovy.yaml" />

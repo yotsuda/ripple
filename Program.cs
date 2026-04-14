@@ -56,6 +56,24 @@ public class Program
             return;
         }
 
+        // --adapter-tests: run each adapter's declared `tests:` block
+        // without the surrounding ConsoleWorkerTests.Run harness, whose
+        // pre-existing Ctrl+C / obsolete-state flakes hard-exit the process
+        // on failure and would otherwise mask downstream adapter-declared
+        // results. Opt-in standalone path — useful after adding a new
+        // adapter to verify just its own tests without rerunning the full
+        // unit + E2E suite. Accepts an optional `--only <name>` filter.
+        if (args.Contains("--adapter-tests"))
+        {
+            string? only = null;
+            var idx = Array.IndexOf(args, "--only");
+            if (idx >= 0 && idx + 1 < args.Length)
+                only = args[idx + 1];
+            var failed = await Tests.AdapterDeclaredTestsRunner.RunAsync(registry, only);
+            if (failed > 0) Environment.Exit(1);
+            return;
+        }
+
         // --test mode: run tests
         if (args.Contains("--test"))
         {

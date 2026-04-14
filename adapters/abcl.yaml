@@ -1,0 +1,185 @@
+schema: 1
+name: abcl
+version: 0.1.0
+description: >
+  Armed Bear Common Lisp (ABCL) REPL with OSC 633 shell-integration-
+  style command tracking. Second Lisp-family adapter alongside Racket,
+  and the first JVM-hosted Common Lisp shipped embedded. Provides a
+  CL reference point for the BalancedParensCounter (same reader-macro
+  surface area as CCL — `#\(` char literals, `#|...|#` block comments,
+  no `#;` datum comments) without requiring a native Common Lisp
+  binary that corporate AppLocker may block from user directories.
+  ABCL runs entirely on the JVM; we invoke `java -jar abcl.jar` so
+  the only executable spawned is `java.exe` itself (whitelisted
+  Program Files path) and the abcl.jar payload loads as a regular
+  classfile bundle — the same pattern Groovy uses to bypass the
+  AppLocker script-rule block on `.bat` launchers.
+homepage: https://abcl.org
+license: BSD-3-Clause
+family: repl
+aliases:
+  - armedbear
+  - armed-bear
+  - armed-bear-common-lisp
+
+process:
+  # Launch ABCL directly via java.exe. `--add-opens` suppresses the
+  # "Failed to introspect virtual threading methods" warning ABCL
+  # 1.9.2 prints on JDK 21+ (abcl was compiled against an older JDK
+  # and the module-path reflection access isn't open by default).
+  # `--noinit` skips ~/.abclrc so a user's rc doesn't interfere with
+  # the integration script; `--noinform` suppresses the startup
+  # banner so it doesn't race the first prompt. `--load` runs our
+  # integration script (which sets top-level::*repl-prompt-fun* and
+  # returns), then ABCL drops into the standard REPL which honors
+  # the new prompt hook.
+  #
+  # %LOCALAPPDATA% is expanded by the worker's ExpandTemplate at
+  # launch time. The ABCL 1.9.2 binary distribution must be unzipped
+  # to %LOCALAPPDATA%\splash-deps\abcl-bin-1.9.2\ — user-local so
+  # the adapter works without admin, and outside %USERPROFILE% so
+  # AppLocker's user-dir PE block (which only applies to actual
+  # executables under ConPTY CreateProcessW) doesn't come into play
+  # because the only executable is java.exe.
+  executable: java
+  command_template: '"{shell_path}" --add-opens java.base/java.lang=ALL-UNNAMED -jar %LOCALAPPDATA%\splash-deps\abcl-bin-1.9.2\abcl.jar --noinit --noinform --load {init_invocation}'
+  inherit_environment: true
+  encoding: utf-8
+  # ABCL's interactive reader on Windows treats \r as Enter via
+  # ConPTY cooked mode. Same convention as python / node / racket /
+  # ccl / groovy.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # JVM cold start + ABCL heap image + integration load ≈ 2–3 s on
+  # this box. No artificial settle needed after the first prompt
+  # fires — the OSC A from splash-print-prompt is the definitive
+  # "ready" signal.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # top-level::*repl-prompt-fun*
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .lisp
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.abcl.lisp
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: balanced_parens
+  balanced_parens:
+    open: ['(', '[', '{']
+    close: [')', ']', '}']
+    string_delims: ['"']
+    escape: '\'
+    line_comment: ';'
+    block_comment: ['#|', '|#']
+    char_literal_prefix: '#\'
+    # Common Lisp does NOT have Racket's `#;` datum comment — the
+    # closest CL idiom is the `#+nil expr` reader conditional, which
+    # works through `read` without needing a counter extension.
+    # Matches ccl.yaml.
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .splash-exec-
+    extension: .lisp
+    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.lisp"
+    invocation_template: '(splash-exec-file "{path}")'
+  chunk_delay_ms: 0
+
+modes:
+  # Top-level ABCL REPL — the `? ` prompt our integration installs.
+  # ModeDetector falls back to this when no auto_enter mode matches.
+  # We override ABCL's default `CL-USER(N): ` prompt to the simpler
+  # `? ` so the mode regex matches the same shape CCL uses.
+  - name: main
+    default: true
+    primary: '^\? $'
+
+  # ABCL debugger mode is deferred — system::debug-loop uses a
+  # separate prompt mechanism from top-level::*repl-prompt-fun* and
+  # the nesting-level capture pattern CCL uses does not apply as-is.
+  # Future work once ABCL's debug-loop internals are researched
+  # against a real break scenario. Errors today just leave the REPL
+  # sitting in the main mode with an error printed to stdout.
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "(quit)"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  # No auto_modes because we haven't wired the debugger mode yet —
+  # main is the only mode in this adapter. Flip to true once the
+  # debugger mode is added.
+  auto_modes: false
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: true
+  cwd_format: windows_native
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: none
+
+probe:
+  eval: "(+ 1 1)"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic returns a value"
+    eval: "(* 21 2)"
+    expect: '42'
+
+  - name: "stateful: defparameter persists across commands"
+    setup_sequence:
+      - eval: "(defparameter *splash-test* 'persist-ok)"
+    eval: "*splash-test*"
+    expect: 'PERSIST-OK'
+
+  - name: "reader macro: block comment #| |# ignored"
+    eval: "(+ 1 #| nested |# 2)"
+    expect: '^3$'
+
+  - name: "char literal: #\\( is a character not an open paren"
+    eval: "(char-code #\\()"
+    expect: '40'
+
+  - name: "modes: top-level eval reports current mode as main"
+    eval: "(+ 1 1)"
+    expect: '2'
+    expect_mode: main

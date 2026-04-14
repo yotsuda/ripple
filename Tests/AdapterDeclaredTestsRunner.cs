@@ -142,7 +142,7 @@ public static class AdapterDeclaredTestsRunner
         }
     }
 
-    public static async Task<int> RunAsync(AdapterRegistry registry)
+    public static async Task<int> RunAsync(AdapterRegistry registry, string? onlyName = null)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -154,6 +154,8 @@ public static class AdapterDeclaredTestsRunner
 
         var adaptersWithTests = registry.All
             .Where(a => a.Tests != null && a.Tests.Count > 0)
+            .Where(a => onlyName == null
+                        || string.Equals(a.Name, onlyName, StringComparison.OrdinalIgnoreCase))
             .OrderBy(a => a.Name)
             .ToList();
 
