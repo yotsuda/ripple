@@ -12,22 +12,23 @@ cleared on 2026-04-14.
 **splash** is a declarative adapter framework that exposes any
 interactive process (shells, REPLs, eventually debuggers) to an AI
 via MCP over ConPTY/forkpty. Phase B (YAML-drive the existing shell
-runtime), phase C (framework generalisation: external adapter
-loading, two REPLs, unified env block, tests runner, schema
-evolution), and the phase C+ punch list (Racket adapter, pdb mode
-declaration, `--probe-adapters` CLI, `ready.output_settled_*`
-timing knobs, BOM fix on `FileTools.WriteFile`, `--list-adapters`
-summary truncation) are all complete. **7 adapters ship embedded**
-(pwsh, bash, zsh, cmd, python, node, racket). **385 assertions**
-pass on `--test --e2e` (274 unit + 79 pre-existing E2E + 32
+runtime), phase C (framework generalisation), and the phase C+
+punch list (Racket adapter, pdb mode declaration, `--probe-adapters`
+CLI, `ready.output_settled_*` timing knobs, BOM fix on
+`FileTools.WriteFile`, `--list-adapters` summary truncation,
+CA1416 cleanup, **runtime `balanced_parens` counter with reader-
+macro extensions**) are all complete. **7 adapters ship embedded**
+(pwsh, bash, zsh, cmd, python, node, racket). **411 assertions**
+pass on `--test --e2e` (300 unit + 79 pre-existing E2E + 32
 adapter-declared). Zero shell-family literals survive in the C#
 runtime outside the registry key normaliser. Schema §18 Q1
-(balanced_parens vs reader macros) is **partially** answered by
-the Racket adapter; §18 Q2 (exit_commands.effect enum) is
-**closed** by the python adapter's pdb mode. Q3 and Q4 are
-untouched. Schema is still intentionally `v1 draft` until a
-runtime counter exists for `multiline_detect: balanced_parens`
-and `modes` graph walking is no longer declarative-only.
+(balanced_parens vs reader macros) is **closed** by the runtime
+counter and `char_literal_prefix` / `datum_comment_prefix` schema
+extensions; §18 Q2 (exit_commands.effect enum) is **closed** by
+the python adapter's pdb mode. Q3 and Q4 are untouched. Schema
+is still intentionally `v1 draft` until the `modes` graph walker
+is no longer declarative-only — that's the last big runtime
+plumbing gap before v1 freeze.
 
 ---
 
@@ -35,10 +36,10 @@ and `modes` graph walking is no longer declarative-only.
 
 ```powershell
 cd C:\MyProj\splash
-git log --oneline -25                              # last 25 commits — phase B/C/C+ arc
+git log --oneline -30                              # last 30 commits — phase B/C/C+ arc
 ./bin/Debug/net9.0/splash.exe --list-adapters      # 7 adapters + their capabilities
 ./bin/Debug/net9.0/splash.exe --probe-adapters     # opt-in pre-flight, one probe.eval per adapter
-./bin/Debug/net9.0/splash.exe --test --e2e         # 385 / 385 green, zsh SKIP expected
+./bin/Debug/net9.0/splash.exe --test --e2e         # 411 / 411 green, zsh SKIP expected
 ```
 
 If the Debug binary is missing or stale:
@@ -151,70 +152,57 @@ given machine.
 
 ## Next-session candidate work
 
-Phase C+ is clear. Roughly in order of payoff per risk:
+Phase C+ is clear. The only remaining gap before v1 freeze is the
+`modes` graph walker. Roughly in order of payoff per risk:
 
-1. **Runtime `balanced_parens` counter** — the unfinished half of
-   §18 Q1. The Racket adapter ships the schema fields but the
-   runtime does not consume `multiline_detect: balanced_parens`
-   at all; multi-line delivery bypasses the counter via tempfile.
-   Implementing it would let splash reject syntactically incomplete
-   AI input before submitting it to the REPL (preventing the
-   deadlock-on-unbalanced-paren failure mode). Minimum schema
-   additions needed:
-     - `balanced_parens.char_literal_prefix` (e.g. `'#\\'`) — next
-       char does not count toward bracket depth
-     - `balanced_parens.datum_comment_prefix` (e.g. `'#;'`) — next
-       balanced expression is skipped
-   Test against the reader-macro cases already in `racket.yaml`
-   tests. No breaking change to existing adapters — fields are
-   additive and gated on `multiline_detect == balanced_parens`.
+1. **Runtime `modes` graph walking** — the unfinished half of
+   §18 Q2 and the last big runtime plumbing gap. The python
+   adapter declares pdb as an auto_enter mode, but `ConsoleWorker`
+   does not walk the graph, enforce exit commands, or emit mode-
+   change events; `AdapterDeclaredTestsRunner` treats
+   `expect_mode` / `expect_level` as deferred fields. Adding this
+   means tracking mode state across commands (which mode am I in
+   now? did this command trigger a mode change?). Good first
+   step: emit a `currentMode` field in the JSON response from
+   `get_status` and `execute`, populated by re-running the mode
+   regexes against the tail of the output buffer. Richer graph
+   walking (exit_commands enforcement, expect_mode assertions)
+   can follow as a second pass. Once this lands, schema v1 can
+   freeze.
 
-2. **Runtime `modes` graph walking** — the unfinished half of
-   §18 Q2. The python adapter declares pdb as an auto_enter mode
-   but ConsoleWorker does not walk the graph, enforce exit
-   commands, or emit mode-change events;
-   `AdapterDeclaredTestsRunner` treats `expect_mode` /
-   `expect_level` as deferred fields. Adding this is bigger than
-   the balanced_parens counter because it requires tracking
-   mode state across commands (which mode am I in now? did this
-   command trigger a mode change?). Good first step: emit a
-   `currentMode` field in the JSON response from `get_status`
-   and `execute`, populated by re-running the mode regexes
-   against the tail of the output buffer. Richer graph walking
-   (exit_commands enforcement, expect_mode assertions) can
-   follow as a second pass.
-
-3. **More reader-macro-heavy Lisp adapters (SBCL / GHCi)** — stress
-   the Q1 fields further and provide a second evidence point for
-   Q4 (`balanced_parens: { preset: lisp }`). Requires installing
+2. **More reader-macro-heavy Lisp adapters (SBCL / GHCi)** — stress
+   the Q1 fields further (now that the runtime counter is live)
+   and provide a second evidence point for Q4
+   (`balanced_parens: { preset: lisp }`). Requires installing
    an interpreter (SBCL is smallest for CL; GHCi pulls in GHC
-   which is heavy). Defer until a test box already has one of
+   which is heavy). Each new adapter is also a smoke test for
+   `BalancedParensCounter` against a different reader-macro
+   surface area. Defer until a test box already has one of
    these toolchains.
 
-4. **`CA1416` Registry.GetValue warning** — `ConsoleManager.cs:1922`
-   calls `Microsoft.Win32.Registry.GetValue` without a platform
-   guard, so the analyzer warns on every build. Add
-   `[SupportedOSPlatform("windows")]` on `GetRegistryPathExt` (and
-   `GetRegistryPath`) or wrap the call in an `OperatingSystem.IsWindows()`
-   check. Trivial — this is a "every rebuild prints the same
-   warning" papercut, not a correctness issue.
-
-5. **Async-output handling (§18 Q3)** — `redraw_detect` is the
+3. **Async-output handling (§18 Q3)** — `redraw_detect` is the
    only defined strategy for `output.async_interleave.strategy`
    and neither in-tree adapter exercises it. A future BEAM
    (iex / erlang shell) or Go REPL adapter would surface whether
    a single strategy covers both async families or if per-family
    variants are needed. Blocked on adding one of those adapters.
 
-6. **`.gitattributes` renormalisation** — still held off. `git
+4. **`balanced_parens: { preset: lisp }` (§18 Q4)** — once a
+   second Lisp adapter ships and duplicates Racket's
+   `balanced_parens` block almost verbatim, factor the common
+   bits into a registry preset that an adapter can reference by
+   name. Cosmetic / DRY improvement, not a runtime change.
+   Blocked on item 2.
+
+5. **`.gitattributes` renormalisation** — still held off. `git
    add --renormalize .` would touch every tracked file and
    pollute blame history. Do this only if there's a separate
    reason to burn a blame entry. Not worth tackling in isolation.
 
 User policy as of 2026-04-14: **schema v1 remains unfrozen** —
-don't stamp `v1 stable` until the runtime `balanced_parens`
-counter and the `modes` graph walker both exist, even though the
-schema fields themselves are believed sufficient.
+the `balanced_parens` counter is now live (Q1 closed), so the
+last gate is the `modes` graph walker for Q2 to be fully closed
+at the runtime layer. Once that lands, freeze.
 
 ---
 
@@ -273,10 +261,13 @@ schema fields themselves are believed sufficient.
 
 ## Commit history at a glance
 
-Phase B → C → C+ is ~22 commits, each a self-contained story.
+Phase B → C → C+ is ~25 commits, each a self-contained story.
 Newest first:
 
 ```
+ed3e7fa  feat(schema): runtime balanced_parens counter closes §18 Q1
+a8f56ed  chore(worker): silence CA1416 on GetRegistryPathExt
+81efbcd  docs(handoff): reflect phase C+ state — 7 adapters, 385 assertions
 589feff  docs(schema): resolve §18 Q1 and Q2 from adapter evidence
 aff1249  feat(python): declare pdb as an auto_enter debug mode
 bc68271  feat(adapters): ship Racket REPL adapter with OSC 633 via current-prompt-read
