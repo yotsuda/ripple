@@ -3,7 +3,8 @@
 Entry point for any future Claude Code (or human) session walking into
 this repo cold. Read this first, then follow the reading list below
 for whatever depth you need. Updated after the cache-on-busy-receive
-salvage round on 2026-04-14 (commit `af4e5e5`).
+salvage round (commit `af4e5e5`) and the ABCL adapter round
+(commit `cd1cef4`) on 2026-04-15.
 
 ---
 
@@ -18,18 +19,23 @@ list (Racket adapter, pdb mode declaration, `--probe-adapters` CLI,
 summary truncation, CA1416 cleanup, runtime `balanced_parens`
 counter, runtime `modes` graph walker), the regex-strategy round
 (CSI-aware `RegexPromptDetector`, `process.executable` override,
-**F# Interactive** and **Java jshell** adapters), and the
+**F# Interactive** and **Java jshell** adapters), the
 **cache-on-busy-receive salvage layer** (multi-entry per-console
 cache list, `FlipToCacheMode`, 170 s preemptive timeout, baked
-status lines, universal drain wrapper on every MCP tool) are all
-complete. **10 adapters ship embedded** (pwsh, bash, zsh, cmd,
-python, node, racket, fsi, jshell; plus `ccl` which ships in the
-source tree but is gitignored on this box because corporate
-AppLocker blocks running user-dir PE files under ConPTY — the
-adapter source is fine and runs wherever CCL is installed into
-a whitelisted location). **530 assertions** pass on `--test --e2e`
-(408 unit + 79 pre-existing E2E + 43 adapter-declared, +84 from
-the cache/drain round). Zero
+status lines, universal drain wrapper on every MCP tool), and the
+**ABCL adapter round** (JVM-hosted Common Lisp via the Groovy
+pattern — `java -jar abcl.jar` from `%LOCALAPPDATA%\splash-deps\`,
+second CL evidence point for the `balanced_parens` counter) are
+all complete. **11 adapters ship embedded** (pwsh, bash, zsh, cmd,
+python, node, racket, **abcl**, fsi, jshell, groovy; plus `ccl`
+which ships in the source tree but is gitignored on this box —
+originally because corporate AppLocker was blocking user-dir PE
+files under ConPTY, though the ccl tests pass on this box as of
+2026-04-15 so the policy may have been relaxed; `ccl` stays
+locally gitignored until we confirm that and decide to ship it
+embedded). **536 assertions** pass on `--test --e2e` (408 unit +
+79 pre-existing E2E + 49 adapter-declared, +6 from the ABCL round).
+Zero
 shell-family literals survive in the C# runtime outside the
 registry key normaliser. Schema §18 Q1 (balanced_parens vs reader
 macros) is **closed** by the runtime counter and `char_literal_prefix`
@@ -47,10 +53,11 @@ stamp it; no remaining runtime gates.
 
 ```powershell
 cd C:\MyProj\splash
-git log --oneline -35                              # last 35 commits — phase B/C/C+ + regex-strategy + cache-on-busy-receive
-./bin/Debug/net9.0/splash.exe --list-adapters      # 10 adapters + their capabilities (9 if ccl gitignored on this box)
-./bin/Debug/net9.0/splash.exe --probe-adapters     # opt-in pre-flight, one probe.eval per adapter
-./bin/Debug/net9.0/splash.exe --test --e2e         # 530 / 530 green, zsh SKIP expected, ccl SKIP if AppLocker-blocked
+git log --oneline -35                                     # last 35 commits — phase B/C/C+ + regex-strategy + cache-on-busy-receive + ABCL
+./bin/Debug/net9.0/splash.exe --list-adapters             # 11 adapters (12 on this box if ccl embedded)
+./bin/Debug/net9.0/splash.exe --probe-adapters            # opt-in pre-flight, one probe.eval per adapter
+./bin/Debug/net9.0/splash.exe --test --e2e                # 536 / 536 green, zsh SKIP expected
+./bin/Debug/net9.0/splash.exe --adapter-tests --only abcl # isolated declared-test run for a single adapter
 ```
 
 If the Debug binary is missing or stale:
@@ -87,8 +94,8 @@ MCP server, remember the flow: `sitter_kill` to unlock the binary,
 | Worker launch / exec | `Services/ConsoleWorker.cs` — `BuildCommandLine` and `RunAsync`'s ready phase are the adapter-driven hotspots |
 | Proxy (MCP-facing) | `Services/ConsoleManager.cs` — the last shell-family literal (`NormalizeShellFamily`) is a registry key normaliser, not a family check |
 | ConPTY + env merge | `Services/ConPty.cs` — unified env block builder applies `adapter.process.env` to both inherit-env and clean-env paths |
-| Integration scripts | `ShellIntegration/*.{ps1,bash,zsh,py,js,rkt,fsx}` — the single source of truth for each shell's OSC 633 emitter. fsi's integration.fsx is intentionally empty (just comments) because F# Interactive has no prompt-replacement API; see Gotchas below. |
-| Adapter YAMLs | `adapters/*.yaml` — 9 live examples embedded in the binary covering every schema section that's currently consumed |
+| Integration scripts | `ShellIntegration/*.{ps1,bash,zsh,py,js,rkt,fsx,abcl.lisp}` — the single source of truth for each shell's OSC 633 emitter. fsi's integration.fsx is intentionally empty (just comments) because F# Interactive has no prompt-replacement API; see Gotchas below. The two Common-Lisp integrations (`integration.lisp` for CCL, `integration.abcl.lisp` for ABCL) differ only in which prompt hook they override — CCL uses `(setf (symbol-function 'ccl::print-listener-prompt) ...)` behind a kernel-redefine warning gate, ABCL uses a simple `(setf top-level::*repl-prompt-fun* ...)`. |
+| Adapter YAMLs | `adapters/*.yaml` — 11 live examples embedded in the binary covering every schema section that's currently consumed. The `groovy` / `abcl` pair documents the **Groovy pattern**: invoke `java.exe` from Program Files with `-jar %LOCALAPPDATA%\splash-deps\<lang>\payload.jar` so the only spawned executable sits in a whitelisted path while the jar payload loads as regular classfiles from user-dir. Any future JVM-hosted REPL (Clojure, Kotlin REPL, JRuby, Jython, Scala) picks this up for free by cloning `abcl.yaml` and swapping the jar path + prompt regex / hook. |
 | Regex prompt detector | `Services/RegexPromptDetector.cs` — CSI-aware, strips ANSI escapes internally and substitutes cursor-to-col-1 positioning with `\n` so adapter authors can write natural `^<prompt>$` patterns. Used by fsi and jshell; future ConPTY-rendering REPLs (ghci, bb, etc.) inherit this for free. |
 | Cache / drain layer | `Services/CommandTracker.cs` (`_cachedResults` list, `FlipToCacheMode`, `ConsumeCachedOutputs`, `BuildStatusLine`, `PreemptiveTimeoutMs`), `Services/ConsoleWorker.cs` (`HandleExecuteAsync` busy-flip path, `HandleGetCachedOutput` array serialisation), `Services/ConsoleManager.cs` (`CollectCachedOutputsAsync` / `WaitForCompletionAsync` array consumers, `MaxExecuteTimeoutSeconds`), `Tools/ShellTools.cs` (`AppendCachedOutputs` universal wrapper that every MCP tool funnels through). |
 | Declarative test runner | `Tests/AdapterDeclaredTestsRunner.cs` — how each adapter's `tests:` block becomes a live worker assertion |
@@ -237,21 +244,40 @@ candidates are extensions and external-dependency work:
    fsi adapter comment, and no adapter today depends on the
    distinction.
 
-4. **More reader-macro-heavy Lisp adapters (SBCL / GHCi)** — stress
-   the Q1 counter against a different reader-macro surface area
-   and provide a second evidence point for Q4
-   (`balanced_parens: { preset: lisp }`). **Blocked on this box by
-   corporate AppLocker** — user-dir PE files can be run directly
-   via `Process.Start` but not spawned via splash's ConPTY
-   `CreateProcessW` path (error 5 = ACCESS_DENIED, surfaced only
-   during ConPTY attach). CCL adapter source exists in
-   `adapters/ccl.yaml` + `ShellIntegration/integration.lisp`
-   (gitignored locally via `.git/info/exclude`) and works on boxes
-   where the Lisp binary lives in a whitelisted location — SBCL /
-   GHCi / Haskell-stack distributed via installer into Program
-   Files would probably also work but we don't have such an
-   install here. Resume when either the AppLocker policy relaxes
-   or the interpreter lives in a whitelisted path.
+4. **More reader-macro-heavy Lisp / Haskell adapters** — the Q1
+   counter already has two evidence points (Racket and the ABCL
+   adapter that shipped in commit `cd1cef4`), plus a locally
+   validated third (CCL on this box). A Q4 `balanced_parens:
+   { preset: lisp }` could now factor the CL-reader-macro
+   specification shared by CCL and ABCL into a registry preset,
+   and adding **GHCi** would stress the counter against a different
+   reader-macro shape (`{- -}` block comments, `` `backtick` ``
+   sections) on the Haskell side. GHCi is still blocked as a
+   native PE from `%USERPROFILE%` under AppLocker — the user would
+   need to install GHC via `stack`/`ghcup` into a whitelisted path
+   like `C:\tools\ghcup\bin` before splash can spawn it via ConPTY.
+   Alternatively, **Clojure** runs on the JVM and would ship via
+   the Groovy pattern (clone `abcl.yaml`, swap jar + prompt
+   regex) without needing a native binary. See also the note on
+   CCL below — the policy may have relaxed and CCL could now be
+   shipped embedded alongside ABCL.
+
+4b. **Confirm CCL policy status and decide on embedding.** Until
+    2026-04-14, the comment was "CCL binary blocked by corporate
+    AppLocker under ConPTY `CreateProcessW`". As of 2026-04-15,
+    `--adapter-tests` on this box runs CCL's probe + 5 declared
+    tests green, which suggests the user-dir PE block has been
+    relaxed (either a policy change or an unblock request was
+    approved). `adapters/ccl.yaml` and `ShellIntegration/integration.lisp`
+    still live under `.git/info/exclude` locally so the committed
+    history stays reproducible on boxes that haven't had the
+    block lifted. Next step: verify on another box with the old
+    policy whether CCL still fails there — if the block is gone
+    universally, un-gitignore and commit; otherwise, keep the
+    gitignore and add a `CCL (local-only)` note to README. ABCL
+    remains the portable default regardless, because it spawns
+    only `java.exe` (whitelisted Program Files path) and loads
+    abcl.jar as classfiles.
 
 5. **Async-output handling (§18 Q3)** — `redraw_detect` is the
    only defined strategy for `output.async_interleave.strategy`
@@ -401,6 +427,34 @@ case is a schema gap.
   files. Use Claude Code's built-in `Edit` tool for splash's own
   source (which is CRLF per the .gitattributes text=auto policy)
   until splash's edit_file normalises line endings before search.
+- **ABCL 1.9.2 + JDK 21 virtual-threading introspection warning.**
+  On cold start ABCL 1.9.2 prints a red "Failed to introspect
+  virtual threading methods: java.lang.reflect.InaccessibleObjectException"
+  warning before the banner. The warning is cosmetic — ABCL was
+  compiled against a JDK with open `java.lang` module access and
+  JDK 21 tightened it — but it pollutes the pre-banner output
+  window and would confuse the ready-phase settle. Fix: the
+  adapter's `command_template` passes
+  `--add-opens java.base/java.lang=ALL-UNNAMED` to java.exe,
+  which silences the warning. Affects ABCL on any JDK 16+.
+- **ABCL default prompt is `CL-USER(N): `, not `? `.** ABCL uses
+  an Allegro-style package-qualified prompt with a monotonic form
+  counter. The splash integration overrides
+  `top-level::*repl-prompt-fun*` to emit a literal `? ` instead
+  so both Common Lisp adapters (CCL and ABCL) share the same mode
+  regex `^\? $` without per-impl branching. If a future tweak
+  ever restores ABCL's native prompt format, the mode regex needs
+  to grow an alternation.
+- **ABCL's debugger is `system::debug-loop`, not the same
+  mechanism as `top-level::*repl-prompt-fun*`.** The CCL-style
+  `N > ` nested break loop prompt pattern and the `level_capture`
+  mode regex do **not** port directly to ABCL — ABCL's debug-loop
+  prints a separate prompt that the top-level hook doesn't see.
+  The ABCL adapter ships with only the `main` mode declared;
+  debugger mode is deferred until someone researches the
+  `debug-loop` prompt mechanism against a live break scenario.
+  Errors today just leave the REPL sitting in `main` mode with
+  the error text printed to stdout.
 - **`CancellationTokenRegistration.Dispose` blocks from inside
   the callback.** When a CTS-registered delegate calls back into
   code that disposes its own registration, the `Dispose` call
@@ -425,10 +479,12 @@ case is a schema gap.
 
 ## Commit history at a glance
 
-Phase B → C → C+ → regex-strategy → cache-on-busy-receive arc is
-~30 commits, each a self-contained story. Newest first:
+Phase B → C → C+ → regex-strategy → cache-on-busy-receive → ABCL
+arc is ~30 commits, each a self-contained story. Newest first:
 
 ```
+cd1cef4  feat(adapters): ship Armed Bear Common Lisp (ABCL) adapter
+b367e99  docs: reflect cache-on-busy-receive round in HANDOFF + CHANGELOG
 af4e5e5  feat(worker): cache-on-busy-receive to recover flipped command results
 1759404  feat(adapters): ship Apache Groovy (groovysh) adapter
 97e80c6  feat(detector): substitute CSI Cursor Forward (CUF) with spaces
