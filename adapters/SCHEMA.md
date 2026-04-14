@@ -552,18 +552,23 @@ Supported assertions:
 - [x] **Q2: Should `modes.exit_commands.effect` enum stay closed (4
   values) or allow `custom` with a free-text label?** — Answered
   "closed is sufficient" by the python adapter's pdb mode declaration
-  (0.1.0, 2026-04-14). pdb is the smallest debugger we ship and its
-  exit commands (`continue`/`c` = resume, `quit`/`q` = return to
-  Python REPL, `return`/`next`/`step` not exit commands) map cleanly
-  to `resume` and `return_to_toplevel`. No need for `custom` or a
-  free-text label for pdb. The `invoke_restart` and `unwind_one_level`
-  values still lack a live example but are kept for CL/SBCL-style
-  debuggers where they have prior art (SLIME's restart protocol).
-  Keep the enum closed for v1 and add a new value only when a
-  concrete adapter demands one. Note: the mode graph is currently
-  declarative-only — ConsoleWorker does not walk it, enforce exit
-  commands, or emit mode-change events. Tests runner treats
-  `expect_mode` / `expect_level` as deferred fields.
+  + the runtime `ModeDetector` (0.2.0, 2026-04-14). pdb's exit
+  commands (`continue`/`c` = resume, `quit`/`q` = return to Python
+  REPL) map cleanly to `resume` and `return_to_toplevel`; no need
+  for `custom` or a free-text label. The `invoke_restart` and
+  `unwind_one_level` values still lack a live example but are kept
+  for CL/SBCL-style debuggers where they have prior art (SLIME's
+  restart protocol). Add a new enum value only when a concrete
+  adapter demands one. Runtime status: `ConsoleWorker` now walks
+  the mode graph after every command via `ModeDetector` (a pure
+  forward regex pass over the captured output tail), surfaces
+  `currentMode` / `currentModeLevel` on execute and get_status
+  responses, and `AdapterDeclaredTestsRunner` honours `expect_mode`
+  / `expect_level` assertions. Exit-command enforcement is still
+  client-side (the AI / MCP client picks an exit_command and the
+  detector confirms the post-command mode), which is the right
+  layering — the runtime reports what mode it sees, the client
+  decides whether to issue the exit command.
 - [ ] Is `output.async_interleave.strategy: redraw_detect` sufficient for
   asyncio / Go-like coroutines, or do we need per-family variants?
 - [ ] Should adapters be able to bundle `preset:` references (e.g.

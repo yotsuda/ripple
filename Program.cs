@@ -71,6 +71,7 @@ public class Program
             Tests.ConsoleWorkerTests.RunUnitTests();
             Tests.RegexPromptDetectorTests.Run();
             Tests.BalancedParensCounterTests.Run();
+            Tests.ModeDetectorTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {

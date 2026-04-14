@@ -399,6 +399,25 @@ public static class AdapterDeclaredTestsRunner
             if (exitCode == 0) return false;
         }
 
+        // expect_mode / expect_level: assert which mode the worker
+        // reports after the eval. Backed by ConsoleWorker's
+        // ModeDetector which re-evaluates after every command. Tests
+        // for adapters without a modes block (no currentMode field
+        // in the response) are a quiet no-op — the field is treated
+        // as additive.
+        if (!string.IsNullOrEmpty(test.ExpectMode))
+        {
+            if (!evalResp.TryGetProperty("currentMode", out var modeProp)) return false;
+            if (modeProp.ValueKind == System.Text.Json.JsonValueKind.Null) return false;
+            if (modeProp.GetString() != test.ExpectMode) return false;
+        }
+        if (test.ExpectLevel is int expectedLevel)
+        {
+            if (!evalResp.TryGetProperty("currentModeLevel", out var lvlProp)) return false;
+            if (lvlProp.ValueKind == System.Text.Json.JsonValueKind.Null) return false;
+            if (lvlProp.GetInt32() != expectedLevel) return false;
+        }
+
         return true;
     }
 

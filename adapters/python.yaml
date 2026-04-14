@@ -202,3 +202,8 @@ tests:
     eval: "raise ValueError('boom')"
     expect: 'ValueError: boom'
     exit_code_is_unreliable: true
+
+  - name: "modes: top-level eval reports current mode as main"
+    eval: "1 + 1"
+    expect: '2'
+    expect_mode: main

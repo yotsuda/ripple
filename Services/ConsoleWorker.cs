@@ -90,6 +90,19 @@ public class ConsoleWorker
     private readonly bool _isPwshFamily;
     private readonly string _defaultEnter;
     private IPtySession? _pty;
+
+    /// <summary>
+    /// Current mode for adapters that declare a <c>modes:</c> block
+    /// (schema §9). Re-evaluated after each command resolves by
+    /// running every auto_enter mode's detect regex against the tail
+    /// of the captured output — see <see cref="ModeDetector"/>. Null
+    /// when the adapter has no modes block. Surfaced on execute /
+    /// get_status responses as <c>currentMode</c> so MCP clients
+    /// (and AdapterDeclaredTestsRunner's expect_mode assertion) can
+    /// observe mode transitions across commands.
+    /// </summary>
+    private string? _currentMode;
+    private int? _currentModeLevel;
     private Stream? _writer;
     private readonly OscParser _parser = new();
     private readonly CommandTracker _tracker = new();
@@ -1476,6 +1489,11 @@ public class ConsoleWorker
                 var elapsed = _tracker.RunningElapsedSeconds;
                 if (elapsed.HasValue) w.WriteNumber("runningElapsedSeconds", elapsed.Value);
                 else w.WriteNull("runningElapsedSeconds");
+                if (_adapter?.Modes is { Count: > 0 })
+                {
+                    w.WriteStringOrNull("currentMode", _currentMode);
+                    if (_currentModeLevel.HasValue) w.WriteNumber("currentModeLevel", _currentModeLevel.Value);
+                }
             }),
             "get_cached_output" => HandleGetCachedOutput(),
             "peek" => SerializeResponse(w =>
@@ -1876,6 +1894,18 @@ public class ConsoleWorker
                     echoExpected = echoExpected[..^enter.Length];
                 cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected);
             }
+            // Re-evaluate which mode the REPL is now in. The detector
+            // scans the tail of the captured output against every
+            // auto_enter mode's detect regex; falls back to the
+            // adapter's default mode otherwise. Result is cached on
+            // the worker so get_status / cached_output can report
+            // the same value without re-scanning.
+            if (_adapter?.Modes is { Count: > 0 } modes)
+            {
+                var match = ModeDetector.Detect(modes, cleanedOutput ?? "");
+                _currentMode = match.Name;
+                _currentModeLevel = match.Level;
+            }
             return SerializeResponse(w =>
             {
                 w.WriteStringOrNull("output", cleanedOutput);
@@ -1883,6 +1913,11 @@ public class ConsoleWorker
                 w.WriteStringOrNull("cwd", result.Cwd);
                 w.WriteStringOrNull("duration", result.Duration);
                 w.WriteBoolean("timedOut", false);
+                if (_adapter?.Modes is { Count: > 0 })
+                {
+                    w.WriteStringOrNull("currentMode", _currentMode);
+                    if (_currentModeLevel.HasValue) w.WriteNumber("currentModeLevel", _currentModeLevel.Value);
+                }
             });
         }
         catch (TimeoutException)

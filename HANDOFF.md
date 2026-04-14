@@ -16,19 +16,20 @@ runtime), phase C (framework generalisation), and the phase C+
 punch list (Racket adapter, pdb mode declaration, `--probe-adapters`
 CLI, `ready.output_settled_*` timing knobs, BOM fix on
 `FileTools.WriteFile`, `--list-adapters` summary truncation,
-CA1416 cleanup, **runtime `balanced_parens` counter with reader-
-macro extensions**) are all complete. **7 adapters ship embedded**
-(pwsh, bash, zsh, cmd, python, node, racket). **411 assertions**
-pass on `--test --e2e` (300 unit + 79 pre-existing E2E + 32
-adapter-declared). Zero shell-family literals survive in the C#
-runtime outside the registry key normaliser. Schema §18 Q1
-(balanced_parens vs reader macros) is **closed** by the runtime
+CA1416 cleanup, runtime `balanced_parens` counter, **runtime
+`modes` graph walker**) are all complete. **7 adapters ship
+embedded** (pwsh, bash, zsh, cmd, python, node, racket). **428
+assertions** pass on `--test --e2e` (316 unit + 79 pre-existing
+E2E + 33 adapter-declared). Zero shell-family literals survive in
+the C# runtime outside the registry key normaliser. Schema §18
+Q1 (balanced_parens vs reader macros) is **closed** by the runtime
 counter and `char_literal_prefix` / `datum_comment_prefix` schema
 extensions; §18 Q2 (exit_commands.effect enum) is **closed** by
-the python adapter's pdb mode. Q3 and Q4 are untouched. Schema
-is still intentionally `v1 draft` until the `modes` graph walker
-is no longer declarative-only — that's the last big runtime
-plumbing gap before v1 freeze.
+the python adapter's pdb mode + the runtime `ModeDetector` and
+`expect_mode` test-runner support. Q3 and Q4 remain untouched —
+both are blocked on a BEAM/Go-style adapter, not on splash itself.
+**The schema is now ready to freeze as `v1 stable`** the next
+time someone is willing to stamp it; no remaining runtime gates.
 
 ---
 
@@ -39,7 +40,7 @@ cd C:\MyProj\splash
 git log --oneline -30                              # last 30 commits — phase B/C/C+ arc
 ./bin/Debug/net9.0/splash.exe --list-adapters      # 7 adapters + their capabilities
 ./bin/Debug/net9.0/splash.exe --probe-adapters     # opt-in pre-flight, one probe.eval per adapter
-./bin/Debug/net9.0/splash.exe --test --e2e         # 411 / 411 green, zsh SKIP expected
+./bin/Debug/net9.0/splash.exe --test --e2e         # 428 / 428 green, zsh SKIP expected
 ```
 
 If the Debug binary is missing or stale:
@@ -152,33 +153,26 @@ given machine.
 
 ## Next-session candidate work
 
-Phase C+ is clear. The only remaining gap before v1 freeze is the
-`modes` graph walker. Roughly in order of payoff per risk:
+All runtime gates for v1 freeze are now clear. The remaining
+candidates are extensions and external-dependency work:
 
-1. **Runtime `modes` graph walking** — the unfinished half of
-   §18 Q2 and the last big runtime plumbing gap. The python
-   adapter declares pdb as an auto_enter mode, but `ConsoleWorker`
-   does not walk the graph, enforce exit commands, or emit mode-
-   change events; `AdapterDeclaredTestsRunner` treats
-   `expect_mode` / `expect_level` as deferred fields. Adding this
-   means tracking mode state across commands (which mode am I in
-   now? did this command trigger a mode change?). Good first
-   step: emit a `currentMode` field in the JSON response from
-   `get_status` and `execute`, populated by re-running the mode
-   regexes against the tail of the output buffer. Richer graph
-   walking (exit_commands enforcement, expect_mode assertions)
-   can follow as a second pass. Once this lands, schema v1 can
-   freeze.
+1. **Stamp `schema: 1 stable`** — purely a docs change. Update
+   `adapters/SCHEMA.md` line 7 (`Status: **draft**.`) to
+   `Status: **stable** (frozen 2026-XX-XX)` and bump the version
+   note. Q1 and Q2 are both closed at the runtime layer; Q3 and
+   Q4 are blocked on adapters splash doesn't ship yet, not on
+   schema gaps. Do this when ready to commit to backwards
+   compatibility on the existing fields.
 
 2. **More reader-macro-heavy Lisp adapters (SBCL / GHCi)** — stress
-   the Q1 fields further (now that the runtime counter is live)
+   the Q1 counter against a different reader-macro surface area
    and provide a second evidence point for Q4
-   (`balanced_parens: { preset: lisp }`). Requires installing
-   an interpreter (SBCL is smallest for CL; GHCi pulls in GHC
-   which is heavy). Each new adapter is also a smoke test for
-   `BalancedParensCounter` against a different reader-macro
-   surface area. Defer until a test box already has one of
-   these toolchains.
+   (`balanced_parens: { preset: lisp }`). Requires installing an
+   interpreter (SBCL is smallest for CL; GHCi pulls in GHC which
+   is heavier). Each new adapter is also an integration test for
+   the modes runtime — SBCL's debugger is the canonical
+   `nested: true` case (level 0/1/2 stacking), which would close
+   the Q2 `level_capture` end-to-end story.
 
 3. **Async-output handling (§18 Q3)** — `redraw_detect` is the
    only defined strategy for `output.async_interleave.strategy`
@@ -194,15 +188,24 @@ Phase C+ is clear. The only remaining gap before v1 freeze is the
    name. Cosmetic / DRY improvement, not a runtime change.
    Blocked on item 2.
 
-5. **`.gitattributes` renormalisation** — still held off. `git
+5. **Mode exit-command enforcement** — currently `ModeDetector`
+   reports the post-command mode, and the MCP client decides
+   whether to send an exit command. A stricter model would have
+   the runtime check `mode.exit_commands` against the AI-supplied
+   command and short-circuit if the AI tries to issue an exit
+   command in the wrong mode. Not blocking v1 freeze (the current
+   layering is defensible) but would catch a class of AI mistakes
+   the same way `balanced_parens` does for incomplete input.
+
+6. **`.gitattributes` renormalisation** — still held off. `git
    add --renormalize .` would touch every tracked file and
    pollute blame history. Do this only if there's a separate
    reason to burn a blame entry. Not worth tackling in isolation.
 
-User policy as of 2026-04-14: **schema v1 remains unfrozen** —
-the `balanced_parens` counter is now live (Q1 closed), so the
-last gate is the `modes` graph walker for Q2 to be fully closed
-at the runtime layer. Once that lands, freeze.
+User policy as of 2026-04-14: **schema is ready to freeze**.
+All four §18 questions are either closed (Q1, Q2) or blocked on
+external adapters that splash doesn't yet ship (Q3, Q4) — neither
+case is a schema gap. Stamp `v1 stable` when comfortable.
 
 ---
 
@@ -261,10 +264,12 @@ at the runtime layer. Once that lands, freeze.
 
 ## Commit history at a glance
 
-Phase B → C → C+ is ~25 commits, each a self-contained story.
+Phase B → C → C+ is ~26 commits, each a self-contained story.
 Newest first:
 
 ```
+PENDING  feat(schema): runtime modes graph walker closes §18 Q2
+654225c  docs(handoff): mark §18 Q1 closed and balanced_parens counter live
 ed3e7fa  feat(schema): runtime balanced_parens counter closes §18 Q1
 a8f56ed  chore(worker): silence CA1416 on GetRegistryPathExt
 81efbcd  docs(handoff): reflect phase C+ state — 7 adapters, 385 assertions
