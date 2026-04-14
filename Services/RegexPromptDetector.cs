@@ -175,6 +175,27 @@ public sealed class RegexPromptDetector
                         map.Add(i);
                         sb.Append('\n');
                     }
+                    else if (terminator == 'C')
+                    {
+                        // Cursor Forward (CUF): ESC [ N C moves the
+                        // cursor right by N columns. When drawing over
+                        // blank space — which prompts typically are —
+                        // this is visually equivalent to inserting N
+                        // literal spaces. fsi uses `\x1b[1C` to pad its
+                        // error-recovery prompt (`\r\n>\x1b[1C` instead
+                        // of `\r\n> \x1b[?25h`), which would otherwise
+                        // strip to `>` and miss the `^> $` regex.
+                        // Substituting CUF with spaces keeps the
+                        // stripped text visually faithful and the
+                        // adapter-author regex happy. Default N = 1
+                        // when the parameter is empty.
+                        int n = ParseCsiParam(input, i + 2, j, defaultValue: 1);
+                        for (int k = 0; k < n; k++)
+                        {
+                            map.Add(i);
+                            sb.Append(' ');
+                        }
+                    }
                     i = j + 1;
                     continue;
                 }
@@ -221,5 +242,26 @@ public sealed class RegexPromptDetector
         if (colStart >= paramEnd) return true;   // ESC [ N ; H — empty col, defaults to 1
         var colSpan = input.AsSpan(colStart, paramEnd - colStart);
         return colSpan.SequenceEqual("1".AsSpan());
+    }
+
+    /// <summary>
+    /// Parse a numeric parameter from a CSI sequence between
+    /// <paramref name="paramStart"/> (inclusive) and
+    /// <paramref name="paramEnd"/> (exclusive). Used for single-param
+    /// CSI commands like <c>ESC [ N C</c> (cursor forward). Returns
+    /// <paramref name="defaultValue"/> when the param is empty or
+    /// cannot be parsed. Clamped to a sane range so a malicious
+    /// terminal sending `ESC[999999999C` can't make the detector
+    /// allocate gigabytes of spaces.
+    /// </summary>
+    private static int ParseCsiParam(string input, int paramStart, int paramEnd, int defaultValue)
+    {
+        if (paramEnd <= paramStart) return defaultValue;
+        var span = input.AsSpan(paramStart, paramEnd - paramStart);
+        if (!int.TryParse(span, out var n) || n <= 0) return defaultValue;
+        // Prompt-relevant cursor moves are typically 1–10 columns. 256
+        // is a generous cap that still bounds memory for pathological
+        // inputs.
+        return Math.Min(n, 256);
     }
 }

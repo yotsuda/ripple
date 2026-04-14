@@ -186,6 +186,36 @@ public static class RegexPromptDetectorTests
                 $"CSI: lambda prompt stripped of CSI matches (got {offsets.Count})");
         }
 
+        // Cursor Forward (CUF) substitution — `\x1b[1C` is visually a
+        // single space (assuming no pre-existing content in that cell).
+        // fsi's error-recovery prompt uses this instead of a literal
+        // space: `\r\n>\x1b[1C`. Substituting CUF with spaces keeps the
+        // stripped text visually faithful to what the user sees on
+        // screen and lets `^> $` match both normal and error cases.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            // fsi's error-recovery shape: newline, `>`, CUF(1).
+            var offsets = d.Scan("\r\n>\x1b[1C");
+            Assert(offsets.Count == 1,
+                $"CSI: `>` + CUF(1) matches `^> $` via CUF→space substitution (got {offsets.Count})");
+        }
+
+        // CUF with explicit parameter (3 columns).
+        {
+            var d = new RegexPromptDetector(@"^>   $");
+            var offsets = d.Scan("\r\n>\x1b[3C");
+            Assert(offsets.Count == 1,
+                $"CSI: CUF(3) substitutes 3 spaces (got {offsets.Count})");
+        }
+
+        // Malformed CUF parameter falls back to default of 1 column.
+        {
+            var d = new RegexPromptDetector(@"^> $");
+            var offsets = d.Scan("\r\n>\x1b[C");   // empty param → default 1
+            Assert(offsets.Count == 1,
+                $"CSI: empty CUF param defaults to 1 column (got {offsets.Count})");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
