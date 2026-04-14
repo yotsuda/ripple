@@ -2195,7 +2195,7 @@ public class ConsoleWorker
     /// Format: \x1b]N;text\x07 (BEL terminator) or \x1b]N;text\x1b\\ (ST terminator)
     /// where N is 0, 1, or 2.
     /// </summary>
-    private static string ReplaceOscTitle(string input, string? desiredTitle)
+    internal static string ReplaceOscTitle(string input, string? desiredTitle)
     {
         if (desiredTitle == null) return input;
 

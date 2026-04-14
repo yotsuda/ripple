@@ -59,6 +59,143 @@ public class ConsoleWorkerTests
         Assert(ConsoleWorker.StripCmdInputEcho("hello", "") == "hello",
             "strip cmd echo: empty sent-input returns original");
 
+        // ReplaceOscTitle — rewrites shell-emitted OSC 0/1/2 title
+        // sequences with the proxy-supplied desired title so shells
+        // like bash that encode `user@host: cwd` in their PROMPT_COMMAND
+        // can't clobber the owned-console window title splash just set.
+        // The function runs on every chunk the read loop produces, so
+        // split-chunk inputs are a realistic failure mode — covered
+        // below.
+        const string desired = "#12345 Dolphin";
+
+        // Fully-terminated OSC 0 + BEL: rewritten.
+        {
+            var input = "before\x1b]0;shell-title\aafter";
+            var expected = "before\x1b]0;" + desired + "\aafter";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 0 BEL fully rewritten");
+        }
+
+        // Fully-terminated OSC 2 + BEL: rewritten (OSC 2 = set icon+title on xterm).
+        {
+            var input = "x\x1b]2;shell-title\ay";
+            var expected = "x\x1b]2;" + desired + "\ay";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 2 BEL fully rewritten");
+        }
+
+        // Fully-terminated OSC 1 + BEL: rewritten (OSC 1 = set icon-name on xterm).
+        {
+            var input = "x\x1b]1;shell-title\ay";
+            var expected = "x\x1b]1;" + desired + "\ay";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 1 BEL fully rewritten");
+        }
+
+        // OSC 0 with ST (String Terminator) instead of BEL: the ESC \
+        // terminator style is also legal per the VT spec; some modern
+        // shells use it. Must be recognized and preserved.
+        {
+            var input = "a\x1b]0;shell-title\x1b\\b";
+            var expected = "a\x1b]0;" + desired + "\x1b\\b";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 0 ST (ESC\\) fully rewritten");
+        }
+
+        // OSC 633 (shell integration) must NOT be rewritten — only
+        // 0/1/2 are title sequences. Other OSC types flow through
+        // untouched.
+        {
+            var input = "\x1b]633;A\acommand output\x1b]633;D;0\a";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == input,
+                "title: OSC 633 passes through untouched");
+        }
+
+        // OSC 7 (pwd update on some terminals) must NOT be rewritten.
+        {
+            var input = "\x1b]7;file:///tmp\a";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == input,
+                "title: OSC 7 passes through untouched");
+        }
+
+        // desiredTitle null = passthrough (used before proxy claim).
+        {
+            var input = "\x1b]0;shell-title\arest";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, null) == input,
+                "title: null desiredTitle is pure passthrough");
+        }
+
+        // Two OSC 0 sequences in one chunk are both rewritten.
+        {
+            var input = "\x1b]0;first\amiddle\x1b]0;second\atail";
+            var expected = "\x1b]0;" + desired + "\amiddle\x1b]0;" + desired + "\atail";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: two OSC 0 in one chunk both rewritten");
+        }
+
+        // Empty title string inside OSC 0: valid per VT spec, must still rewrite.
+        {
+            var input = "\x1b]0;\arest";
+            var expected = "\x1b]0;" + desired + "\arest";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: empty OSC 0 body still rewritten");
+        }
+
+        // OSC 0 at the very start of the chunk.
+        {
+            var input = "\x1b]0;x\aafter";
+            var expected = "\x1b]0;" + desired + "\aafter";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 0 at chunk start");
+        }
+
+        // OSC 0 at the very end of the chunk (BEL is the last byte).
+        {
+            var input = "before\x1b]0;x\a";
+            var expected = "before\x1b]0;" + desired + "\a";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == expected,
+                "title: OSC 0 at chunk end");
+        }
+
+        // Unterminated OSC 0 (opener present but BEL/ST never arrives
+        // in this chunk) is the split-chunk failure mode: a partial
+        // OSC leaks through verbatim, the visible terminal interprets
+        // bytes 1–N as the shell's title up to whatever terminator
+        // eventually arrives, and splash's desired title is clobbered.
+        // The function currently writes the partial opener + body
+        // char-by-char; this test pins the behaviour so a fix that
+        // buffers the tail can change it deliberately.
+        {
+            var input = "output \x1b]0;partial-title-no-term";
+            var result = ConsoleWorker.ReplaceOscTitle(input, desired);
+            Assert(!result.Contains(desired),
+                "title: unterminated OSC currently leaks verbatim (pinning pre-fix behaviour)");
+            Assert(result.Contains("\x1b]0;partial-title-no-term"),
+                "title: unterminated OSC body is present in the output");
+        }
+
+        // 3-digit OSC like \x1b]112;... (set cursor color) must NOT
+        // match because the byte after `1` is `1`, not `;`. Regression
+        // guard — the length check in the matcher has to be strict.
+        {
+            var input = "\x1b]112;rgb:ff/00/00\a";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == input,
+                "title: OSC 112 (3-digit, not a title) passes through");
+        }
+
+        // Plain text without any OSC is unchanged.
+        {
+            var input = "hello world\nno escapes here";
+            Assert(ConsoleWorker.ReplaceOscTitle(input, desired) == input,
+                "title: plain text passes through");
+        }
+
+        // Empty input.
+        {
+            Assert(ConsoleWorker.ReplaceOscTitle("", desired) == "",
+                "title: empty input passes through");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
