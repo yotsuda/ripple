@@ -507,10 +507,42 @@ Supported assertions:
 
 ## 18. Open questions for v1 freeze
 
-- [ ] Is `balanced_parens` expressive enough for Lisp-family languages with
-  reader macros?
-- [ ] Should `modes.exit_commands.effect` enum stay closed (4 values) or allow
-  `custom` with a free-text label?
+- [~] **Q1: Is `balanced_parens` expressive enough for Lisp-family
+  languages with reader macros?** — Partially answered by the Racket
+  adapter (0.1.0, 2026-04-14). The schema fields (`open`, `close`,
+  `string_delims`, `escape`, `line_comment`, `block_comment`) cover the
+  obvious tokens but NOT the reader-macro escapes that appear in real
+  Lisp code: `#;` (datum comment — skips the next datum, paren-aware),
+  `#|…|#` (the existing `block_comment` handles this), `#\(` and `#\)`
+  (character literals of parens — must not count toward bracket depth),
+  and `'`/`` ` ``/`,@` quoting prefixes that prefix sub-expressions
+  without opening brackets. The Racket adapter ships with
+  `balanced_parens` declared for schema forward-compat, but the current
+  runtime does NOT consume `multiline_detect` at all — multi-line
+  delivery goes through the same `tempfile` path Python uses, which
+  sidesteps the question entirely. A runtime counter would need at
+  minimum a `char_literal_prefix: '#\\'` field to skip the next
+  character, and a `datum_comment_prefix: '#;'` field to skip the next
+  balanced expression. Until such a runtime counter exists and is
+  tested against reader-macro-heavy input, treat Q1 as "schema fields
+  are believed sufficient for everything except char literals and
+  datum comments." Deferring a v1 freeze until those two extensions
+  ship keeps the door open without breaking adapters.
+- [x] **Q2: Should `modes.exit_commands.effect` enum stay closed (4
+  values) or allow `custom` with a free-text label?** — Answered
+  "closed is sufficient" by the python adapter's pdb mode declaration
+  (0.1.0, 2026-04-14). pdb is the smallest debugger we ship and its
+  exit commands (`continue`/`c` = resume, `quit`/`q` = return to
+  Python REPL, `return`/`next`/`step` not exit commands) map cleanly
+  to `resume` and `return_to_toplevel`. No need for `custom` or a
+  free-text label for pdb. The `invoke_restart` and `unwind_one_level`
+  values still lack a live example but are kept for CL/SBCL-style
+  debuggers where they have prior art (SLIME's restart protocol).
+  Keep the enum closed for v1 and add a new value only when a
+  concrete adapter demands one. Note: the mode graph is currently
+  declarative-only — ConsoleWorker does not walk it, enforce exit
+  commands, or emit mode-change events. Tests runner treats
+  `expect_mode` / `expect_level` as deferred fields.
 - [ ] Is `output.async_interleave.strategy: redraw_detect` sufficient for
   asyncio / Go-like coroutines, or do we need per-family variants?
 - [ ] Should adapters be able to bundle `preset:` references (e.g.
