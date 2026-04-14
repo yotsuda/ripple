@@ -135,6 +135,13 @@ public class ConsoleWorker
 
     private readonly string? _banner;
     private readonly string? _reason;
+    // Rolling buffer for partial OSC title sequences that straddle
+    // a PTY read-chunk boundary. ReplaceOscTitle owns the scan logic
+    // and pushes any unterminated opener here so the next chunk can
+    // re-scan with the terminator visible. Single owner: the read
+    // loop's MirrorToVisible call path.
+    private string _oscTitlePending = "";
+
     // Title set by proxy via set_title. Used to override OSC 0 title sequences
     // emitted by shells (e.g., bash's PROMPT_COMMAND sets "user@host: cwd").
     private volatile string? _desiredTitle;
@@ -1384,7 +1391,7 @@ public class ConsoleWorker
         if (!_mirrorVisible || text.Length == 0) return;
         try
         {
-            var cleanedOutput = ReplaceOscTitle(text, _desiredTitle);
+            var cleanedOutput = ReplaceOscTitle(text, _desiredTitle, ref _oscTitlePending);
             var outBytes = Encoding.UTF8.GetBytes(cleanedOutput);
             _stdoutStream ??= Console.OpenStandardOutput();
             _stdoutStream.Write(outBytes, 0, outBytes.Length);
@@ -2194,40 +2201,108 @@ public class ConsoleWorker
     /// by the proxy via set_title pipe command.
     /// Format: \x1b]N;text\x07 (BEL terminator) or \x1b]N;text\x1b\\ (ST terminator)
     /// where N is 0, 1, or 2.
+    ///
+    /// <para><b>Cross-chunk buffering.</b> The PTY read loop calls this
+    /// function on every chunk it produces, and a shell emitting a title
+    /// OSC near a read-buffer boundary can easily split the sequence
+    /// (opener in chunk N, body or terminator in chunk N+1). Without
+    /// state, a split opener leaks into the visible stream and the
+    /// terminal interprets it as an open-ended title write — the shell's
+    /// title ends up displayed instead of splash's desired one. The
+    /// <paramref name="pendingTail"/> ref parameter carries a
+    /// not-yet-classified or not-yet-terminated OSC fragment forward
+    /// between calls: on entry it's prepended to the current chunk, on
+    /// exit it contains any unterminated opener that belongs to a title
+    /// sequence (or a partial ESC at chunk end that could begin one).
+    /// Callers are expected to keep one tail buffer per stream.</para>
     /// </summary>
-    internal static string ReplaceOscTitle(string input, string? desiredTitle)
+    internal static string ReplaceOscTitle(string input, string? desiredTitle, ref string pendingTail)
     {
-        if (desiredTitle == null) return input;
+        // Prepend any fragment carried over from the previous chunk.
+        // The carried fragment is always either `\x1b`, `\x1b]`, or
+        // a partial `\x1b]N;...` opener with no terminator — i.e.
+        // something we deliberately refused to emit last time because
+        // we couldn't tell whether it was a title OSC that needed
+        // rewriting. Clear it now; it's re-set below if still partial.
+        var combined = pendingTail.Length == 0 ? input : pendingTail + input;
+        pendingTail = "";
+        if (desiredTitle == null) return combined;
 
-        var sb = new StringBuilder(input.Length);
+        var sb = new StringBuilder(combined.Length);
         int i = 0;
-        while (i < input.Length)
+        while (i < combined.Length)
         {
-            // Look for \x1b](0|1|2);
-            if (i + 3 < input.Length && input[i] == '\x1b' && input[i + 1] == ']' &&
-                (input[i + 2] == '0' || input[i + 2] == '1' || input[i + 2] == '2') && input[i + 3] == ';')
+            if (combined[i] == '\x1b')
             {
-                // Find terminator: BEL (\x07) or ST (\x1b\)
-                int end = -1;
-                int termLen = 0;
-                for (int j = i + 4; j < input.Length; j++)
+                int remain = combined.Length - i;
+
+                // Lone ESC at end of chunk — we can't classify what
+                // kind of escape sequence this starts, and emitting it
+                // bare would leave the visible terminal in "waiting for
+                // sequence" state. Buffer until the next call.
+                if (remain < 2)
                 {
-                    if (input[j] == '\x07') { end = j; termLen = 1; break; }
-                    if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\')
-                    { end = j; termLen = 2; break; }
+                    pendingTail = combined[i..];
+                    break;
                 }
 
-                if (end > 0)
+                if (combined[i + 1] == ']')
                 {
-                    // Replace with our desired title (preserve the OSC type and terminator style)
-                    sb.Append('\x1b').Append(']').Append(input[i + 2]).Append(';').Append(desiredTitle);
-                    if (termLen == 1) sb.Append('\x07');
-                    else { sb.Append('\x1b').Append('\\'); }
-                    i = end + termLen;
-                    continue;
+                    // OSC. Need at least \x1b + ] + type byte + ; = 4 bytes
+                    // to decide whether this is a title sequence we care about.
+                    if (remain < 4)
+                    {
+                        pendingTail = combined[i..];
+                        break;
+                    }
+
+                    var typeByte = combined[i + 2];
+                    var isTitleOsc = (typeByte == '0' || typeByte == '1' || typeByte == '2')
+                                     && combined[i + 3] == ';';
+
+                    if (isTitleOsc)
+                    {
+                        // Look for the terminator: BEL (\x07) or ST (\x1b\).
+                        int end = -1;
+                        int termLen = 0;
+                        for (int j = i + 4; j < combined.Length; j++)
+                        {
+                            if (combined[j] == '\x07') { end = j; termLen = 1; break; }
+                            if (combined[j] == '\x1b' && j + 1 < combined.Length && combined[j + 1] == '\\')
+                            { end = j; termLen = 2; break; }
+                        }
+
+                        if (end >= 0)
+                        {
+                            // Fully terminated — rewrite with desired title,
+                            // preserving OSC type and terminator style.
+                            sb.Append('\x1b').Append(']').Append(typeByte).Append(';').Append(desiredTitle);
+                            if (termLen == 1) sb.Append('\x07');
+                            else { sb.Append('\x1b').Append('\\'); }
+                            i = end + termLen;
+                            continue;
+                        }
+
+                        // Terminator hasn't arrived yet — buffer the whole
+                        // opener + partial body so the next chunk can
+                        // re-scan with the terminator visible. Crucially
+                        // do NOT emit these bytes, or the visible terminal
+                        // would interpret them as an open-ended title and
+                        // display the shell's title once the terminator
+                        // eventually shows up.
+                        pendingTail = combined[i..];
+                        break;
+                    }
+                    // Non-title OSC (OSC 4, 7, 112, 633, ...) — fall
+                    // through and pass the `\x1b` through byte-by-byte.
+                    // The rest of the sequence flows through the plain
+                    // copy path below without being rewritten.
                 }
+                // Non-OSC escape (CSI `\x1b[`, charset `\x1b(`, ...) —
+                // pass through unchanged.
             }
-            sb.Append(input[i]);
+
+            sb.Append(combined[i]);
             i++;
         }
         return sb.ToString();
