@@ -603,14 +603,20 @@ public class ConsoleWorkerTests
         }
 
         // Test 10: send_input Ctrl+C interrupts a running command.
-        // Start a long sleep, send \x03, and confirm the next get_status shows standby
-        // (shell returned to prompt) within a couple of seconds.
+        // Start a 30 s sleep with a 10 s drain window. If Ctrl+C
+        // actually interrupts, we see standby within ~3 s. If Ctrl+C
+        // is silently dropped (or consumed elsewhere), the sleep runs
+        // for its full 30 s and the drain window gives up at 10 s —
+        // test fails. This makes "worked" and "didn't work" dynamically
+        // distinguishable, unlike earlier drafts with 3 / 60 s sleeps
+        // where natural completion and interrupt converged in the drain
+        // window and hid the failure mode.
         {
             var sleepCmd = OperatingSystem.IsWindows()
-                ? "Start-Sleep -Seconds 60"
-                : "sleep 60";
+                ? "Start-Sleep -Seconds 30"
+                : "sleep 30";
 
-            var execResp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", sleepCmd); w.WriteNumber("timeout", 300); }, TimeSpan.FromSeconds(5));
+            var execResp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", sleepCmd); w.WriteNumber("timeout", 500); }, TimeSpan.FromSeconds(5));
             var execTimedOut = execResp.TryGetProperty("timedOut", out var t) && t.GetBoolean();
             Assert(execTimedOut, "Long sleep: timed out as expected");
 
@@ -623,9 +629,21 @@ public class ConsoleWorkerTests
             Assert(inputStatus == "ok", $"send_input Ctrl+C accepted while busy (got: {inputStatus})");
 
             // Drain cached output so the tracker clears HasCachedOutput and the next
-            // get_status can return "standby" instead of "completed".
+            // get_status can return "standby" instead of "completed". 10 s window
+            // — comfortably longer than a real Ctrl+C interrupt (~2-3 s end-to-end)
+            // but comfortably shorter than a 30 s Start-Sleep natural completion,
+            // so a silent-drop failure mode is visibly distinguishable. If Ctrl+C
+            // actually reaches pwsh, standby is reported within ~3 s. If the byte
+            // is dropped or mis-routed (current flake behaviour on this box), the
+            // sleep runs to completion at T+30 s and the drain gives up first.
+            //
+            // On failure, the recent-output ring is dumped so the next debug pass
+            // can see what pwsh was actually doing — if the prompt is visible
+            // in the ring, Ctrl+C worked and the tracker failed to notice; if
+            // only `Start-Sleep -Seconds 30` is visible with no following
+            // output, Ctrl+C was silently dropped and pwsh is still sleeping.
             var interrupted = false;
-            var deadline = DateTime.UtcNow.AddSeconds(5);
+            var deadline = DateTime.UtcNow.AddSeconds(10);
             while (DateTime.UtcNow < deadline)
             {
                 await SendRequest(pipeName, w => w.WriteString("type", "get_cached_output"));
@@ -633,6 +651,15 @@ public class ConsoleWorkerTests
                 var st = statusResp.TryGetProperty("status", out var s) ? s.GetString() : null;
                 if (st == "standby") { interrupted = true; break; }
                 await Task.Delay(200);
+            }
+            if (!interrupted)
+            {
+                // Dump the raw ring bytes so the next debug pass can see
+                // whether pwsh's prompt actually came back (tracker bug) or
+                // whether Start-Sleep is still running (Ctrl+C dropped).
+                var peekResp = await SendRequest(pipeName, w => { w.WriteString("type", "peek"); w.WriteBoolean("raw", true); });
+                var recent = peekResp.TryGetProperty("recentOutput", out var ro) ? ro.GetString() ?? "" : "";
+                Console.Error.WriteLine($"    [Ctrl+C flake] recent ring tail = <{(recent.Length > 300 ? recent[^300..] : recent).Replace("\n", "\\n").Replace("\r", "\\r")}>");
             }
             Assert(interrupted, "Shell returned to standby after Ctrl+C interrupt");
         }
