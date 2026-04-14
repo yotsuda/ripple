@@ -1,0 +1,149 @@
+schema: 1
+name: fsi
+version: 0.1.0
+description: >
+  F# Interactive (dotnet fsi) REPL with regex-based prompt detection.
+  Unlike pwsh / bash / python / node / racket, F# Interactive does not
+  expose a public API for replacing its prompt function — fsi.fs
+  hardcodes "> " as the prompt and the only exposed interactive object
+  (`fsi`) controls print width / depth but not the prompt string. So
+  this adapter uses splash's RegexPromptDetector instead of an
+  injected OSC 633 emitter, exercising the schema's `prompt.strategy: regex`
+  path for the first time. ;; is the F# Interactive command terminator.
+homepage: https://fsharp.org
+license: MIT
+family: repl
+aliases:
+  - fsharp
+  - fsharpi
+
+process:
+  # F# Interactive ships as a subcommand of dotnet (`dotnet fsi`),
+  # not a standalone fsi.exe. `process.executable` tells the worker
+  # to resolve the binary as "dotnet" instead of looking for "fsi" on
+  # PATH; {shell_path} then expands to the dotnet absolute path and
+  # the rest of the command_template adds the `fsi` subcommand.
+  # --readline- disables fsi's line editor so ConPTY captures clean
+  # stdout instead of fsi rewriting the prompt line via cursor
+  # movement. We deliberately do NOT pass --use: with an integration
+  # script: F# Interactive shows `val it: unit = ()` for every
+  # statement evaluated at the top level, so an init script that
+  # tweaks `fsi.PrintWidth` would emit a stray prompt boundary the
+  # tracker would mis-resolve as the first user command's output.
+  executable: dotnet
+  command_template: '"{shell_path}" fsi --use:{init_invocation} --readline- --gui-'
+  inherit_environment: true
+  encoding: utf-8
+  # F# Interactive on Windows reads stdin via the .NET Console class,
+  # which treats \r as Enter under ConPTY cooked mode (same as Python
+  # and Node).
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # fsi cold start = ~1.5s on this box (dotnet host + fsi compile).
+  # Leave the WaitForOutputSettled defaults in place — the regex
+  # detector will fire once "> " appears on its own line.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # fsi prints the post-script-load prompt ~200ms before its eval
+  # loop is ready to accept stdin input. Wait an extra 800ms after
+  # the first regex match so the test runner doesn't race the REPL
+  # startup with its first eval.
+  delay_after_inject_ms: 800
+
+init:
+  strategy: regex
+  hook_type: none
+  delivery: launch_command
+  tempfile:
+    prefix: .splash-integration-
+    extension: .fsx
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.fsx
+
+prompt:
+  strategy: regex
+  # F# Interactive's visible prompt is `> ` at line start. RegexPromptDetector
+  # is CSI-aware: it strips cursor positioning and color escapes before
+  # running this regex, so the adapter author writes against the text
+  # that would actually appear on screen — not against the raw byte
+  # stream with ConPTY's cursor-movement noise interleaved.
+  primary: '^> $'
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  # No OSC C / B from F# Interactive (no integration hook), so use
+  # deterministic byte matching to strip the input echo from the
+  # captured slice — same approach python and cmd use.
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # F# Interactive uses ;; as the terminator for an evaluated
+  # expression block. Without ;;, the REPL waits for more input.
+  # splash currently has no `terminator` value in multiline_detect,
+  # so we fall back to `none` and let splash send the user's command
+  # as-is — the splash convention is for the AI to include ;;
+  # explicitly when it wants the input evaluated. This is the §18
+  # schema gap the fsi adapter surfaces; a future schema bump might
+  # add `multiline_detect: terminator` + `multiline_terminator: ";;"`
+  # so splash can auto-append.
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "#quit;;"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true   # #help, #load, #r, #quit
+  async_output: false
+  # F# Interactive REPL has no per-expression exit code; errors print
+  # a diagnostic but the prompt still returns. Same convention as
+  # python and racket.
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+probe:
+  eval: "1 + 1;;"
+  expect: 'val it: int = 2'
+
+tests:
+  - name: "integer arithmetic returns a typed value"
+    eval: "21 * 2;;"
+    expect: 'val it: int = 42'
+
+  - name: "stateful: let-binding persists across commands"
+    setup_sequence:
+      - eval: "let splashTest = \"persist-ok\";;"
+    eval: "splashTest;;"
+    expect: 'persist-ok'
+
+  - name: "list expression with type inference"
+    eval: "[1; 2; 3] |> List.sum;;"
+    expect: 'val it: int = 6'
+
+  - name: "exception: reaching the next prompt after an error"
+    eval: "1 / 0;;"
+    expect: 'DivideByZeroException|attempted to divide by zero'
+    exit_code_is_unreliable: true
