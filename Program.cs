@@ -45,6 +45,17 @@ public class Program
             return;
         }
 
+        // --probe-adapters: run each adapter's probe.eval as a pre-flight
+        // health check and exit. Opt-in so default startup stays fast; useful
+        // when wiring a new adapter or debugging why the registry loaded
+        // something that refuses to talk.
+        if (args.Contains("--probe-adapters"))
+        {
+            var failed = await Tests.AdapterDeclaredTestsRunner.ProbeAllAsync(registry);
+            if (failed > 0) Environment.Exit(1);
+            return;
+        }
+
         // --test mode: run tests
         if (args.Contains("--test"))
         {
@@ -115,7 +126,7 @@ public class Program
             Console.WriteLine($"    version   : {adapter.Version}");
             Console.WriteLine($"    schema    : v{adapter.Schema}");
             if (!string.IsNullOrEmpty(adapter.Description))
-                Console.WriteLine($"    summary   : {FirstLine(adapter.Description)}");
+                Console.WriteLine($"    summary   : {SummarizeDescription(adapter.Description)}");
             if (adapter.Aliases is { Count: > 0 })
                 Console.WriteLine($"    aliases   : {string.Join(", ", adapter.Aliases)}");
             Console.WriteLine($"    init      : {adapter.Init.Strategy} / {adapter.Init.Delivery}");
@@ -163,5 +174,24 @@ public class Program
     {
         var idx = s.IndexOfAny(new[] { '\n', '\r' });
         return idx >= 0 ? s[..idx] : s;
+    }
+
+    // YAML's `description: >` folded-block form collapses embedded
+    // newlines into spaces, so every adapter ends up with a single
+    // paragraph that can easily run to 300+ characters. --list-adapters
+    // is meant to be a compact index, not a full doc dump, so clip
+    // at ~120 characters and append an ellipsis when there's more.
+    private const int SummaryMaxLength = 120;
+
+    private static string SummarizeDescription(string s)
+    {
+        var flat = FirstLine(s).Trim();
+        if (flat.Length <= SummaryMaxLength)
+            return flat;
+        var cut = flat.AsSpan(0, SummaryMaxLength);
+        var lastSpace = cut.LastIndexOf(' ');
+        if (lastSpace > SummaryMaxLength - 30)
+            cut = cut[..lastSpace];
+        return cut.ToString() + " …";
     }
 }

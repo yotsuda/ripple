@@ -40,6 +40,108 @@ namespace Splash.Tests;
 /// </summary>
 public static class AdapterDeclaredTestsRunner
 {
+    /// <summary>
+    /// Probe every loaded adapter (schema §14) without running any tests.
+    /// Each adapter gets its own fresh worker, runs probe.eval, asserts
+    /// probe.expect, then shuts the worker down. Missing interpreters are
+    /// soft-skipped. Returns the number of hard failures so a caller can
+    /// exit non-zero from a CLI flag like --probe-adapters.
+    /// </summary>
+    public static async Task<int> ProbeAllAsync(AdapterRegistry registry)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("=== Probe Adapters === SKIP (Windows-only worker path)");
+            return 0;
+        }
+
+        Console.WriteLine("=== Probe Adapters ===");
+
+        var adaptersWithProbe = registry.All
+            .Where(a => a.Probe != null && !string.IsNullOrEmpty(a.Probe.Eval))
+            .OrderBy(a => a.Name)
+            .ToList();
+
+        if (adaptersWithProbe.Count == 0)
+        {
+            Console.WriteLine("  (no adapters declare probe:)");
+            return 0;
+        }
+
+        int pass = 0;
+        int fail = 0;
+
+        foreach (var adapter in adaptersWithProbe)
+        {
+            var (ok, skipped) = await ProbeOneAsync(adapter);
+            if (skipped) continue;
+            if (ok) { pass++; Console.WriteLine($"  PASS: {adapter.Name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {adapter.Name}"); }
+        }
+
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        return fail;
+    }
+
+    private static async Task<(bool ok, bool skipped)> ProbeOneAsync(Adapter adapter)
+    {
+        var shell = adapter.Name;
+        var proxyPid = Environment.ProcessId;
+        var agentId = "probe";
+        var cwd = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        int workerPid;
+        try
+        {
+            var launcher = new ProcessLauncher();
+            workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  SKIP: {adapter.Name} (launch failed: {ex.GetType().Name}: {ex.Message})");
+            return (false, true);
+        }
+
+        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+
+        try
+        {
+            var ready = await ConsoleWorkerTests.WaitForPipeAsync(pipeName, TimeSpan.FromSeconds(30));
+            if (!ready)
+            {
+                Console.WriteLine($"  SKIP: {adapter.Name} (worker pipe never ready — interpreter likely missing)");
+                return (false, true);
+            }
+
+            var probeTest = new AdapterTest
+            {
+                Name = "probe",
+                Eval = adapter.Probe!.Eval,
+                Expect = adapter.Probe.Expect,
+            };
+            try
+            {
+                var ok = await RunOneTestAsync(pipeName, probeTest);
+                return (ok, false);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"    {ex.GetType().Name}: {ex.Message}");
+                return (false, false);
+            }
+        }
+        finally
+        {
+            try
+            {
+                var proc = Process.GetProcessById(workerPid);
+                proc.Kill();
+                await proc.WaitForExitAsync();
+            }
+            catch { }
+        }
+    }
+
     public static async Task<int> RunAsync(AdapterRegistry registry)
     {
         if (!OperatingSystem.IsWindows())
