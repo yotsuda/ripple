@@ -6,9 +6,11 @@
 
 **A shell MCP server for AI that actually holds a session.** Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each. Watch every command happen in a real terminal window — the same one you can type into yourself.
 
+> **Renamed from `splashshell`.** Previously published on npm as [`splashshell`](https://www.npmjs.com/package/splashshell) (v0.1.0 – v0.5.0); starting with v0.7.0 the package lives at [`@ytsuda/splash`](https://www.npmjs.com/package/@ytsuda/splash). `splashshell` is deprecated — uninstall it and install `@ytsuda/splash` to keep receiving updates. This repository was also renamed from `yotsuda/splashshell` to `yotsuda/splash`; GitHub redirects old clone URLs automatically.
+
 ## Install
 
-Prerequisite: [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0). No global install needed — `npx` fetches a ~5 MB native binary on first run.
+No runtime prerequisite — splash ships as a self-contained NativeAOT binary (~13 MB, Windows x64). `npx` fetches it on first run.
 
 ```bash
 claude mcp add-json splash -s user '{"command":"npx","args":["-y","@ytsuda/splash@latest"]}'
@@ -90,6 +92,12 @@ Status lines include the console name, shell family, exit code, duration, and cu
 
 Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`, `search_files`, `find_files`), useful when the MCP client doesn't already provide them.
 
+## REPL support
+
+On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eight REPLs: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), and **groovy**. Start any of them with `start_console shell=python` (or `node`, `racket`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+
+All twelve adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.splash/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
+
 ## Multi-shell behavior
 
 Each console tracks its own cwd. When the active console is busy, the AI is auto-routed to a sibling console of the same shell family — started at the source console's cwd — and its next command runs immediately. Manual `cd` in the terminal is detected and the AI is warned before it runs the wrong command in the wrong place.
@@ -104,7 +112,7 @@ Other niceties: **console re-claim** — consoles outlive their parent MCP proce
 | First execute on a new shell | Auto-starts a console; warns so you can verify cwd before re-executing |
 | Active console matches requested shell | Runs immediately |
 | Active console busy, same shell requested | Auto-starts a sibling console **at the source console's cwd** and runs immediately |
-| Switch to a same-shell standby | Prepends `cd` preamble so the command runs in the source cwd, then executes |
+| Switch to a same-shell standby | Runs a standalone `cd` first (with an explicit failure check against the expected directory) so the command runs in the source cwd, then executes the AI's pipeline unchanged |
 | Switch to a different shell | Warns to confirm cwd (cross-shell path translation is not implemented) |
 | User manually `cd`'d in the active console | Warns so the AI can verify the new cwd before running its next command |
 
@@ -156,10 +164,10 @@ graph TB
 ```bash
 git clone https://github.com/yotsuda/splash.git
 cd splash
-dotnet publish -c Release -r win-x64 --no-self-contained -o ./dist
+dotnet publish -c Release -r win-x64 -o ./dist
 ```
 
-The binary is `./dist/splash.exe`. Use the absolute path instead of the `npx` command in your MCP config.
+The csproj has `PublishAot=true`, so the published binary is a NativeAOT single-exe with no .NET runtime dependency. The binary is `./dist/splash.exe` (~13 MB) — use the absolute path instead of the `npx` command in your MCP config.
 
 ## Platform support
 
