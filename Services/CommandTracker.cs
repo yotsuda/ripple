@@ -207,9 +207,12 @@ public class CommandTracker
     /// </summary>
     public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = PreemptiveTimeoutMs)
     {
-        // Minimum 1 second to avoid CancellationTokenSource(0) race conditions
-        timeoutMs = Math.Max(timeoutMs, 1000);
-        // Always cap at the MCP ceiling so the response path stays live.
+        // 0 is the "interactive" sentinel — caller wants splash to flip
+        // to cache mode as soon as possible so the MCP response comes
+        // back without blocking on a shell waiting for user input.
+        // Any other value is clamped to the MCP 170s ceiling so the
+        // response path stays live.
+        if (timeoutMs < 0) timeoutMs = 0;
         timeoutMs = Math.Min(timeoutMs, PreemptiveTimeoutMs);
 
         lock (_lock)
@@ -218,6 +221,19 @@ public class CommandTracker
                 throw new InvalidOperationException("Another command is already executing.");
 
             _tcs = new TaskCompletionSource<CommandResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // Capture the Task reference locally BEFORE wiring up the
+            // CancellationTokenSource. When timeoutMs is 0 (or very
+            // small), `new CancellationTokenSource(timeoutMs)` can be
+            // already-cancelled by the time we call Register, which
+            // invokes FlipToCacheMode synchronously on this thread.
+            // FlipToCacheMode sets `_tcs = null` as part of detaching
+            // the broken response channel, so `return _tcs.Task` below
+            // would NullReferenceException. Capturing `task` locally
+            // means the null-out is harmless — we return the captured
+            // (already-faulted) reference. See commit 8275846 for the
+            // original NRE incident and the clamp-to-1000ms workaround
+            // this replaces.
+            var task = _tcs.Task;
             _isAiCommand = true;
             _aiOutput = "";
             _truncated = false;
@@ -245,7 +261,7 @@ public class CommandTracker
             var timeoutCts = new CancellationTokenSource(timeoutMs);
             _timeoutReg = timeoutCts.Token.Register(FlipToCacheMode);
 
-            return _tcs.Task;
+            return task;
         }
     }
 

@@ -52,7 +52,7 @@ public class ShellTools
         string pipeline,
         [Description("Shell type to execute in (bash, pwsh, zsh, or full path). If omitted, uses the current active console. If specified and no matching console exists, one is auto-started.")]
         string? shell = null,
-        [Description("Timeout in seconds (default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports).")]
+        [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — splash flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
         int timeout_seconds = 30,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
@@ -118,7 +118,11 @@ public class ShellTools
 
         if (result.StillBusy.Count > 0)
         {
-            sb.AppendLine($"Still busy after {timeout_seconds}s. Call wait_for_completion again to keep waiting:");
+            // Don't claim "after Ns" here — wait_for_completion returns
+            // early on the first drained result (see ConsoleManager.cs
+            // first-drain-wins loop), so the actual elapsed time is
+            // usually much shorter than timeout_seconds.
+            sb.AppendLine("Still busy. Call wait_for_completion again to keep waiting:");
             foreach (var b in result.StillBusy)
                 sb.AppendLine(FormatBusyLine(b));
         }
@@ -323,7 +327,8 @@ public class ShellTools
         var elapsed = b.ElapsedSeconds.HasValue ? $" ({b.ElapsedSeconds.Value:F0}s)" : "";
         var raw = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand.Trim();
         var cmd = raw.Length > 60 ? raw[..60] + "..." : raw;
-        return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}";
+        var cwdInfo = !string.IsNullOrEmpty(b.Cwd) ? $" | Location: {b.Cwd}" : "";
+        return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}{cwdInfo}";
     }
 
     /// <summary>
@@ -334,6 +339,7 @@ public class ShellTools
     private static string FormatFinishedLine(ConsoleManager.FinishedStatus f)
     {
         var shell = f.ShellFamily != null ? $" ({f.ShellFamily})" : "";
-        return $"✓ {f.DisplayName}{shell} | Status: User command finished";
+        var cwdInfo = !string.IsNullOrEmpty(f.Cwd) ? $" | Location: {f.Cwd}" : "";
+        return $"✓ {f.DisplayName}{shell} | Status: User command finished{cwdInfo}";
     }
 }

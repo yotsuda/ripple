@@ -303,8 +303,11 @@ public class ConsoleManager
         // pipe wait + worker timer both unwind within the 3-minute
         // tool-call window. Callers that ask for longer get a clean
         // preemptive-timeout response at 170s and can keep polling
-        // via wait_for_completion.
-        timeoutSeconds = Math.Clamp(timeoutSeconds, 1, MaxExecuteTimeoutSeconds);
+        // via wait_for_completion. 0 is the "interactive" sentinel —
+        // splash flips to cache mode as soon as the pipeline is on the
+        // PTY so execute_command returns immediately and the drain
+        // wrapper salvages the result on the next tool call.
+        timeoutSeconds = Math.Clamp(timeoutSeconds, 0, MaxExecuteTimeoutSeconds);
         await _toolLock.WaitAsync();
         try { return await ExecuteCommandInnerAsync(command, timeoutSeconds, agentId, shell); }
         finally { _toolLock.Release(); }
@@ -319,7 +322,8 @@ public class ConsoleManager
             consolePid: plan.ConsolePid,
             pipeName: plan.PipeName,
             command: command,
-            executedCommand: plan.ExecutedCommand,
+            cdCommand: plan.CdCommand,
+            expectedCwdAfterCd: plan.PreambleCwd,
             timeoutSeconds: timeoutSeconds,
             agentId: agentId,
             shell: shell,
@@ -328,16 +332,21 @@ public class ConsoleManager
 
     /// <summary>
     /// Output of the routing phase. Either a concrete target console to run
-    /// the command on (ConsolePid + PipeName + ExecutedCommand, possibly with
-    /// a RoutingNotice that should be surfaced to the AI) or an EarlyResult
-    /// that short-circuits the execute entirely — used for the "switched, re-
-    /// execute" and "cwd drifted, verify" paths where the planner refuses to
-    /// run the command on the AI's behalf.
+    /// the command on (ConsolePid + PipeName + optional CdCommand that must
+    /// be executed first, possibly with a RoutingNotice that should be
+    /// surfaced to the AI) or an EarlyResult that short-circuits the execute
+    /// entirely — used for the "switched, re-execute" and "cwd drifted,
+    /// verify" paths where the planner refuses to run the command on the
+    /// AI's behalf. CdCommand is a standalone shell command (e.g.
+    /// `Set-Location 'C:\...'`) that gets run as its own execute so the
+    /// AI's command stays pure and the status line can show what the AI
+    /// asked for rather than the proxy-injected cd preamble.
     /// </summary>
     private sealed record ExecutionPlan(
         int ConsolePid,
         string PipeName,
-        string ExecutedCommand,
+        string? CdCommand,
+        string? PreambleCwd,
         string? RoutingNotice,
         ExecuteResult? EarlyResult);
 
@@ -507,7 +516,7 @@ public class ConsoleManager
                     // the freshly-started console's live cwd (which is
                     // cachedDeadCwd). Return a plan that points directly
                     // at the new console — no preamble, no warning.
-                    return new ExecutionPlan(consolePid, pipeName, command, RoutingNotice: null, EarlyResult: null);
+                    return new ExecutionPlan(consolePid, pipeName, CdCommand: null, PreambleCwd: null, RoutingNotice: null, EarlyResult: null);
                 }
 
                 var fallbackStart = await StartConsoleInnerAsync(targetShellPath, null, null, agentId);
@@ -524,10 +533,20 @@ public class ConsoleManager
         bool sameShellFamily = sourceShellFamily != null && targetShellFamily != null &&
                                 sourceShellFamily.Equals(targetShellFamily, StringComparison.OrdinalIgnoreCase);
 
-        // What actually gets written to the PTY (may grow by a cd preamble).
-        // The status/busy lines keep showing `command` unchanged so the AI
-        // sees the pipeline it asked for, not the proxy-injected cd.
-        var executedCommand = command;
+        // Standalone cd command to run before the AI's command, when
+        // routing moved us to a console whose cwd differs from the AI's
+        // intended cwd. Running it as a separate execute (instead of
+        // prepending `cd '...'; ` to the AI's command) keeps the AI-
+        // facing status line honest: the Pipeline field shows what the
+        // AI actually asked for, not a proxy-manufactured composite.
+        // expectedCwdAfterCd is the cwd we expect to reach; after the
+        // cd runs we compare the worker's reported cwd against it and
+        // bail if they don't match — catches the pwsh case where
+        // `Set-Location` to a non-existent path leaves $LASTEXITCODE
+        // unchanged (= 0) so an exit-code-only check would silently
+        // let the AI command run in whatever cwd cd got stuck at.
+        string? cdCommand = null;
+        string? expectedCwdAfterCd = null;
 
         // Out-of-band notice attached to the success result, used when we
         // silently corrected for a user-initiated cwd change in the source
@@ -563,7 +582,12 @@ public class ConsoleManager
             var cdPreamble = BuildCdPreamble(targetShellFamily!, preambleCwd);
             if (cdPreamble != null)
             {
-                executedCommand = cdPreamble + command;
+                // Strip trailing `&` / `;` / ` ` so the preamble stands on
+                // its own as a standalone shell command. BuildCdPreamble
+                // produces `cd '...' && ` / `Set-Location '...'; ` /
+                // `cd /d "..." && `; after TrimEnd we get the bare cd.
+                cdCommand = cdPreamble.TrimEnd('&', ';', ' ');
+                expectedCwdAfterCd = preambleCwd;
                 UpdateConsoleInfo(consolePid, info => info.LastAiCwd = preambleCwd);
             }
 
@@ -590,7 +614,7 @@ public class ConsoleManager
             // no longer reach this branch — resolvedShell is pinned to the busy
             // source earlier, so the find/auto-start above stays same-family.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-            return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice,
+            return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                 EarlyResult: new ExecuteResult
                 {
                     Pid = consolePid,
@@ -615,7 +639,7 @@ public class ConsoleManager
             {
                 UpdateConsoleInfo(consolePid, info => info.LastAiCwd = currentCwd);
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
-                return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice,
+                return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                     EarlyResult: new ExecuteResult
                     {
                         Pid = consolePid,
@@ -626,7 +650,7 @@ public class ConsoleManager
             }
         }
 
-        return new ExecutionPlan(consolePid, pipeName, executedCommand, routingNotice, EarlyResult: null);
+        return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice, EarlyResult: null);
     }
 
     /// <summary>
@@ -643,7 +667,8 @@ public class ConsoleManager
         int consolePid,
         string pipeName,
         string command,
-        string executedCommand,
+        string? cdCommand,
+        string? expectedCwdAfterCd,
         int timeoutSeconds,
         string agentId,
         string? shell,
@@ -652,15 +677,84 @@ public class ConsoleManager
         try
         {
             // Record the AI-visible command for this console so background
-            // busy reports can show what the AI asked for, not the preamble-
-            // augmented string the worker actually runs.
+            // busy reports can show what the AI asked for, not the proxy-
+            // injected cd. The cd itself is handled as a separate execute
+            // below and never shown in the AI-facing status line.
             UpdateConsoleInfo(consolePid, ci => ci.LastAiCommand = command);
+
+            // Phase 1: optional cd. Run as its own execute so the AI's
+            // command stays pure in the status line and the cache entry.
+            // Splitting also makes error handling cleaner: if the cd
+            // fails (target directory doesn't exist, etc.) we report the
+            // failure explicitly instead of running the AI command in
+            // the wrong place. We use a short fixed timeout here since
+            // cd is always a near-instant shell builtin.
+            if (!string.IsNullOrEmpty(cdCommand))
+            {
+                try
+                {
+                    var cdResp = await SendPipeRequestAsync(pipeName, w =>
+                    {
+                        w.WriteString("type", "execute");
+                        w.WriteString("id", Guid.NewGuid().ToString());
+                        w.WriteString("command", cdCommand);
+                        w.WriteNumber("timeout", 5000);
+                    }, TimeSpan.FromSeconds(8));
+
+                    var cdActualCwd = cdResp.TryGetProperty("cwd", out var ccProp) ? ccProp.GetString() : null;
+                    var cdOutput = cdResp.TryGetProperty("output", out var coProp) ? coProp.GetString() : null;
+                    // Verify the cd actually reached the expected
+                    // directory. Exit-code checking is unreliable here
+                    // because pwsh's `Set-Location` surfaces path-not-
+                    // found failures as a cmdlet error record, not a
+                    // non-zero $LASTEXITCODE — and cmd's `cd /d`
+                    // doesn't expose %ERRORLEVEL% through the PROMPT
+                    // shim at all. The worker's post-command cwd (sent
+                    // on every execute response via OSC P) is the
+                    // shell-agnostic source of truth: if the cwd
+                    // returned from cdResp doesn't match what we
+                    // expected, the cd didn't land where we wanted,
+                    // even if the shell reported exit code 0.
+                    if (!string.IsNullOrEmpty(expectedCwdAfterCd)
+                        && !string.IsNullOrEmpty(cdActualCwd)
+                        && !CwdEquals(cdActualCwd!, expectedCwdAfterCd!))
+                    {
+                        var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                        var shellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
+                        // Roll LastAiCwd forward to whatever cwd the
+                        // shell actually ended up at so subsequent
+                        // execute_commands from the AI don't keep
+                        // trying to return to the unreachable path.
+                        UpdateConsoleInfo(consolePid, info => info.LastAiCwd = cdActualCwd);
+                        return new ExecuteResult
+                        {
+                            Pid = consolePid,
+                            DisplayName = displayName,
+                            ShellFamily = shellFamily,
+                            Command = command,
+                            Output = string.IsNullOrEmpty(cdOutput)
+                                ? $"Failed to change directory to '{expectedCwdAfterCd}' before running command. Shell stayed at '{cdActualCwd}'."
+                                : cdOutput + $"\n(Shell stayed at '{cdActualCwd}'.)",
+                            ExitCode = 1,
+                            Cwd = cdActualCwd,
+                            Notice = routingNotice,
+                        };
+                    }
+                }
+                catch
+                {
+                    // Pipe error on the cd phase — fall through to the
+                    // main execute. The status line will still report
+                    // whatever cwd the main command ends up at, so the
+                    // AI has visible signal if the cd didn't happen.
+                }
+            }
 
             var response = await SendPipeRequestAsync(pipeName, w =>
             {
                 w.WriteString("type", "execute");
                 w.WriteString("id", Guid.NewGuid().ToString());
-                w.WriteString("command", executedCommand);
+                w.WriteString("command", command);
                 w.WriteNumber("timeout", timeoutSeconds * 1000);
             }, TimeSpan.FromSeconds(timeoutSeconds + 5));
 
@@ -918,6 +1012,29 @@ public class ConsoleManager
            && !liveCwd.Equals(lastAiCwd, PathComparison);
 
     /// <summary>
+    /// Case/separator-normalized cwd comparison used by the cd-failure
+    /// detector in ExecutePlannedCommandAsync. Normalizes both paths
+    /// via <see cref="Path.GetFullPath(string)"/> so trailing slashes
+    /// and short-vs-long 8.3 forms collapse to the same canonical
+    /// spelling, then compares under the platform path-comparison
+    /// policy (OrdinalIgnoreCase on Windows, Ordinal on POSIX).
+    /// Returns false on any normalization exception — a path that
+    /// can't even be canonicalized is definitely not equivalent to a
+    /// real cwd.
+    /// </summary>
+    private static bool CwdEquals(string a, string b)
+    {
+        try
+        {
+            return Path.GetFullPath(a).Equals(Path.GetFullPath(b), PathComparison);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Apply an update to a tracked console's info under _lock. Consolidates
     /// the "look up _consoles[pid], if non-null mutate" pattern that used to
     /// live inline at every LastAiCwd / LastAiCommand assignment site, so
@@ -947,11 +1064,19 @@ public class ConsoleManager
                     TimeSpan.FromSeconds(3));
 
                 var status = response.TryGetProperty("status", out var sp) ? sp.GetString() : null;
-                // Only truly idle consoles are reusable. "completed" has a cached
-                // AI result that the next execute would destroy via RegisterCommand
-                // — let the drain-at-end-of-tool path handle it; we'll auto-start
-                // a fresh console for the new command instead.
-                if (status != "standby") continue;
+                // Reusable states: "standby" (nothing pending) and
+                // "completed" (shell is idle but holds a cached result
+                // from a previous AI command). Routing onto a
+                // "completed" console is safe since RegisterCommand no
+                // longer clears _cachedResults — the old entries ride
+                // along until the universal drain wrapper picks them
+                // up on the way out of the next tool call, which is
+                // typically the same tool call that spawned the new
+                // command. Excluding "completed" caused auto-routing
+                // to spawn a fresh console whenever an earlier
+                // timeout-drained console was still holding a cached
+                // result, which felt unnatural and wasted standbys.
+                if (status != "standby" && status != "completed") continue;
 
                 // Shell path filter: match by full path (tracked consoles) or family (unowned)
                 if (shellPath != null)
@@ -1353,12 +1478,14 @@ public class ConsoleManager
         string DisplayName,
         string? ShellFamily,
         string? RunningCommand,
-        double? ElapsedSeconds);
+        double? ElapsedSeconds,
+        string? Cwd);
 
     public record FinishedStatus(
         int Pid,
         string DisplayName,
-        string? ShellFamily);
+        string? ShellFamily,
+        string? Cwd);
 
     public record BusyReport(
         List<BusyStatus> Busy,
@@ -1419,6 +1546,17 @@ public class ConsoleManager
                 var statusStr = statusResp.TryGetProperty("status", out var st) ? st.GetString() : null;
                 var wasKnownBusy = knownBusy.Contains(pid);
 
+                // Both busy and finished lines carry the worker's live
+                // cwd so the AI can see where each background console
+                // is without a separate peek_console round-trip. The
+                // worker reports _tracker.LastKnownCwd which is updated
+                // on every OSC P (Cwd) event, including from user-typed
+                // cd commands, so this stays in sync with whatever the
+                // human is doing on the shared terminal.
+                var cwdForLine = statusResp.TryGetProperty("cwd", out var cwdProp)
+                    ? cwdProp.GetString()
+                    : null;
+
                 if (statusStr != "busy")
                 {
                     // Idle now. Only emit a finished line if we'd previously
@@ -1431,7 +1569,7 @@ public class ConsoleManager
                     if (wasKnownBusy)
                     {
                         UnmarkPipeBusy(agentId, pid);
-                        finishedReport.Add(new FinishedStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily));
+                        finishedReport.Add(new FinishedStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cwdForLine));
                     }
                     continue;
                 }
@@ -1463,7 +1601,7 @@ public class ConsoleManager
                     && esProp.ValueKind == JsonValueKind.Number)
                     elapsed = esProp.GetDouble();
 
-                busyReport.Add(new BusyStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cmd, elapsed));
+                busyReport.Add(new BusyStatus(pid, info?.DisplayName ?? $"#{pid}", info?.ShellFamily, cmd, elapsed, cwdForLine));
             }
             catch
             {
@@ -1622,7 +1760,15 @@ public class ConsoleManager
                 }
             }
 
-            if (busyPids.Count == 0) break;
+            // Return as soon as ANY busy console produces a result — the
+            // caller can call wait_for_completion again to pick up the
+            // rest. Waiting for all of them at once made AI sessions
+            // block on the slowest command even after a faster one had
+            // completed, which defeats the whole point of the
+            // cache-on-busy-receive salvage layer. First-drain-wins
+            // gives the AI a tight feedback loop: react to whatever
+            // finished, issue the next command, and loop.
+            if (busyPids.Count == 0 || completed.Count > 0) break;
             await Task.Delay(300);
         }
 
