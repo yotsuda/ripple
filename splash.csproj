@@ -55,6 +55,7 @@
     <EmbeddedResource Include="adapters\perldb.yaml" />
     <EmbeddedResource Include="adapters\jdb.yaml" />
     <EmbeddedResource Include="adapters\pdb.yaml" />
+    <EmbeddedResource Include="adapters\sqlite3.yaml" />
   </ItemGroup>
 
 </Project>

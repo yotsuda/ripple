@@ -1,0 +1,159 @@
+schema: 1
+name: sqlite3
+version: 0.1.0
+description: >
+  SQLite's built-in command-line REPL (`sqlite3`) driven as a splash
+  adapter. Launches on an in-memory database so each session is
+  self-contained and disposable — AI agents use this for ad-hoc SQL
+  experimentation, schema exploration, and teaching queries without
+  touching real data. To open a real database, use `.open path.db`
+  from inside the session.
+
+  The prompt is the classic `sqlite> ` (continuation is `   ...> `
+  with a counter). Output mode is forced to `list` with no headers
+  at launch so query results are pipe-separated and trivially
+  parseable — sqlite 3.33+ defaults to a pretty "box" render that
+  would otherwise require adapter-side output normalization.
+homepage: https://www.sqlite.org/cli.html
+license: Public-Domain
+family: repl
+aliases:
+  - sqlite
+
+process:
+  executable_candidates:
+    - sqlite3
+    # winget install location on Windows (user scope).
+    - '%LOCALAPPDATA%\Microsoft\WinGet\Packages\SQLite.SQLite_Microsoft.Winget.Source_8wekyb3d8bbwe\sqlite3.exe'
+    # Common manual-install locations.
+    - 'C:\sqlite\sqlite3.exe'
+    - 'C:\Program Files\SQLite\sqlite3.exe'
+    # Linux / macOS system installs.
+    - /usr/bin/sqlite3
+    - /usr/local/bin/sqlite3
+    - /opt/homebrew/bin/sqlite3
+  # `-cmd` runs dot-commands before the first prompt; each appears as
+  # a separate `-cmd` argument. `.mode list` reverts to pipe-separated
+  # output (the historical default, still the most regex-friendly);
+  # `.headers off` suppresses column names so a `SELECT 1+1;` produces
+  # just `2\n` instead of a header + separator + data block.
+  # `:memory:` is the target database — in-memory, fresh every launch.
+  command_template: '"{shell_path}" -cmd ".mode list" -cmd ".headers off" ":memory:"'
+  inherit_environment: true
+  encoding: utf-8
+  # sqlite3 on Windows reads stdin via fgets under ConPTY cooked mode.
+  # CR is submitted as Enter — same as Python / Node / fsi / perldb.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  # sqlite3 prints a short banner (version + pragma help line) then
+  # the prompt. 200ms is ample for the banner bytes to drain.
+  delay_after_inject_ms: 200
+
+init:
+  # sqlite3 has its own dot-command interpreter — no external
+  # integration script needed. Launch-time `-cmd` args do all the
+  # setup the adapter requires.
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # Primary prompt is `sqlite> ` at line start. Continuation prompts
+  # (when a statement spans multiple lines) are `   ...> ` but this
+  # adapter sends statements as single lines terminated with `;`, so
+  # the continuation case doesn't arise — the regex is scoped to the
+  # primary form only.
+  strategy: regex
+  primary: '^sqlite> $'
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  # SQL statements are single-line by convention for splash — the
+  # caller sends one `SELECT / INSERT / UPDATE / ...;` per execute.
+  # Multi-line SQL (e.g. CREATE TABLE with embedded newlines) would
+  # need the continuation-prompt handling that this adapter
+  # deliberately doesn't enable.
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: ".quit"
+    grace_ms: 500
+    force_signal: kill
+
+capabilities:
+  stateful: true           # in-memory DB state persists across commands
+  interrupt: true
+  meta_commands: true      # .mode, .headers, .tables, .schema, .open, ...
+  async_output: false
+  # SQL errors (syntax, constraint violations) print to stdout but
+  # don't affect the shell's exit code — the REPL stays running.
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+commands:
+  # sqlite3's dot-commands are the REPL's meta-commands. No prefix is
+  # needed inside the adapter — the AI sends `.tables`, `.schema`,
+  # `.mode`, etc. directly.
+  prefix: "."
+  discovery: ".help"
+  builtin:
+    - { name: tables,  syntax: ".tables",       description: "List tables in the current database" }
+    - { name: schema,  syntax: ".schema {expr}", description: "Show CREATE statements for table(s)" }
+    - { name: open,    syntax: ".open {expr}",   description: "Open a database file" }
+    - { name: mode,    syntax: ".mode {expr}",   description: "Change output mode (list|column|box|json|csv|...)" }
+    - { name: headers, syntax: ".headers {expr}", description: "Toggle column headers in query output" }
+
+probe:
+  eval: "SELECT 1+1;"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic"
+    eval: "SELECT 21 * 2;"
+    expect: '^42$'
+
+  - name: "string concatenation via ||"
+    eval: "SELECT 'hello' || '-world';"
+    expect: '^hello-world$'
+
+  - name: "state: in-memory table persists across commands"
+    setup_sequence:
+      - eval: "CREATE TABLE t(x INTEGER);"
+      - eval: "INSERT INTO t VALUES (100), (200), (300);"
+    eval: "SELECT SUM(x) FROM t;"
+    expect: '^600$'
+
+  - name: "meta command: list tables after creation"
+    setup_sequence:
+      - eval: "CREATE TABLE splash_test(id INT);"
+    eval: ".tables"
+    expect: 'splash_test'
+
+  - name: "sqlite version function returns a dotted version"
+    eval: "SELECT sqlite_version();"
+    expect: '^\d+\.\d+\.\d+$'
