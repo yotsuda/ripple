@@ -10,6 +10,30 @@ aliases:
   - sh
 
 process:
+  # Candidate list tried left-to-right; first entry that resolves to an
+  # existing file wins. On Windows, a bare `bash` resolves via registry
+  # PATH, which hits C:\Windows\System32\bash.exe — WSL's launcher — and
+  # that exits ~150ms after CreateProcess when no WSL distribution is
+  # installed (wsl.exe prints "no installed distributions" to stderr and
+  # bails). Most developer workstations have Git for Windows installed
+  # but don't have a WSL distro, so prefer Git Bash first and fall back
+  # to WSL only if Git isn't present. MSYS2 is a tertiary fallback for
+  # users who installed it directly. The bare `bash` fallback covers
+  # Linux / macOS where it's the canonical PATH entry.
+  executable_candidates:
+    # Git for Windows bundled bash — canonical dev workstation bash on
+    # Windows. Runs as a native MSYS2 binary, no distro required.
+    - 'C:\Program Files\Git\bin\bash.exe'
+    # MSYS2 standalone install.
+    - 'C:\msys64\usr\bin\bash.exe'
+    # PATH search — wins on Linux / macOS and on Windows boxes where a
+    # distro-providing bash is explicitly exposed. On Windows without
+    # Git / MSYS2 this falls through to WSL bash, which requires an
+    # installed distribution to survive startup.
+    - bash
+    # Linux / BSD system bash.
+    - /bin/bash
+    - /usr/bin/bash
   command_template: '"{shell_path}" --login -i'
   inherit_environment: true
   env: {}
