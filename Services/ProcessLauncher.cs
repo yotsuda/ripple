@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using static Splash.Services.Win32Native;
 
 namespace Splash.Services;
@@ -110,38 +111,225 @@ public class ProcessLauncher
     }
 
     /// <summary>
-    /// Launch console worker on Linux/macOS with clean environment.
-    /// Uses env -i to strip inherited environment, then login shell to restore user defaults.
+    /// Launch console worker on Linux/macOS inside a visible terminal emulator
+    /// (Terminal.app on macOS, $TERMINAL / gnome-terminal / konsole / xterm /
+    /// alacritty / kitty / foot on Linux).
+    ///
+    /// The worker PID must equal the value baked into the pipe name
+    /// SP.{proxyPid}.{agentId}.{workerPid}, but Process.Start on a terminal
+    /// emulator returns the emulator's PID, not the splash worker's.
+    ///
+    /// Resolution: write a per-launch wrapper script that records its own
+    /// $$ to a handshake PID file before exec'ing splash. Because exec(3)
+    /// preserves the PID, the value in the file is the splash worker's
+    /// actual PID. The proxy polls the file, reads the PID, and builds the
+    /// same pipe name it would have on Windows — no protocol changes.
     /// </summary>
+    [UnsupportedOSPlatform("windows")]
     private static int LaunchConsoleWorkerUnix(string exePath, int proxyPid, string agentId, string shell, string cwd)
     {
-        // Use setsid to detach from parent's terminal session
+        SweepStaleHandshakeFiles();
+
+        var handshake = Guid.NewGuid().ToString("N");
+        var wrapperPath = $"/tmp/splash-launch-{handshake}.sh";
+        var pidFilePath = $"/tmp/splash-launch-{handshake}.pid";
+
+        // /tmp/splash-launch-<guid>.pid is written atomically via a .tmp +
+        // rename so the proxy never observes a half-written PID. exec
+        // replaces the shell with splash while preserving the PID already
+        // written — that's the load-bearing guarantee of this design.
+        var workerArgs = BuildWorkerArgs(exePath, proxyPid, agentId, shell, cwd);
+        var wrapperContent =
+            "#!/bin/bash\n" +
+            $"echo $$ > \"{pidFilePath}.tmp\"\n" +
+            $"mv \"{pidFilePath}.tmp\" \"{pidFilePath}\"\n" +
+            $"exec {workerArgs}\n";
+
+        File.WriteAllText(wrapperPath, wrapperContent);
+        File.SetUnixFileMode(wrapperPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+            UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+            UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+        var termPsi = BuildTerminalEmulatorPsi(wrapperPath, cwd)
+            ?? throw new InvalidOperationException(
+                "No supported terminal emulator found. Install gnome-terminal, konsole, xterm, " +
+                "alacritty, kitty, or foot, or set $TERMINAL to an emulator that accepts '-e <command>'.");
+
+        using (var launcher = Process.Start(termPsi)
+            ?? throw new InvalidOperationException($"Failed to start terminal emulator: {termPsi.FileName}"))
+        {
+            // Don't wait on launcher.WaitForExit() — osascript returns
+            // immediately, and Linux emulators may fork-detach. We only need
+            // the PID written by the wrapper.
+        }
+
+        // 15 s covers macOS Terminal.app first-launch TCC prompt latency
+        // (Accessibility / Automation permission dialogs) without blocking
+        // the MCP server forever if the wrapper never runs.
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (File.Exists(pidFilePath))
+            {
+                try
+                {
+                    var content = File.ReadAllText(pidFilePath).Trim();
+                    if (int.TryParse(content, out var workerPid) && workerPid > 0)
+                    {
+                        try { File.Delete(pidFilePath); } catch { }
+                        try { File.Delete(wrapperPath); } catch { }
+                        return workerPid;
+                    }
+                }
+                catch { /* file racing with mv — retry next tick */ }
+            }
+            Thread.Sleep(50);
+        }
+
+        try { File.Delete(wrapperPath); } catch { }
+        throw new InvalidOperationException(
+            $"Timed out waiting for splash worker handshake ({pidFilePath}). " +
+            "The terminal emulator may have failed to start the wrapper script.");
+    }
+
+    private static string BuildWorkerArgs(string exePath, int proxyPid, string agentId, string shell, string cwd)
+    {
+        // Each arg is single-quoted to survive bash re-parsing. Any ' inside
+        // a value is escaped by closing the quote, adding an escaped ', and
+        // reopening: foo'bar -> 'foo'\''bar'. agentId is a GUID and proxyPid
+        // is an int, so only shell / cwd realistically need this.
+        return $"{SingleQuote(exePath)} --console --proxy-pid {proxyPid} --agent-id {SingleQuote(agentId)} --shell {SingleQuote(shell)} --cwd {SingleQuote(cwd)}";
+    }
+
+    private static string SingleQuote(string s) => "'" + s.Replace("'", "'\\''") + "'";
+
+    private static ProcessStartInfo? BuildTerminalEmulatorPsi(string wrapperPath, string cwd)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // Terminal.app opens a new window and runs the argument as a
+            // shell command. We pass the wrapper's path (short, no special
+            // chars — only /tmp/splash-launch-<hex>.sh), which is safe to
+            // embed in AppleScript. `activate` brings the window forward so
+            // the user sees their new shell.
+            var psi = new ProcessStartInfo
+            {
+                FileName = "osascript",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = cwd,
+            };
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add($"tell application \"Terminal\" to do script \"{wrapperPath}\"");
+            psi.ArgumentList.Add("-e");
+            psi.ArgumentList.Add("tell application \"Terminal\" to activate");
+            return psi;
+        }
+
+        // Linux: probe $TERMINAL first, then well-known emulators in order
+        // of ubiquity. Invocation convention differs per emulator — most
+        // accept `-e <cmd>`, but gnome-terminal deprecated `-e` and uses
+        // `-- <cmd>` instead, kitty takes the command as positional args.
+        var userTerm = Environment.GetEnvironmentVariable("TERMINAL");
+        if (!string.IsNullOrEmpty(userTerm) && TryFindInPath(userTerm) is string userPath)
+            return BuildLinuxTermPsi(userPath, userTerm, wrapperPath, cwd);
+
+        foreach (var term in new[] { "gnome-terminal", "konsole", "xfce4-terminal",
+                                     "mate-terminal", "alacritty", "kitty",
+                                     "foot", "xterm" })
+        {
+            if (TryFindInPath(term) is string path)
+                return BuildLinuxTermPsi(path, term, wrapperPath, cwd);
+        }
+
+        return null;
+    }
+
+    private static ProcessStartInfo BuildLinuxTermPsi(string termPath, string termName, string wrapperPath, string cwd)
+    {
         var psi = new ProcessStartInfo
         {
-            FileName = "setsid",
+            FileName = termPath,
             UseShellExecute = false,
             CreateNoWindow = true,
             WorkingDirectory = cwd,
         };
 
-        // Get user's login shell for clean environment setup
-        var loginShell = Environment.GetEnvironmentVariable("SHELL") ?? "/bin/bash";
+        // gnome-terminal: `-- <cmd> [args]` is the modern replacement for
+        // the deprecated `-e "<cmd>"`. Everything after `--` is treated as
+        // the command and its argv.
+        if (termName == "gnome-terminal")
+        {
+            psi.ArgumentList.Add("--");
+            psi.ArgumentList.Add(wrapperPath);
+            return psi;
+        }
 
-        // setsid <loginShell> -l -c 'exec <exePath> --console ...'
-        // Login shell (-l) loads user's profile for clean PATH etc.
-        var workerCmd = $"exec \"{exePath}\" --console --proxy-pid {proxyPid} --agent-id {agentId} --shell \"{shell}\" --cwd \"{cwd}\"";
+        // kitty takes the command as positional args after its own flags.
+        if (termName == "kitty")
+        {
+            psi.ArgumentList.Add(wrapperPath);
+            return psi;
+        }
 
-        psi.ArgumentList.Add(loginShell);
-        psi.ArgumentList.Add("-l");
-        psi.ArgumentList.Add("-c");
-        psi.ArgumentList.Add(workerCmd);
+        // foot: `foot <cmd> [args]` — positional like kitty.
+        if (termName == "foot")
+        {
+            psi.ArgumentList.Add(wrapperPath);
+            return psi;
+        }
 
-        var process = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to launch console worker process");
+        // konsole, xfce4-terminal, mate-terminal, alacritty, xterm: all
+        // accept `-e <cmd>` (single-argument form). For the wrapper path
+        // this is unambiguous because the path has no whitespace.
+        psi.ArgumentList.Add("-e");
+        psi.ArgumentList.Add(wrapperPath);
+        return psi;
+    }
 
-        var pid = process.Id;
-        process.Dispose();
-        return pid;
+    private static string? TryFindInPath(string exeName)
+    {
+        // Absolute path short-circuit — $TERMINAL may be "/usr/bin/kitty".
+        if (Path.IsPathRooted(exeName))
+            return File.Exists(exeName) ? exeName : null;
+
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrEmpty(path)) return null;
+
+        foreach (var dir in path.Split(':', StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                var candidate = Path.Combine(dir, exeName);
+                if (File.Exists(candidate)) return candidate;
+            }
+            catch { /* malformed PATH entry — skip */ }
+        }
+        return null;
+    }
+
+    private static void SweepStaleHandshakeFiles()
+    {
+        // Handshake files from crashed launches leak into /tmp forever
+        // without this — ConsoleWorker does the same for its *.log and
+        // .splash-exec-*.ps1 files. Best-effort, silent on error.
+        try
+        {
+            var cutoff = DateTime.UtcNow.AddHours(-1);
+            foreach (var pattern in new[] { "splash-launch-*.sh", "splash-launch-*.pid", "splash-launch-*.pid.tmp" })
+            {
+                foreach (var p in Directory.EnumerateFiles("/tmp", pattern))
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTimeUtc(p) < cutoff) File.Delete(p);
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
     }
 
     /// <summary>
