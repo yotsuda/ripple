@@ -12,7 +12,7 @@ additive fields (`process.executable_candidates`,
 adapter YAML describe any debugger's step / print / breakpoint
 vocabulary in a vendor-agnostic way — AI agents drive perldb and
 jdb using the same operation names, no per-debugger knowledge
-required. **19 embedded adapters** (up from 12), with perldb / jdb /
+required. **18 embedded adapters** (up from 12), with perldb / jdb /
 pdb the first members of the `family: debugger` class. `--adapter-
 tests` runs 100 assertions green; window creation during the test
 suite is fully silent (test workers launch with SW_HIDE) so a long
