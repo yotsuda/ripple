@@ -137,6 +137,14 @@ test run no longer disrupts the user's other windows.
   has already declared the command complete) is also documented
   in the adapter YAML's comments for future `async_interleave`
   work.
+- **CCL / ABCL execute_command responses leaked the next `? `
+  prompt.** `CleanDelta`'s trailing-prompt suppressor recognised
+  `$ # % > ❯ λ` but not `?`, so ccl / abcl (whose integration
+  scripts emit a literal `? ` top-level prompt) rendered `(+ 1 1)`
+  as `2\n?` instead of `2`. Fix (commit `ad9d010`): add
+  `line.EndsWith('?')` to `IsShellPrompt`. Nested break-loop
+  prompts (`1 > ` / `2 > `) were already matched via `>` so the
+  fix is scoped to the top-level `? ` case.
 
 ### Known limitations
 - **`dotnet-dump analyze` is post-mortem only.** Shipping an
