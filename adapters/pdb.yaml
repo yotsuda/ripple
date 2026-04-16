@@ -1,0 +1,170 @@
+schema: 1
+name: pdb
+version: 0.1.0
+description: >
+  Python's built-in debugger (`pdb`) driven as a standalone REPL debugger
+  adapter. Launched via `python -c "import pdb; pdb.Pdb().set_trace()"`
+  which drops straight to the `(Pdb) ` prompt without loading a user
+  script — the caller frame is the `-c` fragment itself, giving a
+  scriptless debugger REPL suitable for inline function definition,
+  breakpoint setting, and expression evaluation. Sister adapter to
+  perldb (perl -de 0), built on the same regex-prompt + init-none
+  pattern.
+
+  To debug a real script, use `import runpy; runpy.run_path('file.py')`
+  from inside the pdb prompt, or set breakpoints with
+  `b module:line` after the target module is loaded.
+homepage: https://docs.python.org/3/library/pdb.html
+license: PSF-2.0
+family: debugger
+aliases:
+  - python-debugger
+  - pydb
+
+process:
+  executable_candidates:
+    # PATH search — wins on boxes with python/python3 on the User or
+    # Machine PATH (most developer installs, Linux, macOS Homebrew).
+    - python
+    - python3
+    # Windows Store / py launcher shim.
+    - py
+    # Common Windows install locations for CPython.
+    - 'C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python313\python.exe'
+    - 'C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python312\python.exe'
+    - 'C:\Users\%USERNAME%\AppData\Local\Programs\Python\Python311\python.exe'
+    - 'C:\Python313\python.exe'
+    - 'C:\Python312\python.exe'
+    - 'C:\Python311\python.exe'
+    # Anaconda / Miniconda.
+    - '%USERPROFILE%\anaconda3\python.exe'
+    - '%USERPROFILE%\miniconda3\python.exe'
+    # Linux / macOS system python.
+    - /usr/bin/python3
+    - /usr/local/bin/python3
+    - /usr/bin/python
+    - /usr/local/bin/python
+  # `-u` disables stdout buffering so pdb's prompt flushes immediately
+  # under ConPTY. `pdb.Pdb().set_trace()` enters the debugger with the
+  # caller frame already active — no target script required.
+  command_template: '"{shell_path}" -u -c "import pdb; pdb.Pdb().set_trace()"'
+  inherit_environment: true
+  env:
+    # Quiet Python's default warnings and ensure UTF-8 I/O under ConPTY.
+    PYTHONIOENCODING: "utf-8"
+    PYTHONDONTWRITEBYTECODE: "1"
+  encoding: utf-8
+  # Python on Windows reads stdin via io.TextIOWrapper which treats \r
+  # as Enter under ConPTY cooked mode — same as Node / fsi / perldb.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 300
+
+init:
+  # pdb's interactive loop is self-contained — no injection needed.
+  # Same `none` strategy as perldb.
+  strategy: none
+  hook_type: none
+  delivery: none
+
+prompt:
+  # pdb's prompt is literally `(Pdb) ` at line start, trailing space
+  # included. The OSC-strip fix in RegexPromptDetector (2026-04-16)
+  # ensures ConPTY's window-title setter doesn't get in the way of
+  # the `^` anchor, same as jdb.
+  strategy: regex
+  primary: '^\(Pdb\) $'
+
+output:
+  post_prompt_settle_ms: 100
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: none
+  multiline_delivery: direct
+  chunk_delay_ms: 0
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "q"
+    grace_ms: 500
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: true
+  async_output: false
+  exit_code: "unreliable"
+  cwd_tracking: false
+  cwd_format: "none"
+  job_control: false
+  shell_integration: null
+  user_busy_detection: none
+
+commands:
+  debugger:
+    # --- Navigation ---
+    step_in:        "s"
+    step_over:      "n"
+    step_out:       "r"
+    continue:       "c"
+    run:            null            # pdb -c entry has no "run" — set_trace already paused us
+    # --- Inspection ---
+    print:          "p {expr}"
+    dump:           "pp {expr}"     # pretty-print for nested structures
+    backtrace:      "w"             # 'where' command
+    source_list:    "l"
+    locals:         "a"             # 'args' shows current frame's args; 'l' shows source
+    where:          "w"
+    args:           "a"
+    # --- Breakpoints ---
+    breakpoint_set:       "b {target}"
+    breakpoint_set_line:  "b {line}"
+    breakpoint_list:      "b"               # `b` with no args lists breakpoints
+    breakpoint_clear_all: "cl"              # prompts "Clear all breaks? "
+
+probe:
+  # `p EXPR` evaluates a Python expression in the current frame and
+  # prints the repr. The caller frame is the -c fragment — an empty
+  # module context that still supports basic arithmetic.
+  eval: "p 1+1"
+  expect: '^2$'
+
+tests:
+  - name: "print integer arithmetic"
+    eval: "p 21 * 2"
+    expect: '^42$'
+
+  - name: "print string expression"
+    eval: 'p "hello" + "-world"'
+    expect: "^'hello-world'$"
+
+  - name: "state: module global persists across commands"
+    setup_sequence:
+      - eval: "!import builtins; builtins.splash_test = 100"
+    eval: "p __import__('builtins').splash_test + 1"
+    expect: '^101$'
+
+  - name: "pretty-print structured value"
+    eval: "pp [1, 2, 3]"
+    expect: '\[1, 2, 3\]'
+
+  - name: "debugger meta command: help returns known command"
+    eval: "h p"
+    expect: 'Print the value of the expression'

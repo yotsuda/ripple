@@ -54,6 +54,7 @@
     <EmbeddedResource Include="adapters\groovy.yaml" />
     <EmbeddedResource Include="adapters\perldb.yaml" />
     <EmbeddedResource Include="adapters\jdb.yaml" />
+    <EmbeddedResource Include="adapters\pdb.yaml" />
   </ItemGroup>
 
 </Project>
