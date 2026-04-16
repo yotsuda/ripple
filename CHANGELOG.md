@@ -96,9 +96,22 @@ test run no longer disrupts the user's other windows.
   the user can always interrupt a stuck command. Operates at
   splash's own forwarding layer (above the shell), making it
   universal across adapters regardless of whether the shell has a
-  line editor — the legacy `input.clear_line` path is retained as
-  belt-and-suspenders for characters that slipped into the line
-  editor before the gate was set.
+  line editor. The hold gate and the pre-existing `input.clear_line`
+  field cover complementary windows and both remain in use:
+  - **Hold gate** protects the *during-command* window — keystrokes
+    typed between the moment the AI command arrives and the moment
+    its output drains.
+  - **`input.clear_line`** protects the *between-command* window —
+    keystrokes the user typed into the shared console (which is
+    splash's whole design promise) that already reached the shell's
+    line editor before the next AI command arrived. clear_line
+    issues the line-editor-kill bytes (Ctrl-A + Ctrl-K for readline)
+    right before submitting the AI command so pre-typed partial
+    input doesn't prefix it. Removing clear_line would require
+    extending the hold gate to also cover the between-command
+    window, which would silently break the shared-console contract
+    that lets the user type into splash's terminal as their own
+    workspace.
 - **`--adapter-tests` worker console windows are hidden (SW_HIDE).**
   Normal splash usage keeps `SW_SHOWNOACTIVATE` so the shared
   console is visible-but-inactive; test runs gate on `noUserInput`
