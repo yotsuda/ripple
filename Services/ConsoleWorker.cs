@@ -125,6 +125,14 @@ public class ConsoleWorker
     // Controls whether PTY output is mirrored to the worker's visible console.
     // Disabled during shell integration injection to hide the source echo.
     private volatile bool _mirrorVisible = true;
+    // User-input hold gate: when true, InputForwardLoop buffers
+    // keystrokes instead of forwarding them to the PTY. Set before
+    // an AI command is written and cleared after the command
+    // completes. Ctrl+C (0x03) passes through even when held so the
+    // user can interrupt a stuck command. Held bytes are replayed
+    // to the PTY on release so the user's typing isn't lost.
+    private volatile bool _holdUserInput;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _heldUserInput = new();
     // Direct stdout stream — bypasses Console.Out's TextWriter buffering.
     private Stream? _stdoutStream;
 
@@ -1249,10 +1257,6 @@ public class ConsoleWorker
                     if (!ReadConsoleW(hStdIn, charBuf, (uint)charBuf.Length, out var charsRead, IntPtr.Zero) || charsRead == 0)
                         break;
 
-                    // Always forward user input — the user must be able to
-                    // respond to confirmation prompts and send Ctrl+C even
-                    // while an AI-initiated command is running.
-
                     try
                     {
                         byte[] utf8;
@@ -1271,8 +1275,29 @@ public class ConsoleWorker
                             // Forward the raw sequences without translation.
                             utf8 = Encoding.UTF8.GetBytes(charBuf, 0, (int)charsRead);
                         }
-                        _pty!.InputStream.Write(utf8, 0, utf8.Length);
-                        _pty.InputStream.Flush();
+
+                        if (_holdUserInput)
+                        {
+                            // AI command in flight — hold user keystrokes for
+                            // replay after the command completes. Ctrl+C (0x03)
+                            // passes through immediately so the user can still
+                            // interrupt a stuck command.
+                            bool isCtrlC = utf8.Length == 1 && utf8[0] == 0x03;
+                            if (isCtrlC)
+                            {
+                                _pty!.InputStream.Write(utf8, 0, utf8.Length);
+                                _pty.InputStream.Flush();
+                            }
+                            else
+                            {
+                                _heldUserInput.Enqueue((byte[])utf8.Clone());
+                            }
+                        }
+                        else
+                        {
+                            _pty!.InputStream.Write(utf8, 0, utf8.Length);
+                            _pty.InputStream.Flush();
+                        }
                     }
                     catch (IOException) { break; }
                 }
@@ -2064,25 +2089,31 @@ public class ConsoleWorker
             ptyPayload = command + enter;
         }
 
-        // Wipe any bytes the user may have typed into the current
-        // prompt's line-editor buffer before submitting our command.
-        // The new console window is spawned SW_SHOWNOACTIVATE so it
-        // shouldn't steal focus, but users occasionally click into
-        // splash's window and type a few keystrokes before realising
-        // — without this flush, those bytes would be prepended to
-        // the AI command and submitted as one garbled line.
+        // Hold user input while the AI command is in flight. Any
+        // keystrokes the user types into the visible console window
+        // are buffered by InputForwardLoop instead of being forwarded
+        // to the PTY — this prevents stray characters from being
+        // prepended to the AI command. Held bytes are replayed
+        // automatically after the command completes so the user's
+        // typing isn't lost. Ctrl+C passes through even while held
+        // so the user can always interrupt a stuck command.
         //
-        // The adapter's input.clear_line is null by default (opt-in)
-        // because several shipped REPLs run without a line editor at
-        // all (Python basic mode, fsi --readline-, Racket -i, CCL,
-        // ABCL) and would treat the clear bytes as literal input.
-        // Adapters that have been empirically verified to honor a
-        // known kill-line sequence set it explicitly in YAML.
+        // This replaces the old adapter-level clear_line approach
+        // (which depended on the shell's readline supporting Ctrl-A +
+        // Ctrl-K and didn't work at all for shells without a line
+        // editor). The hold gate operates at splash's own forwarding
+        // layer, above the shell, so it works universally.
+        _holdUserInput = true;
+
+        // Legacy clear_line: still useful as a belt-and-suspenders
+        // defense for characters that slipped into the line editor
+        // buffer before the hold gate was set. Eventually removable
+        // once the hold approach proves sufficient in the field.
         var clearLine = _adapter?.Input.ClearLine;
         if (!string.IsNullOrEmpty(clearLine))
         {
             try { await WriteToPty(clearLine, ct); }
-            catch { /* best-effort — a flush failure shouldn't block execute */ }
+            catch { /* best-effort */ }
         }
 
         await WriteToPty(ptyPayload, ct);
@@ -2090,6 +2121,13 @@ public class ConsoleWorker
         try
         {
             var result = await resultTask;
+            // Release user-input hold BEFORE building the response so
+            // the held keystrokes replay into the shell's fresh prompt
+            // while the proxy is still formatting the JSON. This gives
+            // the shell a head start on processing any user-typed
+            // partial command so it's visible in the console window by
+            // the time the AI's next tool call arrives.
+            ReleaseHeldUserInput();
             var cleanedOutput = result.Output;
             if (_adapter?.Output.InputEchoStrategy == "deterministic_byte_match")
             {
@@ -2175,15 +2213,10 @@ public class ConsoleWorker
         }
         catch (TimeoutException)
         {
-            // Snapshot what THIS command has produced so far so the AI
-            // can diagnose why it's still running (watch mode, stuck at
-            // an interactive prompt, etc.). Scope is the current
-            // in-flight AI command only — NOT the full screen buffer.
-            // Using the screen buffer leaked already-drained results
-            // from previous commands into the partialOutput, which was
-            // confusing ("I already got that get-date result, why is
-            // it showing again?"). peek_console still returns the full
-            // screen for deliberate inspection.
+            // Timeout = command is still running in the background.
+            // Release held user input so the user can interact with
+            // the running command (type a response, send Ctrl+C, etc.).
+            ReleaseHeldUserInput();
             var partial = _tracker.GetCurrentAiOutputSnapshot();
             return SerializeResponse(w =>
             {
@@ -2198,10 +2231,7 @@ public class ConsoleWorker
         }
         catch (InvalidOperationException ex)
         {
-            // Raised by _tracker.AbortPending() when the child shell process
-            // exited before delivering OSC A. Return a synthetic error result
-            // so the proxy-side execute call unwinds instead of waiting for
-            // an IOException from the worker process termination.
+            ReleaseHeldUserInput();
             return SerializeResponse(w =>
             {
                 w.WriteString("output", ex.Message);
@@ -2212,6 +2242,23 @@ public class ConsoleWorker
                 w.WriteBoolean("shellExited", true);
             });
         }
+    }
+
+    /// <summary>
+    /// Release the user-input hold gate and replay any keystrokes that
+    /// were buffered while the AI command was in flight. Called from
+    /// every exit path of HandleExecuteAsync (success, timeout, error)
+    /// so the hold is never accidentally left on.
+    /// </summary>
+    private void ReleaseHeldUserInput()
+    {
+        _holdUserInput = false;
+        while (_heldUserInput.TryDequeue(out var bytes))
+        {
+            try { _pty!.InputStream.Write(bytes, 0, bytes.Length); }
+            catch (IOException) { break; }
+        }
+        try { _pty?.InputStream.Flush(); } catch { }
     }
 
     private JsonElement HandleGetCachedOutput()
