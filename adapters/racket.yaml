@@ -4,11 +4,11 @@ version: 0.1.0
 description: >
   Racket REPL with OSC 633 shell-integration-style command tracking. The
   integration script overrides current-prompt-read to emit OSC D / P / A
-  around the default `> ` prompt, so splash sees the same command
+  around the default `> ` prompt, so ripple sees the same command
   boundaries it does for pwsh / bash / python / node. The first live Lisp-
   family adapter — exercises schema §18 Q1 (balanced_parens expressiveness
   vs reader macros) with evidence instead of theory.
-homepage: https://github.com/yotsuda/splash
+homepage: https://github.com/yotsuda/ripple
 license: MIT
 family: repl
 aliases:
@@ -44,7 +44,7 @@ init:
   hook_type: prompt_variable        # current-prompt-read override
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .rkt
   init_invocation_template: '"{tempfile_path}"'
   script_resource: integration.rkt
@@ -91,10 +91,10 @@ input:
     datum_comment_prefix: '#;'
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .rkt
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.rkt"
-    invocation_template: '(_splash_exec_file "{path}")'
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.rkt"
+    invocation_template: '(_ripple_exec_file "{path}")'
   chunk_delay_ms: 0
 
 signals:
@@ -133,8 +133,8 @@ tests:
 
   - name: "stateful: define persists across commands"
     setup_sequence:
-      - eval: "(define splash-test 'persist-ok)"
-    eval: "splash-test"
+      - eval: "(define ripple-test 'persist-ok)"
+    eval: "ripple-test"
     expect: 'persist-ok'
 
   - name: "reader macro: datum comment does not break arithmetic"

@@ -2,7 +2,7 @@ schema: 1
 name: sqlite3
 version: 0.1.0
 description: >
-  SQLite's built-in command-line REPL (`sqlite3`) driven as a splash
+  SQLite's built-in command-line REPL (`sqlite3`) driven as a ripple
   adapter. Launches on an in-memory database so each session is
   self-contained and disposable — AI agents use this for ad-hoc SQL
   experimentation, schema exploration, and teaching queries without
@@ -81,7 +81,7 @@ output:
 
 input:
   line_ending: "\r"
-  # SQL statements are single-line by convention for splash — the
+  # SQL statements are single-line by convention for ripple — the
   # caller sends one `SELECT / INSERT / UPDATE / ...;` per execute.
   # Multi-line SQL (e.g. CREATE TABLE with embedded newlines) would
   # need the continuation-prompt handling that this adapter
@@ -150,9 +150,9 @@ tests:
 
   - name: "meta command: list tables after creation"
     setup_sequence:
-      - eval: "CREATE TABLE splash_test(id INT);"
+      - eval: "CREATE TABLE ripple_test(id INT);"
     eval: ".tables"
-    expect: 'splash_test'
+    expect: 'ripple_test'
 
   - name: "sqlite version function returns a dotted version"
     eval: "SELECT sqlite_version();"

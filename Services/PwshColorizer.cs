@@ -1,12 +1,12 @@
 using System.Text;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Lightweight PowerShell syntax colorizer used to paint AI-entered commands
 /// in the visible worker console.
 ///
-/// splash writes the AI's command directly to the worker's stdout so the
+/// ripple writes the AI's command directly to the worker's stdout so the
 /// human user can see what the AI is doing, but it does this with
 /// PSReadLine's live mirror suppressed (otherwise the user sees the
 /// character-by-character typing animation and prediction ghost text). The
@@ -31,7 +31,7 @@ internal static class PwshColorizer
 {
     // PSReadLine's default token colors. Match the ones PowerShell.MCP's
     // Write-ColoredCommand falls back to when PSReadLineOption properties
-    // are unavailable, so splash's echo looks consistent with PSReadLine's
+    // are unavailable, so ripple's echo looks consistent with PSReadLine's
     // interactive rendering.
     private const string Reset     = "\x1b[0m";
     private const string Command   = "\x1b[93m";  // Yellow
@@ -46,7 +46,7 @@ internal static class PwshColorizer
     // PowerShell reserved keywords. Matched case-insensitively so `FOREACH`
     // and `Foreach` are both colored. Mirrors the set flagged with
     // TokenFlags.Keyword by System.Management.Automation.Language.Parser —
-    // splash can't reference that assembly under NativeAOT, so we hard-code
+    // ripple can't reference that assembly under NativeAOT, so we hard-code
     // the list instead.
     // Authoritative list copied from PowerShell's tokenizer.cs s_keywordText
     // (System.Management.Automation/engine/parser/tokenizer.cs:625-639). Every

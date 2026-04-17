@@ -1,11 +1,11 @@
-# splash adapter schema — v1 draft
+# ripple adapter schema — v1 draft
 
-Declarative description of an interactive process so splash can drive it over a
+Declarative description of an interactive process so ripple can drive it over a
 PTY with the same runtime. Covers **shells** (pwsh, bash, zsh, cmd, fish, nu…)
 and **REPLs** (python, node, clojure, ghci, sbcl, iex…) under one contract.
 
 Status: **draft**. Not frozen. Expect breaking changes until `schema: 1` is
-stamped on a shipped splash release.
+stamped on a shipped ripple release.
 
 ---
 
@@ -16,7 +16,7 @@ stamped on a shipped splash release.
    *what* patterns to look for.
 2. **Marker-first prompt detection.** Regex-based prompt matching is a fallback.
    The primary strategy is to inject a unique marker string (OSC 633 for shells,
-   `\u0001SPLASH\u0001` for REPLs) at startup so the runtime can locate prompt
+   `\u0001RIPPLE\u0001` for REPLs) at startup so the runtime can locate prompt
    boundaries without risking false positives from command output.
 3. **Exec-form commands only.** `process.command_template` is expanded with
    named placeholders. Shell-interpolated strings are forbidden — no quoting
@@ -156,10 +156,10 @@ init:
   script_resource: integration.ps1   # file under ShellIntegration/
   # -- OR inline:
   # script: |
-  #   $global:__sp_pending ...
+  #   $global:__rp_pending ...
   init_invocation_template: "..."
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .ps1
   banner_injection:
     mode: prepend_to_tempfile | write_before_pty | none
@@ -171,8 +171,8 @@ init:
     dir_env_var: ZDOTDIR
     file_name: .zshrc
   marker:                           # strategy: marker (REPL path)
-    primary:      "\u0001SPLASH\u0001>>> "
-    continuation: "\u0001SPLASH\u0001... "
+    primary:      "\u0001RIPPLE\u0001>>> "
+    continuation: "\u0001RIPPLE\u0001... "
 ```
 
 **Strategy values** determine which sub-fields are relevant:
@@ -234,8 +234,8 @@ prompt:
     property_updates:
       cwd_key: Cwd
   # -- OR for marker strategy:
-  # primary: '^\u0001SPLASH\u0001>>> $'
-  # continuation: '^\u0001SPLASH\u0001\.\.\. $'
+  # primary: '^\u0001RIPPLE\u0001>>> $'
+  # continuation: '^\u0001RIPPLE\u0001\.\.\. $'
   # group_captures:
   #   - { name: counter, group: 1, type: int, role: monotonic_counter }
 ```
@@ -320,11 +320,11 @@ input:
     char_literal_prefix: '#\'        # reader-macro: #\( is not an open paren
     datum_comment_prefix: '#;'       # reader-macro: #;expr skips next datum
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .ps1
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.ps1"
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.ps1"
     invocation_template: ". '{path}'; Remove-Item '{path}' -ErrorAction SilentlyContinue"
-    history_filter: '\.splash-exec-.*\.ps1'
+    history_filter: '\.ripple-exec-.*\.ps1'
     cleanup_on_start: true
     stale_ttl_hours: 24
   chunk_delay_ms: 0
@@ -342,7 +342,7 @@ input:
   fsi `--readline-`, Racket `-i`, CCL, ABCL — and pass raw bytes straight to
   the parser, which rejects `U+0001` as an invalid non-printable character.
   Empirical verification per adapter is the only way to know what's safe:
-  walk the adapter in splash, type into its console window, run
+  walk the adapter in ripple, type into its console window, run
   execute_command, confirm the clear bytes wipe the buffer without syntax
   errors, then add the field. Adapters that haven't been verified should
   leave it null — "nothing written" means user-typed bytes still corrupt
@@ -363,11 +363,11 @@ input:
   reaches the interpreter:
   - `direct` — write line-by-line to PTY stdin (bash, zsh, most REPLs)
   - `tempfile` — write the body to a temp file and dot-source it (pwsh's
-    `.splash-exec-*.ps1`, cmd's `.splash-exec-*.cmd`)
+    `.ripple-exec-*.ps1`, cmd's `.ripple-exec-*.cmd`)
   - `heredoc` — send `cat <<EOF ... EOF` construct (reserved)
   - `wrapper` — send `wrapper.open + body + wrapper.close` (ghci)
 - **`tempfile.history_filter`** — regex matched against shell history entries.
-  Lines matching this are hidden from shell history so splash's
+  Lines matching this are hidden from shell history so ripple's
   implementation detail doesn't pollute the user's `Up-arrow` recall.
 - **`balanced_parens.char_literal_prefix`** — reader-macro prefix that
   escapes a single character from bracket counting (Racket's `#\`,
@@ -388,7 +388,7 @@ input:
 ```yaml
 modes:
   - name: main
-    primary: "\u0001SPLASH\u0001iex(?)> "
+    primary: "\u0001RIPPLE\u0001iex(?)> "
     default: true
   - name: pry
     auto_enter: true
@@ -403,7 +403,7 @@ modes:
     exit_commands:
       - { command: "continue", effect: resume }
       - { command: "respawn()", effect: return_to_toplevel }
-    exit_detect: '^\u0001SPLASH\u0001iex\(\d+\)> $'
+    exit_detect: '^\u0001RIPPLE\u0001iex\(\d+\)> $'
 ```
 
 - **`auto_enter: true`** — this mode is entered by the REPL itself (e.g. an
@@ -537,7 +537,7 @@ Feature flags that the runtime and MCP clients can query.
 | `async_output` | bool | Background concurrency can produce output between commands |
 | `exit_code` | `true` \| `false` \| `unreliable` | Exit code fidelity. `unreliable` means always 0 (cmd's limitation) |
 | `cwd_tracking` | bool | Adapter emits cwd updates via OSC P (or equivalent) |
-| `cwd_format` | `windows_native` \| `posix` \| `none` | Shape of reported cwd strings. `windows_native` (`C:\foo`) can be passed to CreateProcess's `lpCurrentDirectory` directly; `posix` (`/mnt/c/foo`, `/home/u`) forces splash to inject a `cd` preamble at the command level when spawning a replacement console. Only meaningful when `cwd_tracking: true`. |
+| `cwd_format` | `windows_native` \| `posix` \| `none` | Shape of reported cwd strings. `windows_native` (`C:\foo`) can be passed to CreateProcess's `lpCurrentDirectory` directly; `posix` (`/mnt/c/foo`, `/home/u`) forces ripple to inject a `cd` preamble at the command level when spawning a replacement console. Only meaningful when `cwd_tracking: true`. |
 | `job_control` | bool | `&`, `fg`, `bg`, Ctrl-Z suspend work |
 | `shell_integration` | string \| null | Protocol name: `osc633`, `iterm2`, `kitty`, or null |
 | `user_busy_detection` | enum | How to detect the user is typing: `osc_b`, `process_polling`, `none` |
@@ -616,14 +616,14 @@ Supported assertions:
 5. Write the integration script (if any) with the unique marker injection.
 6. Fill in `tests:` — aim for at least 5, covering simple eval, state
    persistence, multi-line input, error recovery, and any mode transitions.
-7. Run `splash adapter test adapters/your-adapter.yaml` to verify it.
+7. Run `ripple adapter test adapters/your-adapter.yaml` to verify it.
 8. Submit a PR to the adapter registry.
 
 ---
 
 ## 17. Versioning policy
 
-- **`schema` field is sacred.** Once `schema: 1` ships on a stable splash
+- **`schema` field is sacred.** Once `schema: 1` ships on a stable ripple
   release, additions are allowed; removals and semantic changes require
   `schema: 2`.
 - **Adapter `version` field is independent** of the schema version. Adapters

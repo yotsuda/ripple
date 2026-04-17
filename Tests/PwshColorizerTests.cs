@@ -1,6 +1,6 @@
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// Sanity tests for PwshColorizer — checks that common syntax elements are
@@ -133,7 +133,7 @@ public class PwshColorizerTests
 
         // 10. Path argument: should pass through without being mis-colored.
         {
-            var cmd = "Set-Location C:\\MyProj\\splashshell";
+            var cmd = "Set-Location C:\\MyProj\\rippleshell";
             var r = PwshColorizer.Colorize(cmd);
             AssertContains(r, $"{Command}Set-Location{Reset}", "cmdlet colored");
             Assert(StripAnsi(r) == cmd, "path text preserved");

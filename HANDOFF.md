@@ -2,45 +2,52 @@
 
 Entry point for any future Claude Code (or human) session walking into
 this repo cold. Read this first, then follow the reading list below
-for whatever depth you need. Updated after the polish round on
-2026-04-15 (seven bug fixes across signals.interrupt declarations,
-OSC title buffering, nested datum comments, focus-theft / clear_line,
-and ModeDetector input source — HEAD is `ca78f95`).
+for whatever depth you need. Updated 2026-04-17 after the **zsh
+recovery round** — MSYS2 zsh now runs under ConPTY via a new
+`init.delivery: rc_file` schema mode, WSL-bash SKIP on boxes with
+no installed distro was fixed via `executable_candidates`, the dead
+`init.inject` sub-schema was removed, and the ccl / abcl top-level
+`?`-prompt leak was plugged in the post-primary delta cleaner. HEAD
+is `e5fec38`. **18 adapters ship embedded** in the 0.8.0 release,
+with `perldb` / `jdb` joining as the first `family: debugger`
+adapters (external `jdb-hello` as proof of ~/.ripple/adapters/ still
+loads alongside the embedded ones).
 
 ---
 
 ## Current state (1 paragraph)
 
-**splash** is a declarative adapter framework that exposes any
-interactive process (shells, REPLs, eventually debuggers) to an AI
-via MCP over ConPTY/forkpty. Phase B (YAML-drive the existing shell
-runtime), phase C (framework generalisation), the phase C+ punch
-list, the regex-strategy round (CSI-aware `RegexPromptDetector`,
-`process.executable` override, **F# Interactive** and **Java
-jshell** adapters), the **cache-on-busy-receive salvage layer**
-(multi-entry per-console cache list, `FlipToCacheMode`, 170 s
-preemptive timeout, baked status lines, universal drain wrapper
-on every MCP tool), the **ABCL adapter round** (JVM-hosted Common
-Lisp via the Groovy pattern), and the **polish round** that
-closed six real bugs — node/groovy `signals.interrupt`
-mis-declaration, OSC title split-chunk buffer leak (the
-"owned-console window title sometimes not set correctly"
-complaint), nested `#;#;(a)` counter leak, console-spawn focus
-theft on Windows, `input.clear_line` opt-in flush for user-typed
-buffer contamination, and the `ModeDetector` input-source bug
-(was scanning OSC-C..D slice which never contained the post-A
-prompt, so auto_enter mode transitions silently fell through
-to default) — are all complete and shipped in **v0.7.0**.
-**12 adapters ship embedded** (pwsh, bash, zsh, cmd, python,
-node, racket, **ccl**, **abcl**, fsi, jshell, groovy). `ccl`
-graduated from local-only gitignore in v0.7.0 after empirical
-confirmation on 2026-04-15 that the corporate AppLocker block
-which motivated the original exclusion has been relaxed — 10
-consecutive clean runs of `--adapter-tests --only ccl`
-(probe + 5 declared tests + a 4-test debugger-mode chain). On
-boxes where a similar block persists the probe will soft-fail,
-same class as a missing zsh on Windows. **528 assertions** pass
-on `--test` + `--adapter-tests` (458 unit + 70 adapter-declared).
+**ripple** is a declarative adapter framework that exposes any
+interactive process (shells, REPLs, **debuggers**) to an AI via MCP
+over ConPTY/forkpty. Phase B (YAML-drive the existing shell runtime),
+phase C (framework generalisation), phase C+, the regex-strategy
+round (CSI-aware `RegexPromptDetector`, `process.executable` override,
+**F# Interactive** and **Java jshell** adapters), the
+**cache-on-busy-receive salvage layer** (multi-entry per-console
+cache list, `FlipToCacheMode`, 170 s preemptive timeout, universal
+drain wrapper on every MCP tool), the **ABCL adapter round**
+(JVM-hosted Common Lisp via the Groovy pattern), the v0.7.0
+**polish round** (six bug fixes across `signals.interrupt`, OSC
+title split-chunk buffer, nested datum comments, focus theft,
+`input.clear_line`, and `ModeDetector` input source), the
+**0.8.0 debugger-adapter round** (`family: debugger`, **perldb**
+and **jdb** landing as the first two, plus **pdb**, **sqlite3**,
+**lua**, **deno** REPLs, user-input hold during AI command
+execution, `SW_HIDE` for test workers), and the **2026-04-17 zsh
+recovery round** (MSYS2 zsh under ConPTY via `init.delivery:
+rc_file`, bash Git-Bash-first via `executable_candidates`, dead
+`init.inject` block removed, ccl/abcl `?`-prompt leak plugged) are
+all complete.
+**18 adapters ship embedded** (pwsh, bash, zsh, cmd, python, node,
+racket, ccl, abcl, fsi, jshell, groovy, **perldb, jdb, pdb,
+sqlite3, lua, deno**) plus `jdb-hello` as the first external
+adapter example in `~/.ripple/adapters/`. **111 passed, 0 failed**
+on `--adapter-tests` (as of `e5fec38`) modulo the known
+jdb-hello/next flake. Two pre-existing `ConsoleWorkerTests.Run`
+flakes (Ctrl+C standby, obsolete PTY alive) still block
+`--test --e2e` from reaching the declared suite — use
+`--adapter-tests` standalone to exercise that layer and ignore
+the flake gate.
 Two pre-existing `ConsoleWorkerTests.Run` flakes (Ctrl+C standby,
 obsolete PTY alive) still block `--test --e2e` from reaching the
 declared suite — use `--adapter-tests` standalone to exercise
@@ -64,13 +71,14 @@ stamp it; no remaining runtime gates.
 ## Warm-up checklist (30 seconds)
 
 ```powershell
-cd C:\MyProj\splash
-git log --oneline -40                                     # last 40 commits — phase B/C/C+ + regex-strategy + cache-on-busy-receive + ABCL + polish round
-./bin/Debug/net9.0/splash.exe --list-adapters             # 11 adapters (12 on this box if ccl embedded)
-./bin/Debug/net9.0/splash.exe --probe-adapters            # opt-in pre-flight, one probe.eval per adapter
-./bin/Debug/net9.0/splash.exe --test                      # unit tests only — 437 / 437 green
-./bin/Debug/net9.0/splash.exe --adapter-tests             # declared-test run across every loaded adapter — 70 / 70 green
-./bin/Debug/net9.0/splash.exe --adapter-tests --only ccl  # single-adapter focus (local example; includes debugger-mode chain)
+cd C:\MyProj\ripple
+git log --oneline -50                                     # phase B/C/C+ + regex-strategy + cache-on-busy-receive + ABCL + polish round + 0.8.0 debugger round + 2026-04-17 zsh recovery
+./bin/Debug/net9.0/ripple.exe --list-adapters             # 18 embedded (+ external jdb-hello if ~/.ripple/adapters/ is populated)
+./bin/Debug/net9.0/ripple.exe --probe-adapters            # opt-in pre-flight, one probe.eval per adapter
+./bin/Debug/net9.0/ripple.exe --test                      # unit tests only
+./bin/Debug/net9.0/ripple.exe --adapter-tests             # declared-test run across every loaded adapter — 111 / 111 on green day
+./bin/Debug/net9.0/ripple.exe --adapter-tests --only ccl  # single-adapter focus (ccl includes the 4-test debugger-mode chain)
+./bin/Debug/net9.0/ripple.exe --adapter-tests --only zsh  # verifies the rc_file-delivery path end-to-end
 # --test --e2e still blocked by the two pre-existing ConsoleWorkerTests.Run
 # flakes (Ctrl+C post-interrupt standby, obsolete PTY alive) — see gotchas.
 ```
@@ -79,14 +87,14 @@ If the Debug binary is missing or stale:
 
 ```powershell
 dotnet build -c Debug                              # fast local build
-./Build.ps1                                        # AOT Release → dist/splash.exe (slower)
+./Build.ps1                                        # AOT Release → dist/ripple.exe (slower)
 ```
 
-`./Build.ps1` is what splash-dev (via mcp-sitter) picks up for
-hot-reload cycles during the session. If you use the `splash-dev`
+`./Build.ps1` is what ripple-dev (via mcp-sitter) picks up for
+hot-reload cycles during the session. If you use the `ripple-dev`
 MCP server, remember the flow: `sitter_kill` to unlock the binary,
 `./Build.ps1` via another MCP (pwsh) to rebuild, then any
-`splash-dev` tool call triggers lazy respawn of the fresh child.
+`ripple-dev` tool call triggers lazy respawn of the fresh child.
 
 ---
 
@@ -105,12 +113,12 @@ MCP server, remember the flow: `sitter_kill` to unlock the binary,
 | Area | Files |
 |---|---|
 | Schema types in C# | `Services/Adapters/AdapterModel.cs`, `AdapterStaticContext.cs` (AOT-safe YamlDotNet) |
-| Loader & registry | `Services/Adapters/AdapterLoader.cs`, `AdapterRegistry.cs` (embedded + `~/.splash/adapters/` merge with override semantics) |
+| Loader & registry | `Services/Adapters/AdapterLoader.cs`, `AdapterRegistry.cs` (embedded + `~/.ripple/adapters/` merge with override semantics) |
 | Worker launch / exec | `Services/ConsoleWorker.cs` — `BuildCommandLine` and `RunAsync`'s ready phase are the adapter-driven hotspots |
 | Proxy (MCP-facing) | `Services/ConsoleManager.cs` — the last shell-family literal (`NormalizeShellFamily`) is a registry key normaliser, not a family check |
 | ConPTY + env merge | `Services/ConPty.cs` — unified env block builder applies `adapter.process.env` to both inherit-env and clean-env paths |
 | Integration scripts | `ShellIntegration/*.{ps1,bash,zsh,py,js,rkt,fsx,abcl.lisp}` — the single source of truth for each shell's OSC 633 emitter. fsi's integration.fsx is intentionally empty (just comments) because F# Interactive has no prompt-replacement API; see Gotchas below. The two Common-Lisp integrations (`integration.lisp` for CCL, `integration.abcl.lisp` for ABCL) differ only in which prompt hook they override — CCL uses `(setf (symbol-function 'ccl::print-listener-prompt) ...)` behind a kernel-redefine warning gate, ABCL uses a simple `(setf top-level::*repl-prompt-fun* ...)`. |
-| Adapter YAMLs | `adapters/*.yaml` — 11 live examples embedded in the binary covering every schema section that's currently consumed. The `groovy` / `abcl` pair documents the **Groovy pattern**: invoke `java.exe` from Program Files with `-jar %LOCALAPPDATA%\splash-deps\<lang>\payload.jar` so the only spawned executable sits in a whitelisted path while the jar payload loads as regular classfiles from user-dir. Any future JVM-hosted REPL (Clojure, Kotlin REPL, JRuby, Jython, Scala) picks this up for free by cloning `abcl.yaml` and swapping the jar path + prompt regex / hook. |
+| Adapter YAMLs | `adapters/*.yaml` — 11 live examples embedded in the binary covering every schema section that's currently consumed. The `groovy` / `abcl` pair documents the **Groovy pattern**: invoke `java.exe` from Program Files with `-jar %LOCALAPPDATA%\ripple-deps\<lang>\payload.jar` so the only spawned executable sits in a whitelisted path while the jar payload loads as regular classfiles from user-dir. Any future JVM-hosted REPL (Clojure, Kotlin REPL, JRuby, Jython, Scala) picks this up for free by cloning `abcl.yaml` and swapping the jar path + prompt regex / hook. |
 | Regex prompt detector | `Services/RegexPromptDetector.cs` — CSI-aware, strips ANSI escapes internally and substitutes cursor-to-col-1 positioning with `\n` so adapter authors can write natural `^<prompt>$` patterns. Used by fsi and jshell; future ConPTY-rendering REPLs (ghci, bb, etc.) inherit this for free. |
 | Cache / drain layer | `Services/CommandTracker.cs` (`_cachedResults` list, `FlipToCacheMode`, `ConsumeCachedOutputs`, `BuildStatusLine`, `PreemptiveTimeoutMs`), `Services/ConsoleWorker.cs` (`HandleExecuteAsync` busy-flip path, `HandleGetCachedOutput` array serialisation), `Services/ConsoleManager.cs` (`CollectCachedOutputsAsync` / `WaitForCompletionAsync` array consumers, `MaxExecuteTimeoutSeconds`), `Tools/ShellTools.cs` (`AppendCachedOutputs` universal wrapper that every MCP tool funnels through). |
 | OSC title / split-chunk buffer | `Services/ConsoleWorker.cs` — `ReplaceOscTitle(input, desiredTitle, ref pendingTail)` on the read-loop path rewrites shell-emitted OSC 0/1/2 to match the proxy-supplied display name. The `ref pendingTail` parameter buffers partial openers that straddle a PTY chunk boundary, so `\e]0;part-of` arriving in chunk N and `title\a` in chunk N+1 are reassembled and rewritten in one piece — without it the partial leaks to the visible terminal and the shell's title wins. `_oscTitlePending` on the worker carries the tail across calls. |
@@ -131,11 +139,11 @@ given machine.
 
 ## Architecture in 5 bullets
 
-1. **Proxy / worker split.** `splash.exe` in MCP mode is the proxy
+1. **Proxy / worker split.** `ripple.exe` in MCP mode is the proxy
    that serves AI tool calls. When the AI asks to open a shell, the
-   proxy launches `splash.exe --console <shell>` in a new window —
+   proxy launches `ripple.exe --console <shell>` in a new window —
    that's the worker, which owns the ConPTY pseudoconsole and PTY I/O.
-   Proxy and worker talk over a Named Pipe (`SP.{proxyPid}.{agent}.{consolePid}`)
+   Proxy and worker talk over a Named Pipe (`RP.{proxyPid}.{agent}.{consolePid}`)
    using a framed JSON RPC.
 
 2. **Adapter-driven launch.** `ConsoleWorker.BuildCommandLine` reads
@@ -176,16 +184,16 @@ given machine.
    for all three cases.
 
 4. **External adapters override embedded ones.** At startup,
-   `AdapterRegistry.LoadDefault()` merges `Splash.adapters.*.yaml`
+   `AdapterRegistry.LoadDefault()` merges `Ripple.adapters.*.yaml`
    (embedded resources, baked into the binary at build time) with
-   any `*.yaml` dropped into `~/.splash/adapters/`. External adapters
+   any `*.yaml` dropped into `~/.ripple/adapters/`. External adapters
    override embedded ones of the same name, with the override logged
-   in the startup report so you can see it in `splash --list-adapters`.
+   in the startup report so you can see it in `ripple --list-adapters`.
    The external path resolves `script_resource` relative to the
    YAML's directory first, then falls back to the embedded
    `ShellIntegration/*` resources.
 
-5. **`splash --test --e2e` is the contract gate.** It runs unit
+5. **`ripple --test --e2e` is the contract gate.** It runs unit
    tests, the pre-existing pipe-protocol E2E suite, the multi-shell
    cross-verification, then finally walks every loaded adapter's
    `tests:` block via `AdapterDeclaredTestsRunner`. Missing
@@ -194,12 +202,12 @@ given machine.
    runs as a synthetic first test — a broken adapter fails fast
    instead of flooding the output with downstream failures. The
    same probe loop is reachable standalone via
-   `splash --probe-adapters` (opt-in, no other tests).
+   `ripple --probe-adapters` (opt-in, no other tests).
 
 6. **Cache / drain salvage layer.** The MCP client can silently drop
    an in-flight response (user hits ESC; a new tool call lands while
    the previous one is still running; the protocol's own 3-minute
-   ceiling). splash can't detect client-side cancel directly, so
+   ceiling). ripple can't detect client-side cancel directly, so
    instead it flips the in-flight command to **cache-on-complete
    mode** whenever any of those signals fire: the 170 s preemptive
    timer in `CommandTracker.RegisterCommand` (hard-capped under the
@@ -224,13 +232,28 @@ given machine.
 ## Next-session candidate work
 
 All runtime gates for v1 freeze are now clear. The remaining
-candidates are extensions and external-dependency work:
+candidates are extensions and external-dependency work.
+
+**Closed since the last HANDOFF revision:**
+- ccl was shipped embedded in v0.7.0 (`0007de9`) — items 4b and 10
+  below are historical context only.
+- bash adapter-tests on WSL-free dev boxes now pass via
+  `process.executable_candidates` picking Git for Windows' bash
+  first (`0b88b28`, 2026-04-17).
+- MSYS2 zsh under ConPTY works via new `init.delivery: rc_file`
+  schema (`f8e721d` hardcoded → `dd494b2` generalised to schema).
+- Dead `init.inject` sub-schema removed (`5fe6a6f`).
+- bash/zsh's `multiline_delivery` yaml value corrected from the
+  pre-schema-era lie (`direct`) to the runtime-truthful `tempfile`
+  (`e5fec38`).
+- ccl / abcl top-level `?`-prompt leak in post-primary delta
+  (`ad9d010`).
 
 1. **Stamp `schema: 1 stable`** — purely a docs change. Update
    `adapters/SCHEMA.md` line 7 (`Status: **draft**.`) to
    `Status: **stable** (frozen 2026-XX-XX)` and bump the version
    note. Q1 and Q2 are both closed at the runtime layer; Q3 and
-   Q4 are blocked on adapters splash doesn't ship yet, not on
+   Q4 are blocked on adapters ripple doesn't ship yet, not on
    schema gaps. User opted to defer this until there is a concrete
    reason to stamp it (2026-04-14: "まだやるメリットがない").
 
@@ -240,7 +263,7 @@ candidates are extensions and external-dependency work:
    does not consume it on the input path; `balanced_parens` only
    runs as a validator inside an adapter test helper, and
    `prompt_based` has no runtime meaning yet. Wiring it for real
-   would let splash reject syntactically incomplete AI input
+   would let ripple reject syntactically incomplete AI input
    before submitting it to the REPL — avoiding the
    deadlock-on-unbalanced-paren failure mode for Lisp and the
    deadlock-on-unclosed-brace failure mode for Java. `racket.yaml`
@@ -273,29 +296,20 @@ candidates are extensions and external-dependency work:
    sections) on the Haskell side. GHCi is still blocked as a
    native PE from `%USERPROFILE%` under AppLocker — the user would
    need to install GHC via `stack`/`ghcup` into a whitelisted path
-   like `C:\tools\ghcup\bin` before splash can spawn it via ConPTY.
+   like `C:\tools\ghcup\bin` before ripple can spawn it via ConPTY.
    Alternatively, **Clojure** runs on the JVM and would ship via
    the Groovy pattern (clone `abcl.yaml`, swap jar + prompt
    regex) without needing a native binary. See also the note on
    CCL below — the policy may have relaxed and CCL could now be
    shipped embedded alongside ABCL.
 
-4b. **Confirm CCL policy status and decide on embedding.** Until
-    2026-04-14, the comment was "CCL binary blocked by corporate
-    AppLocker under ConPTY `CreateProcessW`". As of 2026-04-15,
-    `--adapter-tests` on this box runs CCL's probe + 5 declared
-    tests green, which suggests the user-dir PE block has been
-    relaxed (either a policy change or an unblock request was
-    approved). `adapters/ccl.yaml` and `ShellIntegration/integration.lisp`
-    still live under `.git/info/exclude` locally so the committed
-    history stays reproducible on boxes that haven't had the
-    block lifted. Next step: verify on another box with the old
-    policy whether CCL still fails there — if the block is gone
-    universally, un-gitignore and commit; otherwise, keep the
-    gitignore and add a `CCL (local-only)` note to README. ABCL
-    remains the portable default regardless, because it spawns
-    only `java.exe` (whitelisted Program Files path) and loads
-    abcl.jar as classfiles.
+4b. ~~**Confirm CCL policy status and decide on embedding.**~~
+    ✅ DONE in v0.7.0 (commit `0007de9`): `adapters/ccl.yaml` and
+    `ShellIntegration/integration.lisp` were un-gitignored and
+    added to `ripple.csproj`'s embedded resources. CCL now ships
+    embedded alongside ABCL and the debugger-mode chain is in
+    CI. On boxes where the AppLocker block is still active, the
+    probe soft-fails same class as a missing zsh.
 
 5. **Async-output handling (§18 Q3)** — `redraw_detect` is the
    only defined strategy for `output.async_interleave.strategy`
@@ -334,7 +348,7 @@ candidates are extensions and external-dependency work:
      worker to transition back to `standby` within 5 s. The
      shell does interrupt (earlier assertions pass) but something
      in the OSC A / cleanup path after interrupt doesn't settle
-     fast enough on this box. Investigate with `splash --console
+     fast enough on this box. Investigate with `ripple --console
      pwsh.exe` manually + send_input `\x03` via another proxy.
    - `PTY still alive after obsolete state` — after sending a
      claim from a fake-higher proxy version, the worker marks
@@ -357,20 +371,10 @@ candidates are extensions and external-dependency work:
    for the obsolete-claim case, confirm whether the worker PID
    is still alive after receiving the obsolete response.
 
-10. **Decide whether to un-gitignore `ccl.yaml` and ship it
-    embedded.** As of 2026-04-15, CCL's probe + 5 declared
-    tests + a 4-test debugger-mode chain (added local-only to
-    verify §18 Q2 empirically) all pass on this box. That
-    strongly suggests the corporate AppLocker user-dir PE
-    block that motivated the gitignore has been relaxed. The
-    remaining question is whether the block is gone
-    universally or just for this account. Un-gitignoring
-    `adapters/ccl.yaml` + `ShellIntegration/integration.lisp`
-    + removing the entries from `.git/info/exclude` + adjusting
-    `splash.csproj`'s embedded resources would ship ccl in the
-    binary and put the debugger-mode chain into CI coverage.
-    Needs user confirmation first — it's a shipping decision,
-    not a pure fix.
+10. ~~**Decide whether to un-gitignore `ccl.yaml` and ship it
+    embedded.**~~ ✅ DONE in v0.7.0 (`0007de9`). Historical
+    duplicate of item 4b — both were tracking the same shipping
+    decision, now closed.
 
 11. **`input.clear_line` opt-in for the remaining adapters.**
     Currently opted in for bash and zsh only (both use
@@ -381,12 +385,102 @@ candidates are extensions and external-dependency work:
     permanently (no line editor). A future session can walk the
     shortlist: start a console, manually type junk, issue an
     execute, confirm the junk is wiped. Low priority — the
-    `SW_SHOWNOACTIVATE` focus fix is the primary defense.
+    `SW_SHOWNOACTIVATE` focus fix + the 0.8.0 user-input hold gate
+    (`bb7e4e3`) are the primary defenses.
+
+12. **Unix / macOS parity — the biggest strategic lever.** Added
+    to the candidate list on 2026-04-16 after reviewing the MCP
+    shell competitive landscape (see
+    `../../PowerShell.MCP/scratch/competitive-landscape-ja.md`).
+    The gravity of the MCP shell ecosystem is overwhelmingly on
+    Linux / macOS — DesktopCommanderMCP (~958k dl/year), iterm-mcp
+    (~16k dl/year), every major PTY-based competitor, and the
+    Python REPL family are all Linux/macOS first or exclusive.
+    ripple is currently Windows-first and the Unix PTY path is
+    marked experimental in README. Making Unix / macOS
+    production-grade would open the larger half of the market
+    while the differentiators (shared visible console, 12-adapter
+    framework, OSC 633 lifecycle, auto-routing, re-claim) all
+    translate cleanly.
+
+    **What's already in place.** The forkpty code path exists in
+    `ProcessLauncher.LaunchConsoleWorkerUnix` (via `setsid` + a
+    login shell wrapper); `AdapterModel.Capabilities.CwdFormat`
+    already has a `posix` case for `bash/zsh/sh`; every adapter
+    except cmd (Windows-only by nature) is theoretically
+    portable — bash/zsh are Unix-native, pwsh/fsi/jshell are
+    cross-platform .NET/JVM binaries, python/node/racket are
+    Unix-first, ccl/abcl/groovy all run on macOS and Linux.
+    `InvariantGlobalization=true` + `PublishAot=true` are already
+    set in `ripple.csproj`, so building for `osx-arm64` /
+    `osx-x64` / `linux-x64` is a `dotnet publish -r <rid>` flag
+    away.
+
+    **What's untested (blockers for the "experimental" label to
+    come off).** The forkpty path has never been exercised end-
+    to-end on a real Unix host — "compiles and starts" is the
+    current bar. Specific open questions: does
+    `ConsoleManager.NormalizeShellFamily` map Unix shell paths
+    correctly? Do the bash / zsh `integration.bash` / `.zsh`
+    scripts actually inject their OSC 633 sequences under
+    forkpty (pty_inject on Unix may need a different write
+    strategy than on ConPTY)? Does `ReadOutputLoop`'s blocking
+    `stream.Read` work against a forkpty master the same way it
+    works against `_pty.OutputStream` on Windows? Does the user-
+    busy detector's `process_polling` have a meaningful
+    implementation on Unix, or does it need a separate code path
+    (e.g. `/proc/<pid>/stat` on Linux)? Each of these is a
+    day's worth of investigation plus a fix.
+
+    **The hardest unsolved piece: visible terminal window on
+    Unix.** On Windows, `CREATE_NEW_CONSOLE` gives ripple a
+    literal user-facing console window for free — the "shared
+    visible console" differentiator depends on this. There is no
+    direct equivalent on Linux or macOS. Three paths forward,
+    none of which ripple has today:
+    - **macOS: Terminal.app / iTerm2 control.** iterm-mcp's
+      AppleScript approach is proven for iTerm2; Terminal.app has
+      a similar AppleScript surface. Implementation is per-
+      terminal-emulator and macOS-only. Work estimate: 2-3 days
+      each, probably start with Terminal.app (ubiquitous by
+      default) and add iTerm2 as a second backend.
+    - **Linux: spawn the terminal emulator as a subprocess.**
+      `gnome-terminal -- ripple --console ...` or
+      `alacritty -e ripple --console ...` gets the job done
+      without AppleScript equivalents; each emulator has
+      slightly different argument conventions so a detection
+      layer is needed (parallel to how ripple already probes
+      `$TERM_PROGRAM` on macOS in a few places). Work estimate:
+      2-3 days for the top 3-4 emulators (gnome-terminal,
+      konsole, xterm, alacritty).
+    - **Avoided: headless PTY + Web UI.** Would match
+      takafu/repl-mcp / amol21p/mcp-interactive-terminal, but
+      abandons the "user and AI share the SAME visible terminal"
+      differentiator. Don't ship this unless paths 1/2 turn out
+      to be infeasible.
+
+    **Estimated total scope for production-grade Unix/macOS
+    support.** ~1-2 weeks of focused work: ~3-5 days on forkpty
+    / OSC 633 / adapter sanity, ~3-5 days on terminal emulator
+    spawn across 2-3 macOS and 3-4 Linux backends, ~2-3 days on
+    CI matrix + GitHub Actions builds for `osx-*` / `linux-x64`,
+    ~1 day of Homebrew / .deb packaging research (optional
+    follow-up, not strictly v0.8 blocking). The adapter layer
+    itself should stay mostly untouched.
+
+    **Why this is item 12, not item 1.** No user has reported
+    Unix/macOS issues yet, so the opportunity cost against
+    continuing to polish Windows is real. But the competitive
+    analysis strongly suggests this is the biggest strategic
+    lever ripple has for growth beyond PowerShell.MCP's Windows-
+    centric audience — possibly more impactful than any single
+    adapter or schema cleanup on the rest of this list. Elevate
+    to item 1 the moment a v0.8 milestone is planned.
 
 User policy as of 2026-04-14: **schema is ready to freeze** but
 the user opted not to stamp it until there's a concrete reason.
 All four §18 questions are either closed (Q1, Q2) or blocked on
-external adapters that splash doesn't yet ship (Q3, Q4) — neither
+external adapters that ripple doesn't yet ship (Q3, Q4) — neither
 case is a schema gap.
 
 ---
@@ -460,7 +554,7 @@ case is a schema gap.
   spawn at `CreateProcessW` time (error 5 = ACCESS_DENIED),
   surfacing ONLY when ConPTY attaches the pseudoconsole —
   `Process.Start` from the same user-dir path works fine,
-  confirming it's specifically the splash `--console`-mode
+  confirming it's specifically the ripple `--console`-mode
   ConPTY spawn being filtered. Binaries in `C:\Program Files\**`
   are whitelisted and work. Concretely this means:
   - racket (Program Files) ✅
@@ -471,15 +565,15 @@ case is a schema gap.
     gitignored for machines where the policy allows it.
 - **BOM in commit messages**: FIXED in `fix(tools): write files
   as UTF-8 without BOM`. `FileTools.cs` now uses a shared
-  `UTF8Encoding(false)` for every write, so `mcp__splash__write_file`
+  `UTF8Encoding(false)` for every write, so `mcp__ripple__write_file`
   output pipes cleanly into `git commit -F`. Reads already
   detect+strip BOM via `detectEncodingFromByteOrderMarks: true`
   so round-tripping pre-BOM files still works.
-- **`mcp__splash__edit_file` on CRLF files**: the splash-dev MCP
+- **`mcp__ripple__edit_file` on CRLF files**: the ripple-dev MCP
   tool's `edit_file` fails to match `old_string` on CRLF-terminated
-  files. Use Claude Code's built-in `Edit` tool for splash's own
+  files. Use Claude Code's built-in `Edit` tool for ripple's own
   source (which is CRLF per the .gitattributes text=auto policy)
-  until splash's edit_file normalises line endings before search.
+  until ripple's edit_file normalises line endings before search.
 - **ABCL 1.9.2 + JDK 21 virtual-threading introspection warning.**
   On cold start ABCL 1.9.2 prints a red "Failed to introspect
   virtual threading methods: java.lang.reflect.InaccessibleObjectException"
@@ -492,7 +586,7 @@ case is a schema gap.
   which silences the warning. Affects ABCL on any JDK 16+.
 - **ABCL default prompt is `CL-USER(N): `, not `? `.** ABCL uses
   an Allegro-style package-qualified prompt with a monotonic form
-  counter. The splash integration overrides
+  counter. The ripple integration overrides
   `top-level::*repl-prompt-fun*` to emit a literal `? ` instead
   so both Common Lisp adapters (CCL and ABCL) share the same mode
   regex `^\? $` without per-impl branching. If a future tweak
@@ -554,7 +648,7 @@ case is a schema gap.
   verbatim, leaving the visible terminal in "waiting for title
   termination" state — so when the terminator eventually
   arrived, the terminal committed the SHELL's title and
-  splash's desired title was clobbered. User-visible symptom:
+  ripple's desired title was clobbered. User-visible symptom:
   "owned-console window title sometimes not set correctly".
   Fix (`737f0a3`): `ref string pendingTail` parameter on
   `ReplaceOscTitle` carries the unterminated opener to the
@@ -604,12 +698,84 @@ case is a schema gap.
   with `CREATE_NEW_CONSOLE` alone makes Windows move keyboard
   focus to the new console window by default — if the user
   is typing in their editor when a console is launched, their
-  keystrokes land in splash's shell until they notice and
+  keystrokes land in ripple's shell until they notice and
   re-focus the editor, and those buffered bytes get prepended
   to the next AI command. Setting `STARTF_USESHOWWINDOW +
   SW_SHOWNOACTIVATE` in `STARTUPINFOW` shows the window
   without activating it, so the user's focus stays put.
   Fixed in `c90d3f1`.
+- **WSL bash needs an installed distribution to survive startup.**
+  `C:\Windows\System32\bash.exe` is the WSL launcher. On a box
+  where `wsl -l -v` says "has no installed distributions", the
+  launcher exits ~150 ms after `CreateProcessW` (stderr is
+  captured but the child is dead before the adapter can
+  integrate). Before the 2026-04-17 round this made bash
+  adapter-tests silently SKIP with "worker pipe never ready" on
+  any WSL-free dev box. Fix: bash.yaml now declares
+  `process.executable_candidates` with Git for Windows' bundled
+  `C:\Program Files\Git\bin\bash.exe` as the first preference, so
+  the worker picks Git Bash (or MSYS2 if Git isn't installed)
+  before falling through to WSL. The WSL path still works when a
+  distro *is* installed; dev boxes without one just don't hit it.
+- **MSYS2 zsh under ConPTY deadlocks the pty_inject flow.** zsh's
+  line editor (ZLE) buffers PTY-written bytes but treats neither
+  `\n` nor `\r\n` as a reliable Enter from the worker's
+  `WriteToPty`, so the `source '<tmpfile>'; rm -f '<tmpfile>'`
+  injection never submits and `WaitForReady` times out (manifests
+  as "worker pipe never ready"). Verified empirically against
+  several line-ending variants; none submit. Fix: new
+  `init.delivery: rc_file` schema mode stages integration.zsh as
+  `<ZDOTDIR>/.zshrc` before `CreateProcessW` and exports `ZDOTDIR`
+  into the child env. zsh sources `.zshrc` as part of its own
+  startup, so `precmd` / `preexec` hooks are live by the time
+  the first prompt is drawn — no PTY write involved. Extends to
+  any future shell with an rc-directory env var (fish, etc.) by
+  declaring `rc_file: { dir_env_var: XDG_CONFIG_HOME, file_name:
+  fish/config.fish }`. See `dd494b2` for the schema and
+  `f8e721d` for the original hardcoded fix that motivated the
+  abstraction.
+- **`init.inject` sub-block was dead documentation.** bash.yaml
+  carried a nested `inject: { method, windows: { tempfile_prefix,
+  tempfile_extension, wsl_path_template, msys_path_template,
+  source_command_template }, unix: { ... } }` block that looked
+  like the pty_inject flow was YAML-driven, but the runtime
+  `InjectShellIntegration` hardcoded every one of those values
+  (tempfile naming, path translation, source-command template)
+  in C#. The yaml was parsed into `InjectSpec` objects that sat
+  unread on `InitSpec.Inject`. Removed in `5fe6a6f` along with
+  the three model classes (`InjectSpec` / `InjectWindowsSpec` /
+  `InjectUnixSpec`) and their YamlSerializable registrations.
+  The pty_inject delivery mode still works unchanged — nothing
+  was consulting those fields at runtime.
+- **`multiline_delivery` is schema-partial.** The generic
+  tempfile-dispatch path
+  (`adapter.Input.MultilineDelivery == "tempfile"` +
+  `tempfile.invocation_template`) works for the 5 REPL adapters
+  that declare it (python, node, racket, ccl, abcl). pwsh / cmd /
+  bash / zsh all get tempfile behaviour via *hardcoded*
+  `isMultiLinePwsh` / `isMultiLineCmd` / `isMultiLinePosix`
+  branches in `HandleExecuteAsync` that take precedence over the
+  schema dispatch — pre-schema legacy that predates the yaml
+  abstraction. bash/zsh were lying about this (`direct` in yaml
+  vs tempfile at runtime) until `e5fec38` corrected them. pwsh's
+  hardcoded path is genuinely more complex than the schema can
+  express today (cursor-wrap-aware echo via
+  `BuildMultiLineTempfileBody`) — generalising it needs new
+  schema surface (`cursor_wrap_aware_echo_template` or similar)
+  that isn't worth adding until there's a second shell with the
+  same need. Documented here for future-me so the asymmetry isn't
+  mysterious.
+- **ccl / abcl top-level `?` prompt leaked into output**
+  (`ad9d010`). `CommandTracker.CleanDelta`'s trailing-prompt
+  suppressor (`IsShellPrompt`) recognised `$ # % > ❯ λ` terminators
+  but not `?`, so the literal `? ` that both Common Lisp adapters'
+  integration hooks emit after OSC A ended up tacked onto every
+  AI-visible command output (`2\n?` instead of `2` for `(+ 1 1)`).
+  Added `line.EndsWith('?')` to the chain. Only affects the
+  post-primary drain cleaner — command output itself goes through
+  `CleanOutput` which uses a separate code path. Nested
+  break-loop prompts `1 > ` / `2 > ` already matched via `>` so
+  the hit was specifically the top-level `? ` case.
 - **`NormalizeShellFamily` stays.** It looks like a hardcoded
   shell-family helper but it's the path-to-registry-key normaliser
   that `AdapterRegistry.Find` itself uses as a lookup key —
@@ -622,11 +788,31 @@ case is a schema gap.
 
 ## Commit history at a glance
 
-Phase B → C → C+ → regex-strategy → cache-on-busy-receive → ABCL
-→ polish round arc is ~35 commits, each a self-contained story.
-Newest first:
+Phase B → C → C+ → regex-strategy → cache-on-busy-receive → ABCL →
+polish round → 0.8.0 debugger round → zsh recovery round arc is
+~60 commits, each a self-contained story. Newest first:
 
 ```
+e5fec38  docs(adapters): correct bash/zsh multiline_delivery to match runtime
+5fe6a6f  refactor(schema): remove dead init.inject block and its model classes
+dd494b2  refactor(schema): generalize zsh ZDOTDIR fix as init.delivery: rc_file
+0b88b28  feat(bash): prefer Git Bash / MSYS2 over WSL bash via executable_candidates
+f8e721d  feat(worker): stage integration.zsh via ZDOTDIR on Windows
+ad9d010  fix(tracker): drop ?-terminated prompts from post-primary delta
+828c159  docs(changelog): clarify clear_line vs hold gate coverage
+c7ea05e  docs(changelog): document pre-session ?-terminated prompt fix in 0.8.0
+68b18ef  docs(changelog): correct embedded-adapter count to 18
+59074e0  docs(readme): reflect 0.8.0 adapter inventory
+eca302e  chore(release): 0.8.0 — debugger adapter framework + 3 new REPLs
+3576cec  feat(adapters): add deno REPL adapter
+f6c5819  feat(adapters): add lua REPL adapter
+f285542  feat(adapters): add sqlite3 REPL adapter
+9e73dac  fix(launcher): hide console window for --adapter-tests workers
+f2f3834  fix(worker): initialize ModeMatch with explicit nulls, not default
+8fd9264  feat(adapters): add pdb debugger adapter
+686a14b  fix(tests): suppress user input in adapter test workers
+bb7e4e3  fix(worker): hold user input during AI command execution
+0a98d31  feat(adapters): debugger adapter framework — perldb + jdb
 ca78f95  fix(worker): run ModeDetector against raw ring bytes so post-OSC-A prompts match
 feac057  test(adapters): pin input.clear_line per-adapter expectations
 c90d3f1  feat(worker): stop console focus theft + opt-in line-editor flush before execute
@@ -666,8 +852,8 @@ c6d2732  chore(repo): add .gitattributes to normalize line endings
 f85928c  feat(tests): run each adapter's tests: block against a real worker
 60ef8c8  refactor(conpty): unify env block construction, apply overrides in clean-env path
 4495e81  feat(adapters): ship Node.js REPL adapter with OSC 633 via displayPrompt hook
-061bb42  feat(python): multi-line command delivery via _splash_exec_file tempfile
-529dff6  feat(adapters): load external YAMLs from ~/.splash/adapters
+061bb42  feat(python): multi-line command delivery via _ripple_exec_file tempfile
+529dff6  feat(adapters): load external YAMLs from ~/.ripple/adapters
 aaf9ed1  feat(adapters): ship Python REPL adapter with OSC 633 via sys.ps1 hook
 8fb4802  refactor(worker): delete LoadEmbeddedScript dead fallback (milestone 2j)
 17bfd61  refactor(worker): delete IsPowerShellFamily / IsUnixShell / EnterKeyFor
@@ -679,5 +865,5 @@ aaf9ed1  feat(adapters): ship Python REPL adapter with OSC 633 via sys.ps1 hook
 
 Read them bottom-up if you want the phase B narrative, top-down if
 you want to see the most recent polish first. Every commit was
-live-verified via the splash-dev hot-reload loop (sitter_kill →
+live-verified via the ripple-dev hot-reload loop (sitter_kill →
 Build.ps1 → lazy respawn → actually run the new feature).

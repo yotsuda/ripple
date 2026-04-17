@@ -48,7 +48,7 @@ init:
   hook_type: prompt_variable        # ccl::print-listener-prompt override
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .lisp
   init_invocation_template: '"{tempfile_path}"'
   script_resource: integration.lisp
@@ -86,13 +86,13 @@ input:
     # closest CL idiom is the `#+nil expr` reader conditional, which
     # works through `read` without needing a counter extension because
     # the conditional consumption happens inside CL's reader, not at
-    # splash's input layer. So no datum_comment_prefix here.
+    # ripple's input layer. So no datum_comment_prefix here.
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .lisp
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.lisp"
-    invocation_template: '(splash-exec-file "{path}")'
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.lisp"
+    invocation_template: '(ripple-exec-file "{path}")'
   chunk_delay_ms: 0
 
 modes:
@@ -163,8 +163,8 @@ tests:
 
   - name: "stateful: defparameter persists across commands"
     setup_sequence:
-      - eval: "(defparameter *splash-test* 'persist-ok)"
-    eval: "*splash-test*"
+      - eval: "(defparameter *ripple-test* 'persist-ok)"
+    eval: "*ripple-test*"
     expect: 'PERSIST-OK'
 
   - name: "reader macro: block comment #| |# ignored"

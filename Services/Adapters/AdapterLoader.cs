@@ -2,11 +2,11 @@ using System.Reflection;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
-namespace Splash.Services.Adapters;
+namespace Ripple.Services.Adapters;
 
 /// <summary>
-/// Loads splash adapter YAML files (schema v1) into Adapter instances.
-/// Adapter YAMLs ship as embedded resources under Splash.adapters.*.yaml.
+/// Loads ripple adapter YAML files (schema v1) into Adapter instances.
+/// Adapter YAMLs ship as embedded resources under Ripple.adapters.*.yaml.
 ///
 /// Uses StaticDeserializerBuilder + AdapterStaticContext so deserialization
 /// is AOT-safe. Switching back to the reflection-based DeserializerBuilder
@@ -41,7 +41,7 @@ public static class AdapterLoader
 
         if (adapter.Schema != SupportedSchemaVersion)
             throw new InvalidOperationException(
-                $"Adapter '{sourceName}' declares schema v{adapter.Schema}, but this splash build supports v{SupportedSchemaVersion}.");
+                $"Adapter '{sourceName}' declares schema v{adapter.Schema}, but this ripple build supports v{SupportedSchemaVersion}.");
 
         if (string.IsNullOrEmpty(adapter.Name))
             throw new InvalidOperationException($"Adapter '{sourceName}' has empty 'name' field");
@@ -60,7 +60,7 @@ public static class AdapterLoader
     /// After parsing, resolves adapter.IntegrationScript: if the YAML did
     /// not provide an inline `integration_script:` block, falls back to
     /// loading the embedded resource named by `init.script_resource`
-    /// (e.g. "integration.ps1" -> Splash.ShellIntegration.integration.ps1).
+    /// (e.g. "integration.ps1" -> Ripple.ShellIntegration.integration.ps1).
     /// This keeps ShellIntegration/*.{ps1,bash,zsh} as the single source
     /// of truth for shell integration scripts and lets adapters reference
     /// them by name without duplicating their content.
@@ -73,7 +73,7 @@ public static class AdapterLoader
 
         foreach (var resourceName in assembly.GetManifestResourceNames())
         {
-            if (!resourceName.StartsWith("Splash.adapters.", StringComparison.Ordinal))
+            if (!resourceName.StartsWith("Ripple.adapters.", StringComparison.Ordinal))
                 continue;
             if (!resourceName.EndsWith(".yaml", StringComparison.Ordinal))
                 continue;
@@ -99,8 +99,8 @@ public static class AdapterLoader
 
     /// <summary>
     /// Load all adapter YAMLs directly from a filesystem directory. Used for
-    /// user-contributed adapters under ~/.splash/adapters/ — the user drops
-    /// a YAML there, splash picks it up on the next startup, no rebuild.
+    /// user-contributed adapters under ~/.ripple/adapters/ — the user drops
+    /// a YAML there, ripple picks it up on the next startup, no rebuild.
     ///
     /// Missing directory is a no-op (empty result, no error). Individual
     /// YAML parse failures are collected per file rather than aborting the
@@ -145,9 +145,9 @@ public static class AdapterLoader
     ///      during Parse) → no-op here.
     ///   2. script_resource: resolved relative to externalDir (for
     ///      external adapters, enables a self-contained YAML + script
-    ///      pair in ~/.splash/adapters/).
+    ///      pair in ~/.ripple/adapters/).
     ///   3. script_resource: resolved as an embedded resource under
-    ///      Splash.ShellIntegration.* (for external adapters overriding
+    ///      Ripple.ShellIntegration.* (for external adapters overriding
     ///      a built-in shell while still using its integration script).
     /// Throws InvalidOperationException if script_resource is set but
     /// neither the external file nor the embedded resource exists.
@@ -171,7 +171,7 @@ public static class AdapterLoader
             }
         }
 
-        var fullResourceName = $"Splash.ShellIntegration.{resourceRef}";
+        var fullResourceName = $"Ripple.ShellIntegration.{resourceRef}";
         using var stream = assembly.GetManifestResourceStream(fullResourceName);
         if (stream == null)
         {

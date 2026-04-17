@@ -1,7 +1,7 @@
 using System.Text.RegularExpressions;
-using Splash.Services.Adapters;
+using Ripple.Services.Adapters;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Walks an adapter's <see cref="ModeSpec"/> graph against a snapshot

@@ -9,7 +9,7 @@ description: >
   the prompt string at each command boundary. Multi-line commands are
   delivered via the same tempfile path Python uses, with a server.eval
   helper that handles const/let/class scoping correctly.
-homepage: https://github.com/yotsuda/splash
+homepage: https://github.com/yotsuda/ripple
 license: MIT
 family: repl
 aliases:
@@ -23,7 +23,7 @@ process:
   inherit_environment: true
   env:
     # Quiet Node's experimental warnings so the OSC pipeline stays
-    # clean and splash's input-echo stripper doesn't have surprise
+    # clean and ripple's input-echo stripper doesn't have surprise
     # diagnostic noise to deal with.
     NODE_NO_WARNINGS: "1"
   encoding: utf-8
@@ -45,7 +45,7 @@ init:
   hook_type: prompt_variable        # displayPrompt + setPrompt swap
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .js
   init_invocation_template: '"{tempfile_path}"'
   script_resource: integration.js
@@ -74,17 +74,17 @@ output:
 input:
   line_ending: "\r"
   multiline_detect: none
-  # Multi-line bodies are written to a .splash-exec-*.js tempfile and
-  # invoked via the async _splash_exec_file helper. The `await` in the
+  # Multi-line bodies are written to a .ripple-exec-*.js tempfile and
+  # invoked via the async _ripple_exec_file helper. The `await` in the
   # invocation pauses the REPL on the returned Promise so server.eval
-  # can finish before splash's tracker resolves on the next prompt —
+  # can finish before ripple's tracker resolves on the next prompt —
   # without it, the tracker would race the eval callback.
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .js
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.js"
-    invocation_template: 'await _splash_exec_file(String.raw`{path}`)'
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.js"
+    invocation_template: 'await _ripple_exec_file(String.raw`{path}`)'
   chunk_delay_ms: 0
 
 signals:
@@ -137,8 +137,8 @@ tests:
 
   - name: "stateful: var persists across commands"
     setup_sequence:
-      - eval: "global.SPLASH_TEST = 'persist-ok'"
-    eval: "global.SPLASH_TEST"
+      - eval: "global.RIPPLE_TEST = 'persist-ok'"
+    eval: "global.RIPPLE_TEST"
     expect: 'persist-ok'
 
   - name: "top-level await resolves"

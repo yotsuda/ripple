@@ -1,6 +1,6 @@
-using Splash.Services.Adapters;
+using Ripple.Services.Adapters;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Scans a block of input text against an adapter's

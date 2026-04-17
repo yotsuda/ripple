@@ -7,7 +7,7 @@ description: >
   debugger prompt without loading any user script, giving us a scriptless
   debugger REPL suitable for smoke tests and interactive inspection. The
   prompt is `  DB<N> ` with a monotonic command counter. First
-  `family: debugger` adapter in splash; exercises `prompt.strategy: regex`
+  `family: debugger` adapter in ripple; exercises `prompt.strategy: regex`
   against SGR-decorated prompt bytes emitted by perl5db.
 homepage: https://perldoc.perl.org/perldebug
 license: Artistic-1.0-Perl OR GPL-1.0-or-later
@@ -21,7 +21,7 @@ process:
   # (`perldb`) is not an executable on PATH, so the worker resolves
   # a `perl` launcher from the candidate list below. Candidates are
   # tried left-to-right; the first that resolves to an existing file
-  # wins. splash's worker launches under a clean registry environment
+  # wins. ripple's worker launches under a clean registry environment
   # block, so bare `perl` only works when perl.exe is on User/Machine
   # PATH (Strawberry, ActivePerl, or a Linux/macOS box). Git for
   # Windows deliberately keeps its bundled `usr\bin\perl.exe` OFF
@@ -94,7 +94,7 @@ prompt:
   # called sub, or when `o inhibit_exit` triggers a nested session)
   # use `DB<<N>>` with two angle brackets, and deeper nesting levels
   # add more brackets (`DB<<<N>>>` at depth 3, etc.). The `<+` / `>+`
-  # quantifiers match any nesting level so splash tracks prompt
+  # quantifiers match any nesting level so ripple tracks prompt
   # boundaries correctly through breakpoint pauses and resumes.
   strategy: regex
   primary: '^  DB<+\d+>+ $'
@@ -113,7 +113,7 @@ input:
   line_ending: "\r"
   # perl5db is strictly line-oriented at the command prompt. Multi-line
   # Perl code would need `{ ... }` block continuation which is out of
-  # scope for v0.1 — splash users send single-line `p EXPR` style
+  # scope for v0.1 — ripple users send single-line `p EXPR` style
   # commands, which is how 99% of debugger interaction actually works.
   multiline_detect: none
   multiline_delivery: direct
@@ -218,13 +218,13 @@ tests:
     expect: '^hello-world$'
 
   - name: "built-in function call"
-    eval: "p length('splash')"
+    eval: "p length('ripple')"
     expect: '^6$'
 
   # Debugger-specific: `o FOO?` is a perl5db meta-command that queries
   # the value of debugger option FOO. It doesn't exist in plain perl —
   # running `o NonStop?` outside the debugger is a syntax error. This
-  # test proves splash is really driving perl5db.pl, not just evaluating
+  # test proves ripple is really driving perl5db.pl, not just evaluating
   # perl expressions at a REPL.
   - name: "debugger meta command: option query"
     eval: "o NonStop?"
@@ -251,7 +251,7 @@ tests:
   # eval inspects `$main::result` to prove the resumed code path
   # actually returned 42.
   #
-  # This is the first splash test that exercises:
+  # This is the first ripple test that exercises:
   #   - breakpoint setting on a runtime-defined sub
   #   - the nested-context prompt (`DB<<N>>`)
   #   - resume-from-pause (`c`)

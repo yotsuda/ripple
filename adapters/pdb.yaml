@@ -157,8 +157,8 @@ tests:
 
   - name: "state: module global persists across commands"
     setup_sequence:
-      - eval: "!import builtins; builtins.splash_test = 100"
-    eval: "p __import__('builtins').splash_test + 1"
+      - eval: "!import builtins; builtins.ripple_test = 100"
+    eval: "p __import__('builtins').ripple_test + 1"
     expect: '^101$'
 
   - name: "pretty-print structured value"

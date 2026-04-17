@@ -7,7 +7,7 @@ description: >
   jdb accepts meta commands (`version`, `help`, `connectors`, `stop`)
   and defers any breakpoint assertions until a VM is later attached or
   launched via `run <class>`. Second `family: debugger` adapter in
-  splash, validating that the regex-prompt + init-none pattern
+  ripple, validating that the regex-prompt + init-none pattern
   generalizes from perl5db to a completely unrelated debugger runtime.
 homepage: https://docs.oracle.com/en/java/javase/21/docs/specs/man/jdb.html
 license: GPL-2.0-with-classpath-exception

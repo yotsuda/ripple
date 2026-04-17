@@ -2,9 +2,9 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
-using static Splash.Services.Win32Native;
+using static Ripple.Services.Win32Native;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Windows ConPTY (Pseudo Console) P/Invoke wrapper.
@@ -188,7 +188,7 @@ public static class ConPty
         bool inheritEnvironment,
         IReadOnlyDictionary<string, string>? envOverrides)
     {
-        var pipeName = $@"\\.\pipe\splash-{Environment.ProcessId}-{Guid.NewGuid():N}";
+        var pipeName = $@"\\.\pipe\ripple-{Environment.ProcessId}-{Guid.NewGuid():N}";
 
         // Create server-side Named Pipes
         var inPipeName = pipeName + "-in";

@@ -2,11 +2,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
-using Splash.Services;
-using Splash.Services.Adapters;
-using Splash.Tools;
+using Ripple.Services;
+using Ripple.Services.Adapters;
+using Ripple.Tools;
 
-namespace Splash;
+namespace Ripple;
 
 public class Program
 {
@@ -24,7 +24,7 @@ public class Program
         if (!isWorkerMode || adapterReport.HasErrors)
         {
             var level = adapterReport.HasErrors ? "WARNING" : "info";
-            Console.Error.WriteLine($"[splash adapters {level}] {adapterReport.Summary()}");
+            Console.Error.WriteLine($"[ripple adapters {level}] {adapterReport.Summary()}");
         }
 
         // --console mode: run as ConPTY console worker process
@@ -37,7 +37,7 @@ public class Program
 
         // --list-adapters: print what the registry loaded and exit.
         // Useful for debugging missing/stale external adapters under
-        // ~/.splash/adapters and for verifying an adapter override is
+        // ~/.ripple/adapters and for verifying an adapter override is
         // actually taking effect.
         if (args.Contains("--list-adapters"))
         {
@@ -133,10 +133,10 @@ public class Program
     }
 
     private static void PrintAdapterList(
-        Splash.Services.Adapters.AdapterRegistry registry,
-        Splash.Services.Adapters.AdapterRegistry.LoadReport report)
+        Ripple.Services.Adapters.AdapterRegistry registry,
+        Ripple.Services.Adapters.AdapterRegistry.LoadReport report)
     {
-        Console.WriteLine($"splash — {registry.Count} adapter(s) loaded");
+        Console.WriteLine($"ripple — {registry.Count} adapter(s) loaded");
         Console.WriteLine();
 
         foreach (var adapter in registry.All.OrderBy(a => a.Name, StringComparer.Ordinal))
@@ -184,8 +184,8 @@ public class Program
             Console.WriteLine();
         }
 
-        Console.WriteLine($"External adapter directory: {Splash.Services.Adapters.AdapterRegistry.DefaultExternalDirectory}");
-        Console.WriteLine(Directory.Exists(Splash.Services.Adapters.AdapterRegistry.DefaultExternalDirectory)
+        Console.WriteLine($"External adapter directory: {Ripple.Services.Adapters.AdapterRegistry.DefaultExternalDirectory}");
+        Console.WriteLine(Directory.Exists(Ripple.Services.Adapters.AdapterRegistry.DefaultExternalDirectory)
             ? "  (exists — YAMLs here override embedded adapters of the same name)"
             : "  (not present — drop YAMLs here to override embedded adapters)");
     }

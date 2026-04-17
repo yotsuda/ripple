@@ -55,13 +55,13 @@ input:
   multiline_detect: none
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .cmd
     invocation_template: 'call "{path}" & del "{path}"'
   # clear_line is deliberately unset — cmd has no line editor to
   # Ctrl-A / Ctrl-K against, and its cooked-mode console would
   # inject the bytes as literal command-line characters. Users
-  # who type into splash's cmd window while idle still see their
+  # who type into ripple's cmd window while idle still see their
   # keystrokes prepended to the next AI command; the primary
   # defense is the SW_SHOWNOACTIVATE spawn that prevents the
   # console from stealing focus in the first place.

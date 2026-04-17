@@ -10,7 +10,7 @@ description: >
   `C:\Program Files\groovy-*\` can be blocked by the corporate DLL
   policy even though the JDK directory beside it is whitelisted — the
   workaround is to copy the extracted Groovy tree to a user-local
-  location (`%LocalAppData%\splash-deps\groovy-4.0.31\`) that the
+  location (`%LocalAppData%\ripple-deps\groovy-4.0.31\`) that the
   DLL rule lets java.exe load from. The adapter invokes the Groovy
   JVM directly via `java -classpath ...groovy-4.0.31.jar
   org.codehaus.groovy.tools.GroovyStarter` rather than through
@@ -35,7 +35,7 @@ process:
   # %LOCALAPPDATA% is expanded by the worker's ExpandTemplate at
   # launch time.
   executable: java
-  command_template: '"{shell_path}" -Dprogram.name=groovysh -Dgroovy.home=%LOCALAPPDATA%\splash-deps\groovy-4.0.31 -Dgroovy.starter.conf=%LOCALAPPDATA%\splash-deps\groovy-4.0.31\conf\groovy-starter.conf -Djline.terminal=none -classpath %LOCALAPPDATA%\splash-deps\groovy-4.0.31\lib\groovy-4.0.31.jar org.codehaus.groovy.tools.GroovyStarter --main org.apache.groovy.groovysh.Main --conf %LOCALAPPDATA%\splash-deps\groovy-4.0.31\conf\groovy-starter.conf --classpath .'
+  command_template: '"{shell_path}" -Dprogram.name=groovysh -Dgroovy.home=%LOCALAPPDATA%\ripple-deps\groovy-4.0.31 -Dgroovy.starter.conf=%LOCALAPPDATA%\ripple-deps\groovy-4.0.31\conf\groovy-starter.conf -Djline.terminal=none -classpath %LOCALAPPDATA%\ripple-deps\groovy-4.0.31\lib\groovy-4.0.31.jar org.codehaus.groovy.tools.GroovyStarter --main org.apache.groovy.groovysh.Main --conf %LOCALAPPDATA%\ripple-deps\groovy-4.0.31\conf\groovy-starter.conf --classpath .'
   inherit_environment: true
   encoding: utf-8
   # groovysh uses JLine's console reader which treats \r as Enter
@@ -149,11 +149,11 @@ tests:
   - name: "stateful: variable persists across commands"
     # Use an untyped assignment (no `def` / `int`) — Groovy's REPL
     # keeps untyped bindings in the shell scope across commands,
-    # whereas `def splashTest = 42` creates a script-local that
+    # whereas `def rippleTest = 42` creates a script-local that
     # goes out of scope between lines.
     setup_sequence:
-      - eval: "splashTest = 42"
-    eval: "splashTest"
+      - eval: "rippleTest = 42"
+    eval: "rippleTest"
     expect: '===> 42'
 
   - name: "string interpolation with GString"

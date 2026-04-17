@@ -28,7 +28,7 @@ init:
   hook_type: precommand_lookup_action
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .ps1
   init_invocation_template: "Import-Module PSReadLine -ErrorAction SilentlyContinue; . '{tempfile_path}'; Remove-Item '{tempfile_path}' -ErrorAction SilentlyContinue"
   script_resource: integration.ps1
@@ -64,11 +64,11 @@ input:
   multiline_detect: prompt_based
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .ps1
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.ps1"
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.ps1"
     invocation_template: ". '{path}'; Remove-Item '{path}' -ErrorAction SilentlyContinue"
-    history_filter: '\.splash-exec-.*\.ps1'
+    history_filter: '\.ripple-exec-.*\.ps1'
     cleanup_on_start: true
     stale_ttl_hours: 24
 
@@ -118,7 +118,7 @@ tests:
   - name: error_surfaces_nonzero_exit
     # PowerShell cmdlet errors (Get-Item /nope) only set $? and write
     # to the error stream; they do NOT update $LASTEXITCODE, so
-    # splash's OSC D;0 path reports exit 0 even on failure. Use a
+    # ripple's OSC D;0 path reports exit 0 even on failure. Use a
     # native command instead so the non-zero exit actually propagates
     # via the integration's prompt-function read of $LASTEXITCODE.
     eval: "cmd /c exit 7"

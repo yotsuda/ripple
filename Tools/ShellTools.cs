@@ -1,9 +1,9 @@
 using ModelContextProtocol.Server;
 using System.ComponentModel;
 using System.Text;
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tools;
+namespace Ripple.Tools;
 
 [McpServerToolType]
 public class ShellTools
@@ -45,14 +45,14 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Execute a command in the shared terminal. The command and its output are visible to the user as they stream. Session state (variables, modules, cwd) persists across calls. If the active console is busy with a user-typed command, splash auto-routes to a same-family standby (or auto-starts a fresh one) and preserves your last known cwd via a cd preamble — if the source console was moved by the user since your last command, you'll see a one-line routing notice explaining what splash did. If the active console is idle but the user manually cd'd in it since your last command, the call returns a verify-and-retry warning instead of running. Every response also reports any other consoles' busy / finished / closed state so you stay aware of background activity.")]
+    [Description("Execute a command in the shared terminal. The command and its output are visible to the user as they stream. Session state (variables, modules, cwd) persists across calls. If the active console is busy with a user-typed command, ripple auto-routes to a same-family standby (or auto-starts a fresh one) and preserves your last known cwd via a cd preamble — if the source console was moved by the user since your last command, you'll see a one-line routing notice explaining what ripple did. If the active console is idle but the user manually cd'd in it since your last command, the call returns a verify-and-retry warning instead of running. Every response also reports any other consoles' busy / finished / closed state so you stay aware of background activity.")]
     public static async Task<string> ExecuteCommand(
         ConsoleManager consoleManager,
         [Description("The pipeline to execute (supports pipes, e.g. 'ls | grep foo')")]
         string pipeline,
         [Description("Shell type to execute in (bash, pwsh, zsh, or full path). If omitted, uses the current active console. If specified and no matching console exists, one is auto-started.")]
         string? shell = null,
-        [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — splash flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
+        [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — ripple flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
         int timeout_seconds = 30,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,

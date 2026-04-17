@@ -2,7 +2,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Tracks command lifecycle using OSC 633 events.
@@ -207,7 +207,7 @@ public class CommandTracker
     /// </summary>
     public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = PreemptiveTimeoutMs)
     {
-        // 0 is the "interactive" sentinel — caller wants splash to flip
+        // 0 is the "interactive" sentinel — caller wants ripple to flip
         // to cache mode as soon as possible so the MCP response comes
         // back without blocking on a shell waiting for user input.
         // Any other value is clamped to the MCP 170s ceiling so the

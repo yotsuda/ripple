@@ -1,9 +1,9 @@
 using YamlDotNet.Serialization;
 
-namespace Splash.Services.Adapters;
+namespace Ripple.Services.Adapters;
 
 /// <summary>
-/// Source-generated deserialization context for the splash adapter model.
+/// Source-generated deserialization context for the ripple adapter model.
 /// Tells YamlDotNet's StaticGenerator to emit AOT-safe deserializers for
 /// the Adapter record tree instead of using runtime reflection.
 ///

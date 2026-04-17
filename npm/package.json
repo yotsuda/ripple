@@ -1,14 +1,14 @@
 {
-  "name": "@ytsuda/splash",
+  "name": "@ytsuda/ripple",
   "version": "0.7.0",
   "description": "Shared console MCP server for any shell (bash, pwsh, cmd) — AI and user work in the same terminal. Real-time command visibility, interactive prompt support, session persistence, multi-shell management with automatic cwd handoff.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yotsuda/splash.git"
+    "url": "git+https://github.com/yotsuda/ripple.git"
   },
-  "homepage": "https://github.com/yotsuda/splash",
+  "homepage": "https://github.com/yotsuda/ripple",
   "keywords": [
     "mcp",
     "mcp-server",
@@ -28,7 +28,7 @@
     "win32"
   ],
   "bin": {
-    "splash": "bin/cli.mjs"
+    "ripple": "bin/cli.mjs"
   },
   "files": [
     "bin/",

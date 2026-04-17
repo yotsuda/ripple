@@ -2,9 +2,9 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// E2E test: launch ConsoleWorker in --console mode, send commands via Named Pipe.
@@ -62,7 +62,7 @@ public class ConsoleWorkerTests
         // ReplaceOscTitle — rewrites shell-emitted OSC 0/1/2 title
         // sequences with the proxy-supplied desired title so shells
         // like bash that encode `user@host: cwd` in their PROMPT_COMMAND
-        // can't clobber the owned-console window title splash just set.
+        // can't clobber the owned-console window title ripple just set.
         // The function runs on every chunk the read loop produces, so
         // split-chunk inputs are a realistic failure mode — covered
         // below. Each test declares its own `tail` so the scenarios
@@ -326,7 +326,7 @@ public class ConsoleWorkerTests
 
         Console.WriteLine("=== ConsoleWorker E2E Tests ===");
 
-        // Find splash executable
+        // Find ripple executable
         var exePath = Process.GetCurrentProcess().MainModule?.FileName;
         if (exePath == null)
         {
@@ -344,7 +344,7 @@ public class ConsoleWorkerTests
         var launcher = new Services.ProcessLauncher();
         int workerPid = launcher.LaunchConsoleWorker(proxyPid, agentId, shell, cwd);
 
-        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+        var pipeName = $"RP.{proxyPid}.{agentId}.{workerPid}";
         Console.WriteLine($"  Pipe: {pipeName}, Worker PID: {workerPid}");
 
         // Wait for pipe to be ready (up to 30s)
@@ -376,7 +376,7 @@ public class ConsoleWorkerTests
 
         // Test 3: execute simple command
         {
-            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello splash'" : "echo 'hello splash'";
+            var command = OperatingSystem.IsWindows() ? "Write-Output 'hello ripple'" : "echo 'hello ripple'";
             Console.WriteLine($"  Executing: {command}");
             var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", command); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
 
@@ -389,7 +389,7 @@ public class ConsoleWorkerTests
             Console.WriteLine($"  ExitCode: {exitCode}, TimedOut: {timedOut}, Cwd: {cwdResult}");
 
             Assert(!timedOut, "Command did not time out");
-            Assert(output.Contains("hello splash"), "Output contains expected text");
+            Assert(output.Contains("hello ripple"), "Output contains expected text");
             Assert(exitCode == 0, "Exit code is 0");
             Assert(cwdResult != null, "Cwd is reported");
         }
@@ -418,16 +418,16 @@ public class ConsoleWorkerTests
         }
 
         // Test 6: session persistence — a variable set in one execute is readable in the next.
-        // This guards the core value proposition of splash: persistent shell state across
+        // This guards the core value proposition of ripple: persistent shell state across
         // AI tool calls. If the worker ever loses state (e.g. spawns a subshell per execute),
         // this test catches it immediately.
         {
             var setCmd = OperatingSystem.IsWindows()
-                ? "$script:SPLASH_SESSION_TEST = 'persistent-42'"
-                : "export SPLASH_SESSION_TEST='persistent-42'";
+                ? "$script:RIPPLE_SESSION_TEST = 'persistent-42'"
+                : "export RIPPLE_SESSION_TEST='persistent-42'";
             var getCmd = OperatingSystem.IsWindows()
-                ? "Write-Output $script:SPLASH_SESSION_TEST"
-                : "echo \"$SPLASH_SESSION_TEST\"";
+                ? "Write-Output $script:RIPPLE_SESSION_TEST"
+                : "echo \"$RIPPLE_SESSION_TEST\"";
 
             await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", setCmd); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
             var resp = await SendRequest(pipeName, w => { w.WriteString("type", "execute"); w.WriteString("command", getCmd); w.WriteNumber("timeout", 10000); }, TimeSpan.FromSeconds(15));
@@ -440,7 +440,7 @@ public class ConsoleWorkerTests
         // heredoc-style delivery on bash; either path must preserve output ordering.
         // Note: we don't assert exitCode here because pwsh's $LASTEXITCODE only updates
         // on native-command invocations; a prior `cmd /c exit 42` leaks into this test.
-        // That is a pwsh semantic, not a splash bug.
+        // That is a pwsh semantic, not a ripple bug.
         {
             var multilineCmd = OperatingSystem.IsWindows()
                 ? "foreach ($i in 1..3) {\n    Write-Output \"line $i\"\n}"
@@ -670,7 +670,7 @@ public class ConsoleWorkerTests
         // and returns status="obsolete". The shell (PTY) must remain alive afterwards
         // so the human user can keep working in the terminal.
         {
-            var unownedPipe = $"SP.{workerPid}";
+            var unownedPipe = $"RP.{workerPid}";
             var resp = await SendRequest(unownedPipe, w =>
             {
                 w.WriteString("type", "claim");
@@ -708,7 +708,7 @@ public class ConsoleWorkerTests
 
     /// <summary>
     /// Cross-shell smoke test. The main <see cref="Run"/> suite only covers pwsh
-    /// because that's splash's primary target; this runs a smaller set of
+    /// because that's ripple's primary target; this runs a smaller set of
     /// assertions against Windows PowerShell 5.1 (powershell.exe) and cmd.exe so
     /// both are exercised end-to-end from the Pipe protocol.
     ///
@@ -738,8 +738,8 @@ public class ConsoleWorkerTests
                 shellExe: "powershell.exe",
                 simpleEcho: "Write-Output 'hello ps51'",
                 simpleEchoExpect: "hello ps51",
-                setVar: "$script:SPLASH_MS_TEST = 'ps51-persist'",
-                getVar: "$global:LASTEXITCODE = 0; Write-Output $script:SPLASH_MS_TEST",
+                setVar: "$script:RIPPLE_MS_TEST = 'ps51-persist'",
+                getVar: "$global:LASTEXITCODE = 0; Write-Output $script:RIPPLE_MS_TEST",
                 getVarExpect: "ps51-persist",
                 multiLine: "foreach ($i in 1..3) {\n    Write-Output \"ps51-line $i\"\n}",
                 multiLineExpects: new[] { "ps51-line 1", "ps51-line 2", "ps51-line 3" },
@@ -749,15 +749,15 @@ public class ConsoleWorkerTests
                 shellExe: "cmd.exe",
                 simpleEcho: "echo hello cmd",
                 simpleEchoExpect: "hello cmd",
-                setVar: "set SPLASH_MS_TEST=cmd-persist",
-                getVar: "echo %SPLASH_MS_TEST%",
+                setVar: "set RIPPLE_MS_TEST=cmd-persist",
+                getVar: "echo %RIPPLE_MS_TEST%",
                 getVarExpect: "cmd-persist",
                 // Multi-line cmd goes through a tempfile .cmd batch (see
                 // HandleExecuteAsync). Verifies both that the tempfile path
                 // works and that cmd batch block syntax (nested blocks with
                 // line breaks) survives the round-trip. cwd-independent —
                 // uses a variable set inside the block.
-                multiLine: "set _SPLASH_MSH=ok\nif \"%_SPLASH_MSH%\"==\"ok\" (\n    echo cmd-line-a\n    echo cmd-line-b\n) else (\n    echo cmd-else\n)",
+                multiLine: "set _RIPPLE_MSH=ok\nif \"%_RIPPLE_MSH%\"==\"ok\" (\n    echo cmd-line-a\n    echo cmd-line-b\n) else (\n    echo cmd-else\n)",
                 multiLineExpects: new[] { "cmd-line-a", "cmd-line-b" },
                 // cmd's PROMPT fires a fake D;0 after every command — exit code
                 // assertions would always see 0, so don't bother.
@@ -767,8 +767,8 @@ public class ConsoleWorkerTests
                 shellExe: "bash.exe",
                 simpleEcho: "echo hello bash",
                 simpleEchoExpect: "hello bash",
-                setVar: "export SPLASH_MS_TEST=bash-persist",
-                getVar: "echo \"$SPLASH_MS_TEST\"",
+                setVar: "export RIPPLE_MS_TEST=bash-persist",
+                getVar: "echo \"$RIPPLE_MS_TEST\"",
                 getVarExpect: "bash-persist",
                 // Multi-line bash goes through a tempfile .sh dot-source
                 // (see HandleExecuteAsync). Also exercises the bash
@@ -820,7 +820,7 @@ public class ConsoleWorkerTests
 
         // Read the embedded integration script the same way ConsoleWorker does.
         string? scriptBody;
-        using (var stream = typeof(ConsoleWorker).Assembly.GetManifestResourceStream("Splash.ShellIntegration.integration.ps1"))
+        using (var stream = typeof(ConsoleWorker).Assembly.GetManifestResourceStream("Ripple.ShellIntegration.integration.ps1"))
         {
             if (stream == null)
             {
@@ -834,7 +834,7 @@ public class ConsoleWorkerTests
         }
         Assert(true, "integration.ps1 embedded resource located");
 
-        var tmp = Path.Combine(Path.GetTempPath(), $"splash-psrl-guard-{Guid.NewGuid():N}.ps1");
+        var tmp = Path.Combine(Path.GetTempPath(), $"ripple-psrl-guard-{Guid.NewGuid():N}.ps1");
         await File.WriteAllTextAsync(tmp, scriptBody);
 
         try
@@ -909,7 +909,7 @@ public class ConsoleWorkerTests
             return (pass, fail);
         }
 
-        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+        var pipeName = $"RP.{proxyPid}.{agentId}.{workerPid}";
 
         try
         {

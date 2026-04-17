@@ -2,7 +2,7 @@ schema: 1
 name: lua
 version: 0.1.0
 description: >
-  Lua's standard command-line interpreter driven as a splash REPL
+  Lua's standard command-line interpreter driven as a ripple REPL
   adapter. Interactive mode is entered by launching `lua` with no
   script argument. Primary prompt is `> `, continuation is `>> `
   when a statement spans multiple lines. Used for quick Lua evaluation
@@ -57,7 +57,7 @@ init:
 
 prompt:
   # Lua's primary prompt is `> ` at line start. Continuation is `>> `
-  # but splash sends statements as single lines so the continuation
+  # but ripple sends statements as single lines so the continuation
   # case doesn't arise for adapter-driven commands.
   strategy: regex
   primary: '^> $'
@@ -118,13 +118,13 @@ tests:
 
   - name: "state: global variable persists across commands"
     setup_sequence:
-      - eval: "splash_test = 100"
-    eval: "=splash_test + 1"
+      - eval: "ripple_test = 100"
+    eval: "=ripple_test + 1"
     expect: '^101$'
 
   - name: "built-in function: string.upper"
-    eval: '=string.upper("splash")'
-    expect: '^SPLASH$'
+    eval: '=string.upper("ripple")'
+    expect: '^RIPPLE$'
 
   - name: "table construction and length"
     eval: "=#{1,2,3,4,5}"

@@ -1,6 +1,6 @@
-using Splash.Services.Adapters;
+using Ripple.Services.Adapters;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// Contract tests for the adapter loader: verifies that every embedded
@@ -60,8 +60,8 @@ public static class AdapterLoaderTests
         {
             Assert(!string.IsNullOrEmpty(pwsh.IntegrationScript),
                 "pwsh: integration_script block is present");
-            Assert(pwsh.IntegrationScript?.Contains("__SplashInjected") == true,
-                "pwsh: integration_script contains __SplashInjected guard");
+            Assert(pwsh.IntegrationScript?.Contains("__RippleInjected") == true,
+                "pwsh: integration_script contains __RippleInjected guard");
             Assert(pwsh.IntegrationScript?.Contains("PreCommandLookupAction") == true,
                 "pwsh: integration_script contains PreCommandLookupAction hook");
             Assert(pwsh.Init.HookType == "precommand_lookup_action",
@@ -146,7 +146,7 @@ public static class AdapterLoaderTests
         // External loading: write a YAML to a temp directory and verify
         // AdapterLoader.LoadFromDirectory picks it up with its
         // integration_script populated from an inline block.
-        var tempDir = Path.Combine(Path.GetTempPath(), $"splash-adapter-test-{Guid.NewGuid():N}");
+        var tempDir = Path.Combine(Path.GetTempPath(), $"ripple-adapter-test-{Guid.NewGuid():N}");
         try
         {
             Directory.CreateDirectory(tempDir);

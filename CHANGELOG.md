@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to splash are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
+All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [0.8.0] - 2026-04-16
 
@@ -94,7 +94,7 @@ test run no longer disrupts the user's other windows.
   bytes replay automatically after the command completes (success /
   timeout / error). Ctrl+C (0x03) passes through even when held so
   the user can always interrupt a stuck command. Operates at
-  splash's own forwarding layer (above the shell), making it
+  ripple's own forwarding layer (above the shell), making it
   universal across adapters regardless of whether the shell has a
   line editor. The hold gate and the pre-existing `input.clear_line`
   field cover complementary windows and both remain in use:
@@ -103,17 +103,17 @@ test run no longer disrupts the user's other windows.
     its output drains.
   - **`input.clear_line`** protects the *between-command* window —
     keystrokes the user typed into the shared console (which is
-    splash's whole design promise) that already reached the shell's
+    ripple's whole design promise) that already reached the shell's
     line editor before the next AI command arrived. clear_line
     issues the line-editor-kill bytes (Ctrl-A + Ctrl-K for readline)
     right before submitting the AI command so pre-typed partial
     input doesn't prefix it. Removing clear_line would require
     extending the hold gate to also cover the between-command
     window, which would silently break the shared-console contract
-    that lets the user type into splash's terminal as their own
+    that lets the user type into ripple's terminal as their own
     workspace.
 - **`--adapter-tests` worker console windows are hidden (SW_HIDE).**
-  Normal splash usage keeps `SW_SHOWNOACTIVATE` so the shared
+  Normal ripple usage keeps `SW_SHOWNOACTIVATE` so the shared
   console is visible-but-inactive; test runs gate on `noUserInput`
   to switch to fully invisible windows. Rapid window creation
   during a full test suite (15+ workers) previously caused focus
@@ -206,7 +206,7 @@ release binaries.
   read-chunk boundary — the partial opener leaked to the visible
   terminal and the terminal interpreted bytes 1..N as the shell's
   title up to whatever terminator eventually arrived, clobbering
-  splash's desired title. Fix (commit `737f0a3`): add a
+  ripple's desired title. Fix (commit `737f0a3`): add a
   `ref string pendingTail` parameter so the unterminated opener is
   buffered on `_oscTitlePending` and reassembled on the next chunk.
   37 new unit assertions cover split points between `\e` and `]`,
@@ -242,14 +242,14 @@ release binaries.
   now `string?` to support explicit `null` in YAML.
 - **New console windows stole keyboard focus.** `CreateProcessW`
   with only `CREATE_NEW_CONSOLE` gives the new console active-
-  window status by default, so starting a splash shell while
+  window status by default, so starting a ripple shell while
   the user is typing in their editor drops their keystrokes
-  into splash's buffer. Fix (commit `c90d3f1`): set
+  into ripple's buffer. Fix (commit `c90d3f1`): set
   `STARTF_USESHOWWINDOW | wShowWindow = SW_SHOWNOACTIVATE` in
   `STARTUPINFOW` so the new window is displayed but not
   activated. The user's editor keeps focus.
 - **User-typed bytes were prepended to the next AI command.** Even
-  with the focus fix, users occasionally click into a splash
+  with the focus fix, users occasionally click into a ripple
   console and type a few keystrokes before noticing. Without a
   flush, those bytes sit in the shell's line-editor buffer and
   get submitted together with the next AI command as one garbled
@@ -310,7 +310,7 @@ release binaries.
   adding a new adapter to verify just its own tests in isolation.
 - **`input.clear_line` schema field** — documented in SCHEMA.md §8
   alongside the empirical-verification requirement ("walk the
-  adapter in splash, type into its console window, run
+  adapter in ripple, type into its console window, run
   execute_command, confirm the clear bytes wipe the buffer
   without syntax errors, then add the field"). Bash and zsh opt-in;
   everything else null by default.
@@ -344,7 +344,7 @@ release binaries.
 
 ## [0.6.0] - 2026-04-15
 
-Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just execute_command — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference. And: **Armed Bear Common Lisp** (ABCL) joins the embedded adapter set, giving splash a JVM-hosted Lisp reference point for the `balanced_parens` counter and proving the **Groovy pattern** (java.exe from a whitelisted Program Files path loading a jar payload from `%LocalAppData%`) works for any future JVM-hosted REPL. 536 / 536 test assertions pass (408 unit + 79 pre-existing E2E + 49 adapter-declared).
+Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a command is in flight and the MCP client silently drops the response channel — ESC cancel, the MCP protocol's 3-minute ceiling, or a fresh tool call sneaking in on the same console — the worker flips the in-flight command to cache-on-complete mode so its eventual result lands in a per-console list instead of being silently discarded. The next tool call — **any** tool call, not just execute_command — drains the list and surfaces the result to the AI. Mirrors the PowerShell.MCP pattern, then closes three implementation holes observed in its reference. And: **Armed Bear Common Lisp** (ABCL) joins the embedded adapter set, giving ripple a JVM-hosted Lisp reference point for the `balanced_parens` counter and proving the **Groovy pattern** (java.exe from a whitelisted Program Files path loading a jar payload from `%LocalAppData%`) works for any future JVM-hosted REPL. 536 / 536 test assertions pass (408 unit + 79 pre-existing E2E + 49 adapter-declared).
 
 ### Added
 - **`CommandTracker.FlipToCacheMode()`** — detaches the in-flight TCS with a `TimeoutException` and marks `_shouldCacheOnComplete` so the eventual OSC-driven `Resolve()` appends to `_cachedResults` instead of delivering to the original caller. Invoked by two paths: the `CancellationTokenSource` registration firing at the 170 s preemptive deadline, and `HandleExecuteAsync` catching a fresh `execute_command` on a busy console (proof the prior caller stopped listening).
@@ -352,7 +352,7 @@ Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a co
 - **170 s preemptive timeout cap** — `CommandTracker.PreemptiveTimeoutMs = 170_000` and `ConsoleManager.MaxExecuteTimeoutSeconds = 170` clamp both the worker-side timer and the proxy-side pipe wait, so `execute_command` always returns a usable response within the MCP 3-minute tool-call window even when the underlying command keeps running in the background.
 - **Worker-baked status line on cached results** — `CommandTracker.SetDisplayContext(displayName, shellFamily)` (populated from `claim` / `set_title`) lets the worker compute a self-describing status line at `Resolve` time. `CommandResult.StatusLine` carries it through the pipe, `ExecuteResult.StatusLine` carries it through the proxy, and `ShellTools.AppendCachedOutputs` prefers it over proxy-side reformatting so drained output reads identically to inline results — even if the console has since been reused.
 - **84 new cache/drain test assertions** — 76 `CommandTrackerTests` unit tests for flip semantics, list accumulation, atomic drain, status-line formatting (pwsh / cmd / bash variants), cache survival across `RegisterCommand`, the 170 s cap, and a wall-clock preemptive-timer path; 8 `ConsoleWorkerTests` E2E assertions covering the multi-entry wire protocol — two back-to-back short-timeout commands stack in the cache and drain in a single RPC with both status lines intact, follow-up drain returns `no_cache`.
-- **Armed Bear Common Lisp (ABCL) adapter** — `adapters/abcl.yaml` + `ShellIntegration/integration.abcl.lisp`. Second Common Lisp family adapter, first JVM-hosted Lisp shipped embedded. Runs ABCL 1.9.2 from `%LocalAppData%\splash-deps\abcl-bin-1.9.2\` via `java.exe` from Program Files — the same **Groovy pattern** that bypasses AppLocker's user-dir PE block by keeping the only spawned executable in a whitelisted location and loading the jar payload as classfiles. The integration script `setf`s `top-level::*repl-prompt-fun*` to an OSC-emitting wrapper — simpler than CCL's `ccl::print-listener-prompt` override which needs a kernel-redefine warning gate. Prompt is overridden from ABCL's default `CL-USER(N): ` to a literal `? ` so both CL adapters share mode regexes. `balanced_parens` / `char_literal_prefix` / tempfile delivery / `modes.main` mirror `ccl.yaml`. Probe + 5 declared tests (arithmetic, `defparameter` persistence, block comment `#| |#`, char literal `#\(`, modes-main default) all pass on `--adapter-tests --only abcl`. Debugger mode intentionally deferred because ABCL's `system::debug-loop` uses a separate prompt mechanism that needs research against a real break scenario.
+- **Armed Bear Common Lisp (ABCL) adapter** — `adapters/abcl.yaml` + `ShellIntegration/integration.abcl.lisp`. Second Common Lisp family adapter, first JVM-hosted Lisp shipped embedded. Runs ABCL 1.9.2 from `%LocalAppData%\ripple-deps\abcl-bin-1.9.2\` via `java.exe` from Program Files — the same **Groovy pattern** that bypasses AppLocker's user-dir PE block by keeping the only spawned executable in a whitelisted location and loading the jar payload as classfiles. The integration script `setf`s `top-level::*repl-prompt-fun*` to an OSC-emitting wrapper — simpler than CCL's `ccl::print-listener-prompt` override which needs a kernel-redefine warning gate. Prompt is overridden from ABCL's default `CL-USER(N): ` to a literal `? ` so both CL adapters share mode regexes. `balanced_parens` / `char_literal_prefix` / tempfile delivery / `modes.main` mirror `ccl.yaml`. Probe + 5 declared tests (arithmetic, `defparameter` persistence, block comment `#| |#`, char literal `#\(`, modes-main default) all pass on `--adapter-tests --only abcl`. Debugger mode intentionally deferred because ABCL's `system::debug-loop` uses a separate prompt mechanism that needs research against a real break scenario.
 - **`--adapter-tests [--only <name>]` CLI flag** — runs each adapter's declared `tests:` block standalone, without the `ConsoleWorkerTests.Run` harness whose pre-existing Ctrl+C / obsolete-state flakes hard-exit the process on failure and would otherwise mask downstream adapter-declared results. Useful after adding a new adapter to verify just its own tests in isolation (e.g. `--adapter-tests --only abcl`) or to run the full declared-test suite across all loaded adapters independently of the broader `--test --e2e` gate.
 
 ### Changed
@@ -361,13 +361,13 @@ Cache-on-busy-receive salvage layer plus a second Common Lisp adapter. When a co
 - **`AppendCachedOutputs` in every MCP tool** — `send_input` is now wrapped like the rest, so its response also drains any cached results on its target console and reports other consoles' busy / finished / closed state. Closes the last gap where a tool response could omit freshly-ready cached output.
 
 ### Fixed
-- **Drain hole: read-only MCP tools didn't surface stale cache** — PowerShell.MCP's `CollectAllCachedOutputsAsync` is only called from execute / wait_for_completion handlers, so tools like `get_current_location` leave other consoles' caches sitting until the next execute. splash now drains from every tool response (execute, wait_for_completion, start_console, peek_console, send_input), matching the user's "any MCP tool response" requirement.
-- **Drain hole: older cache hidden behind timeout / flipped branches** — PS.MCP's `invoke_expression` timeout / `shouldCache` branches don't consume older cache entries, so they sit until the next normal completion. splash's atomic `ConsumeCachedOutputs` picks up everything in one call regardless of which branch fires.
+- **Drain hole: read-only MCP tools didn't surface stale cache** — PowerShell.MCP's `CollectAllCachedOutputsAsync` is only called from execute / wait_for_completion handlers, so tools like `get_current_location` leave other consoles' caches sitting until the next execute. ripple now drains from every tool response (execute, wait_for_completion, start_console, peek_console, send_input), matching the user's "any MCP tool response" requirement.
+- **Drain hole: older cache hidden behind timeout / flipped branches** — PS.MCP's `invoke_expression` timeout / `shouldCache` branches don't consume older cache entries, so they sit until the next normal completion. ripple's atomic `ConsumeCachedOutputs` picks up everything in one call regardless of which branch fires.
 - **`CancellationTokenRegistration` self-disposal deadlock** — `FlipToCacheMode` originally disposed `_timeoutReg` inline, but when called FROM the token's own callback via `Register(FlipToCacheMode)`, `CTR.Dispose` blocks until the callback finishes — which was the same thread currently inside the callback. Disposal now happens in `Resolve`'s cache branch and `AbortPending`, where the command has already finished running.
 
 ### Known limitations
-- **Silent fast-completing ESC cancel** — if `execute_command` completes normally in well under 170 s but the client already stopped listening (ESC fired before anything triggered a flip), the result is delivered via `_tcs.TrySetResult` and never enters the cache. splash has no way to detect client-side cancel without a protocol extension. Commands taking more than a few hundred milliseconds are covered via the flip-on-busy-receive trigger as soon as the next tool call arrives.
-- **Cross-agent salvage not attempted** — the drain walks only consoles owned by the current agent. A sub-agent's flipped cache is not visible to the parent agent's tool calls, by design (agent isolation is a first-class splash concept).
+- **Silent fast-completing ESC cancel** — if `execute_command` completes normally in well under 170 s but the client already stopped listening (ESC fired before anything triggered a flip), the result is delivered via `_tcs.TrySetResult` and never enters the cache. ripple has no way to detect client-side cancel without a protocol extension. Commands taking more than a few hundred milliseconds are covered via the flip-on-busy-receive trigger as soon as the next tool call arrives.
+- **Cross-agent salvage not attempted** — the drain walks only consoles owned by the current agent. A sub-agent's flipped cache is not visible to the parent agent's tool calls, by design (agent isolation is a first-class ripple concept).
 
 ## [0.5.0] - 2026-04-13
 
@@ -380,7 +380,7 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 - **Additional E2E tests for pwsh** — session variable persistence across execute calls, multi-line foreach, slow-command timeout + busy-state probe, cached output retrieval after timeout, `send_input` rejection on idle consoles, `send_input` Ctrl+C interrupt with standby recovery.
 
 ### Changed
-- **bash integration rewritten from DEBUG trap to PS0** — `PS0=$'\\e]633;C\\a'` fires OSC 633 C exactly once per command-line submit in the parent shell, working for subshells (`(echo foo)`), command substitutions (`$(date)`), pipelines, brace groups, and multi-statement lines. The old DEBUG trap approach couldn't fire for compound commands without `set -T`, and even with functrace had recursive emission issues inside `__sp_precmd`. The `__sp_in_command` flag and DEBUG trap are deleted entirely; `__sp_precmd` now emits OSC D unconditionally.
+- **bash integration rewritten from DEBUG trap to PS0** — `PS0=$'\\e]633;C\\a'` fires OSC 633 C exactly once per command-line submit in the parent shell, working for subshells (`(echo foo)`), command substitutions (`$(date)`), pipelines, brace groups, and multi-statement lines. The old DEBUG trap approach couldn't fire for compound commands without `set -T`, and even with functrace had recursive emission issues inside `__rp_precmd`. The `__rp_in_command` flag and DEBUG trap are deleted entirely; `__rp_precmd` now emits OSC D unconditionally.
 - **bash multi-line / multi-statement command capture** — multi-line bodies route through a tempfile `.sh` dot-source with WSL/MSYS path translation. Multi-statement single-line commands (`cmd1; cmd2; cmd3`) capture all output in order — previously only the last statement was reported because each sub-command's DEBUG firing reset the OSC C marker.
 - **cmd.exe status line** — now renders as `○ Finished (exit code unavailable)` instead of a misleading `✓ Completed`. cmd's PROMPT can't expand `%ERRORLEVEL%` at display time, so the worker reports a fake exit 0 for every command; the new status text makes that limitation visible to the AI instead of silently lying.
 - **Long status-line commands truncated** — the pipeline column in status lines now caps at 60 characters with `...` to keep multi-line responses readable.
@@ -393,7 +393,7 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 
 ### Known limitations
 - **cmd.exe exit codes are always reported as 0**. cmd's PROMPT can't expand `%ERRORLEVEL%` at display time, so the worker emits a fake `OSC 633 D;0` after every command. AI commands show as `Finished (exit code unavailable)` to make the limitation visible. Use pwsh or bash if you need exit-code-aware execution. (The visible terminal still has the real `%ERRORLEVEL%`; only the AI-side capture is affected.)
-- **`Remove-Module PSReadLine` mid-session breaks the pwsh worker.** PSReadLine spawns persistent reader threads that survive module unload (.NET can't fully unload binary modules), so the orphaned threads keep consuming console input bytes and the next AI command hangs forever. Splash can't recover from this state. Documented in README.
+- **`Remove-Module PSReadLine` mid-session breaks the pwsh worker.** PSReadLine spawns persistent reader threads that survive module unload (.NET can't fully unload binary modules), so the orphaned threads keep consuming console input bytes and the next AI command hangs forever. Ripple can't recover from this state. Documented in README.
 - **cmd.exe builtin interactive prompts are not detected as user-busy** (`pause`, `set /p`). Zero CPU + zero children leave both polling signals silent. Uncommon enough to leave undetected.
 
 ## [0.4.0] - 2026-04-12
@@ -415,7 +415,7 @@ A round of cmd.exe and bash polish driven by systematic shell-by-shell testing. 
 ### Fixed
 - **Dot-source line visible in console** — the `\e[<N>F\e[0J` erase sequence now dynamically calculates wrap row count based on terminal width, so the full dot-source input (which can exceed 200 chars and wrap to 2-3 rows) is erased completely.
 - **Multi-line command cursor position** — the colorized echo is now emitted from inside the tempfile via `[Console]::OpenStandardOutput()`, bypassing pwsh's host TextWriter layer that was rewriting cursor-control escapes into absolute positioning. This keeps the child's virtual buffer cursor in sync with the visible terminal.
-- **PSReadLine history pollution** — `.splash-exec-*.ps1` dot-source lines are excluded from PSReadLine history via `AddToHistoryHandler` in `integration.ps1`.
+- **PSReadLine history pollution** — `.ripple-exec-*.ps1` dot-source lines are excluded from PSReadLine history via `AddToHistoryHandler` in `integration.ps1`.
 
 ### Known limitations
 - `peek_console` on Linux/macOS uses the VT-medium interpreter which may not perfectly match the real terminal for complex TUI applications. Windows uses native screen buffer reads for exact fidelity.
@@ -428,17 +428,17 @@ A quality-focused release built on top of the v0.2.0 foundation. pwsh is now sta
 ### Added
 - **Syntax-highlighted AI command echo** — pwsh and Windows PowerShell 5.1 both render the echoed command with PSReadLine-equivalent colors: cmdlets, keywords (`foreach`, `in`, `if`, `else`, ...), scriptblock bodies (`Write-Host` inside `{ ... }`), double-quoted string interpolation (`"- $i"`), parameters, variables, numbers and comments. Hand-rolled state machine in `Services/PwshColorizer.cs` with unit tests.
 - **Background busy / finished / closed reports** — every tool response now prepends a one-line summary of any other console's state, discovered on demand via a get_status pass. Includes a `✓ #N Name | Status: User command finished` line fired exactly once when a user-typed command like `pause` completes.
-- **Source-cwd drift handling when auto-routing** — if the human user manually `cd`'d in the busy source console since your last command, splash preserves your last known cwd by using it as the cd preamble target on the routed-to console and attaches a one-line `Note: source #N was moved by user to '...'; ran in #M at your last known cwd '...'` to the response. Source's `LastAiCwd` is intentionally not updated, so later returns to that console still prompt a verify-and-retry warning.
+- **Source-cwd drift handling when auto-routing** — if the human user manually `cd`'d in the busy source console since your last command, ripple preserves your last known cwd by using it as the cd preamble target on the routed-to console and attaches a one-line `Note: source #N was moved by user to '...'; ran in #M at your last known cwd '...'` to the response. Source's `LastAiCwd` is intentionally not updated, so later returns to that console still prompt a verify-and-retry warning.
 - **Same-console drift warning** — if the user manually `cd`'d in the *idle* active console, the next `execute_command` returns a "verify cwd and re-execute" warning instead of running in the wrong place.
 - **`wait_for_completion` three-state contract** — distinguishes "no commands pending" (nothing to wait for, stop calling), "completed" (one or more drained results included), and "still busy" (call again to keep waiting).
 
 ### Changed
-- **NativeAOT publish** — `splash.exe` cold start dropped from ~1 s (R2R) to ~130 ms, eliminating the race between Claude Code's first MCP call and splash warm-up.
+- **NativeAOT publish** — `ripple.exe` cold start dropped from ~1 s (R2R) to ~130 ms, eliminating the race between Claude Code's first MCP call and ripple warm-up.
 - **Two concurrent owned pipe listeners** — a long-running `execute_command` no longer stalls `get_status` / `get_cached_output`; the second instance stays free for status queries.
 - **500 ms fixed settle removed** — fast commands return without the old delay; trailing output is drained adaptively via the new `drain_post_output` pipe command.
 - **Stream capture rewritten** as OSC C/D position slicing (`_commandStart` / `_commandEnd`), replacing the layered AcceptLine noise filters and first-newline heuristics.
 - **start_console banner / reason survive ConPTY startup** — they used to flash for ~0.5 s before ConPTY's initial `\e[?25l\e[2J\e[m\e[H` wiped them. For pwsh / powershell.exe the banner is now emitted from inside the shell via the generated integration tempfile, so it sticks.
-- **Unowned window title** changed from `#PID ____` to `#PID ~~~~` so splash's idle state visually differentiates from PowerShell.MCP's identical `____`.
+- **Unowned window title** changed from `#PID ____` to `#PID ~~~~` so ripple's idle state visually differentiates from PowerShell.MCP's identical `____`.
 - **AI command echo blank line removed** — `cmdDisplay` no longer ends with `\r\n`, so it no longer doubles up with PSReadLine's AcceptLine newline.
 - **Same-shell-family pinning when auto-switching** away from a busy console, so bash users don't get silently bounced into pwsh.
 - **`powershell.exe` fallback** when `pwsh.exe` is absent on the host.
@@ -458,7 +458,7 @@ A quality-focused release built on top of the v0.2.0 foundation. pwsh is now sta
 
 ### Added
 - **Claim-handshake version check** — a strictly newer proxy trying to attach to an older worker is refused; the old worker marks itself obsolete and stops serving pipes while keeping the PTY alive for the human user, so the MCP session disconnects cleanly without killing the shell.
-- **npx-based install docs** — README now documents `npx splashshell` as the primary install path.
+- **npx-based install docs** — README now documents `npx rippleshell` as the primary install path.
 
 ## [0.1.0] - 2026-04-10
 

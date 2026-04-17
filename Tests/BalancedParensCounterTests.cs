@@ -1,7 +1,7 @@
-using Splash.Services;
-using Splash.Services.Adapters;
+using Ripple.Services;
+using Ripple.Services.Adapters;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 public static class BalancedParensCounterTests
 {

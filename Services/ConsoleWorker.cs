@@ -5,9 +5,9 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
-using Splash.Services.Adapters;
+using Ripple.Services.Adapters;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Console worker process: runs in --console mode.
@@ -22,7 +22,7 @@ public class ConsoleWorker
     // Worker logs go to a file, NOT to Console.Error.
     // The worker's visible console (Console.Out) is reserved for mirroring PTY output.
     // Anything to stderr would also appear there, mixed with PTY data.
-    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"splash-worker-{Environment.ProcessId}.log");
+    private static readonly string LogFile = Path.Combine(Path.GetTempPath(), $"ripple-worker-{Environment.ProcessId}.log");
     private static void Log(string msg) { try { File.AppendAllText(LogFile, $"{DateTime.Now:HH:mm:ss.fff} {msg}\n"); } catch { } }
 
     /// <summary>
@@ -34,7 +34,7 @@ public class ConsoleWorker
         try
         {
             var cutoff = DateTime.UtcNow.AddHours(-24);
-            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), "splash-worker-*.log"))
+            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), "ripple-worker-*.log"))
             {
                 try
                 {
@@ -44,12 +44,12 @@ public class ConsoleWorker
                 catch { /* in use by another live worker, or locked — skip */ }
             }
             // Multi-line command tempfiles — HandleExecuteAsync writes the
-            // command body to `.splash-exec-{pid}-{guid}.ps1` and deletes
+            // command body to `.ripple-exec-{pid}-{guid}.ps1` and deletes
             // it inline via `Remove-Item` after dot-sourcing. If the
             // worker crashes or the shell dies mid-dot-source the delete
             // never runs, so sweep stale ones older than 24 hours here
             // on startup just like we do for the logs.
-            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), ".splash-exec-*.ps1"))
+            foreach (var path in Directory.EnumerateFiles(Path.GetTempPath(), ".ripple-exec-*.ps1"))
             {
                 try
                 {
@@ -328,7 +328,7 @@ public class ConsoleWorker
             && !string.IsNullOrEmpty(envVar) && !string.IsNullOrEmpty(fileName)
             && _adapter.IntegrationScript is string rcScript)
         {
-            var rcDir = Path.Combine(Path.GetTempPath(), $".splash-{_shellFamily}-{Environment.ProcessId}");
+            var rcDir = Path.Combine(Path.GetTempPath(), $".ripple-{_shellFamily}-{Environment.ProcessId}");
             Directory.CreateDirectory(rcDir);
             // Line endings are normalised to LF before write: the shells
             // that read rc files under this delivery mode (zsh on MSYS2,
@@ -358,7 +358,7 @@ public class ConsoleWorker
         // first OSC A that WaitForReady gates on. The outer terminal emulator
         // answers DSR with the real cursor position, and that reply has to
         // reach the shell for PSReadLine to continue. If input forwarding
-        // starts after WaitForReady the reply sits in splash's stdin buffer
+        // starts after WaitForReady the reply sits in ripple's stdin buffer
         // long enough that PSReadLine either times out on DSR wait
         // (degraded-mode rendering — wrong cursor row) or consumes the
         // buffered reply as typed characters once forwarding catches up
@@ -426,7 +426,7 @@ public class ConsoleWorker
         // Wait for PromptStart marker from shell integration (confirms OSC pipeline is working)
         // Wait until the shell reports its first OSC A (PromptStart).
         // No wall-clock timeout: a cold pwsh startup + Defender first-
-        // scan of splash.exe + Import-Module PSReadLine + sourcing
+        // scan of ripple.exe + Import-Module PSReadLine + sourcing
         // integration.ps1 can take arbitrary real time, and any fallback
         // "proceed without OSC markers" path lets the worker accept AI
         // commands before the shell is actually interactive — the next
@@ -632,7 +632,7 @@ public class ConsoleWorker
                     prefix.Append(ExpandTemplate(reasonTpl, ("reason", _reason.Replace("'", "''"))));
                 if (prefix.Length > 0) prefix.AppendLine("Write-Host");
 
-                var tmpPrefix = _adapter?.Init.Tempfile?.Prefix ?? ".splash-integration-";
+                var tmpPrefix = _adapter?.Init.Tempfile?.Prefix ?? ".ripple-integration-";
                 var tmpExt = _adapter?.Init.Tempfile?.Extension ?? ".ps1";
                 var tmpFile = Path.Combine(
                     Path.GetTempPath(),
@@ -670,7 +670,7 @@ public class ConsoleWorker
             replAdapter.IntegrationScript is { } replScript &&
             !string.IsNullOrEmpty(replAdapter.Process.CommandTemplate))
         {
-            var tmpPrefix = replAdapter.Init.Tempfile?.Prefix ?? ".splash-integration-";
+            var tmpPrefix = replAdapter.Init.Tempfile?.Prefix ?? ".ripple-integration-";
             var tmpExt = replAdapter.Init.Tempfile?.Extension ?? "";
             var tmpFile = Path.Combine(
                 Path.GetTempPath(),
@@ -738,7 +738,7 @@ public class ConsoleWorker
         // but no integration script. `{init_invocation}` is NOT
         // substituted here — adapters on this path must not reference
         // it. ExpandTemplate additionally applies %ENVVAR% expansion
-        // so paths like `%LOCALAPPDATA%\splash-deps\...` resolve.
+        // so paths like `%LOCALAPPDATA%\ripple-deps\...` resolve.
         if (!_isPwshFamily && shellName != "cmd" &&
             _adapter is { } cmdTplAdapter &&
             !string.IsNullOrEmpty(cmdTplAdapter.Process.CommandTemplate))
@@ -772,8 +772,8 @@ public class ConsoleWorker
             result = result.Replace("{" + name + "}", value);
         // After the named-placeholder substitution, also expand Windows
         // `%ENVVAR%` references so adapter authors can reference user-
-        // specific paths like `%LOCALAPPDATA%\splash-deps\...` without
-        // splash having to mint a new named placeholder for every
+        // specific paths like `%LOCALAPPDATA%\ripple-deps\...` without
+        // ripple having to mint a new named placeholder for every
         // possible env var. No-op on non-Windows (the method just
         // returns the input unchanged there).
         if (OperatingSystem.IsWindows())
@@ -858,7 +858,7 @@ public class ConsoleWorker
             // Windows temp path directly since the worker and child share
             // the filesystem, then teach the shell how to find it in its
             // own namespace (/mnt/c/... for WSL, /c/... for MSYS2).
-            var windowsPath = Path.Combine(Path.GetTempPath(), $".splash-integration-{Environment.ProcessId}.sh");
+            var windowsPath = Path.Combine(Path.GetTempPath(), $".ripple-integration-{Environment.ProcessId}.sh");
             var scriptContent = script.Replace("\r\n", "\n");
             await File.WriteAllTextAsync(windowsPath, scriptContent, ct);
 
@@ -874,11 +874,11 @@ public class ConsoleWorker
         {
             // Linux/macOS: heredoc the script into the child's own /tmp so
             // we don't need the worker to see the child's filesystem.
-            var tmpFile = $"/tmp/.splash-integration-{Environment.ProcessId}.sh";
+            var tmpFile = $"/tmp/.ripple-integration-{Environment.ProcessId}.sh";
             var injection = new StringBuilder();
-            injection.AppendLine($"cat > {tmpFile} << 'SPLASH_EOF'");
+            injection.AppendLine($"cat > {tmpFile} << 'RIPPLE_EOF'");
             injection.AppendLine(script.TrimEnd());
-            injection.AppendLine("SPLASH_EOF");
+            injection.AppendLine("RIPPLE_EOF");
             injection.AppendLine($"source {tmpFile}; rm -f {tmpFile}");
             await WriteToPty(injection.ToString(), ct);
         }
@@ -1634,7 +1634,7 @@ public class ConsoleWorker
     /// Forward a slice of OSC-stripped PTY output to the worker's visible
     /// console so the human user sees what the AI is doing. Rewrites any
     /// OSC 0 (set window title) sequences on the way so the title stays as
-    /// splash's "#PID Name" tag instead of being overwritten by whatever
+    /// ripple's "#PID Name" tag instead of being overwritten by whatever
     /// the shell's prompt decided to set.
     /// </summary>
     private void MirrorToVisible(string text)
@@ -1654,12 +1654,12 @@ public class ConsoleWorker
     /// <summary>
     /// Scan recent PTY output for in-band terminal queries from the hosted
     /// shell and inject synthetic responses back into the PTY input. On Unix
-    /// the inner forkpty has no real terminal emulator behind it — splash is
+    /// the inner forkpty has no real terminal emulator behind it — ripple is
     /// the middleman relaying bytes between the outer xfce4-terminal /
     /// Terminal.app and the shell — so line-editor libraries that sync their
     /// internal state by querying the terminal (PSReadLine fires DSR on
     /// startup, various REPLs probe DA1 / DA2) never see a reply and can
-    /// hang indefinitely waiting for one. Answering here keeps splash a
+    /// hang indefinitely waiting for one. Answering here keeps ripple a
     /// pure relay on Windows (the real ConPTY handles these queries itself,
     /// so the loop below no-ops unless the specific sequence actually
     /// appears) while unblocking the Unix path.
@@ -1671,7 +1671,7 @@ public class ConsoleWorker
     /// the reply races back through the stdin relay into the shell — the
     /// shell's line editor then treats the duplicate reply as typed
     /// characters and prints garbage like "R24" or "21R" into the command
-    /// buffer. Answering on splash's side and swallowing the query is the
+    /// buffer. Answering on ripple's side and swallowing the query is the
     /// single-authoritative path.
     ///
     /// Currently handled:
@@ -2219,10 +2219,10 @@ public class ConsoleWorker
         var sb = new StringBuilder();
         // Bypass pwsh's host Console wrapper by grabbing the raw stdout
         // stream and writing the payload as bytes directly.
-        sb.AppendLine("$__sp_out = [System.Console]::OpenStandardOutput()");
-        sb.AppendLine($"$__sp_bytes = [System.Convert]::FromBase64String('{payloadBase64}')");
-        sb.AppendLine("$__sp_out.Write($__sp_bytes, 0, $__sp_bytes.Length)");
-        sb.AppendLine("$__sp_out.Flush()");
+        sb.AppendLine("$__rp_out = [System.Console]::OpenStandardOutput()");
+        sb.AppendLine($"$__rp_bytes = [System.Convert]::FromBase64String('{payloadBase64}')");
+        sb.AppendLine("$__rp_out.Write($__rp_bytes, 0, $__rp_bytes.Length)");
+        sb.AppendLine("$__rp_out.Flush()");
         // and finally the real command body, normalized to LF line endings
         sb.AppendLine(command.Replace("\r\n", "\n"));
         return sb.ToString();
@@ -2239,7 +2239,7 @@ public class ConsoleWorker
         // The arrival of this execute_command is definitive proof that the prior
         // command's response channel has been lost — the caller cannot both be
         // awaiting the prior result and issuing a new execute at the same time
-        // (splash has no concept of "target console" in the tool shape — each
+        // (ripple has no concept of "target console" in the tool shape — each
         // new execute replaces the previous expectation). Flip the in-flight
         // command to cache mode so its result gets appended to _cachedResults
         // and surfaces on the next drain instead of being silently discarded.
@@ -2338,7 +2338,7 @@ public class ConsoleWorker
         string ptyPayload;
         if (isMultiLinePwsh)
         {
-            var tmpFile = Path.Combine(Path.GetTempPath(), $".splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
+            var tmpFile = Path.Combine(Path.GetTempPath(), $".ripple-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
             var ptyInput = $". '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
 
             // Work out how many terminal rows the dot-source + Remove-Item
@@ -2365,7 +2365,7 @@ public class ConsoleWorker
             // batch file, `call` it from the PTY as a single-line input, then
             // `del` it. `@echo off` up front suppresses re-echo of each line
             // inside the batch so the output mirrors single-line cmd usage.
-            var tmpFile = Path.Combine(Path.GetTempPath(), $"splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.cmd");
+            var tmpFile = Path.Combine(Path.GetTempPath(), $"ripple-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.cmd");
             var body = "@echo off\r\n" + command.Replace("\r\n", "\n").Replace("\n", "\r\n") + "\r\n";
             await File.WriteAllTextAsync(tmpFile, body, ct);
             ptyPayload = $"call \"{tmpFile}\" & del \"{tmpFile}\"" + enter;
@@ -2380,7 +2380,7 @@ public class ConsoleWorker
             // .sh file and dot-source it so the shell parses the whole block
             // as a single source file. State (variables, functions, cwd)
             // persists because dot-sourcing runs in the caller's scope.
-            var windowsPath = Path.Combine(Path.GetTempPath(), $"splash-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.sh");
+            var windowsPath = Path.Combine(Path.GetTempPath(), $"ripple-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.sh");
             var body = command.Replace("\r\n", "\n");
             if (!body.EndsWith('\n')) body += "\n";
             await File.WriteAllTextAsync(windowsPath, body, ct);
@@ -2415,12 +2415,12 @@ public class ConsoleWorker
             //
             // The body is written to adapter.input.tempfile.{prefix,extension}
             // and the adapter-supplied invocation_template (e.g.
-            // _splash_exec_file(r"{path}") for python) is sent to the PTY
+            // _ripple_exec_file(r"{path}") for python) is sent to the PTY
             // as a single line. The helper referenced by the template is
             // expected to have been registered by the adapter's
             // init.script_resource at REPL startup and is responsible for
             // cleanup so interrupted commands still delete their tempfile.
-            var tmpPrefix = _adapter.Input.Tempfile.Prefix ?? ".splash-exec-";
+            var tmpPrefix = _adapter.Input.Tempfile.Prefix ?? ".ripple-exec-";
             var tmpExt = _adapter.Input.Tempfile.Extension ?? "";
             var tmpFile = Path.Combine(
                 Path.GetTempPath(),
@@ -2447,7 +2447,7 @@ public class ConsoleWorker
         // This replaces the old adapter-level clear_line approach
         // (which depended on the shell's readline supporting Ctrl-A +
         // Ctrl-K and didn't work at all for shells without a line
-        // editor). The hold gate operates at splash's own forwarding
+        // editor). The hold gate operates at ripple's own forwarding
         // layer, above the shell, so it works universally.
         _holdUserInput = true;
 
@@ -2716,7 +2716,7 @@ public class ConsoleWorker
     /// (opener in chunk N, body or terminator in chunk N+1). Without
     /// state, a split opener leaks into the visible stream and the
     /// terminal interprets it as an open-ended title write — the shell's
-    /// title ends up displayed instead of splash's desired one. The
+    /// title ends up displayed instead of ripple's desired one. The
     /// <paramref name="pendingTail"/> ref parameter carries a
     /// not-yet-classified or not-yet-terminated OSC fragment forward
     /// between calls: on entry it's prepended to the current chunk, on
@@ -2929,7 +2929,7 @@ public class ConsoleWorker
             // Show a prominent banner so the human user understands what happened:
             // AI/MCP control has been detached, but the shell itself is still usable.
             WriteBannerText(
-                $"This console is no longer managed by splash (worker v{_myVersion.ToString(3)}).",
+                $"This console is no longer managed by ripple (worker v{_myVersion.ToString(3)}).",
                 $"A newer proxy (v{proxyVer}) tried to re-claim this console. The shell is still available for you to use directly, but AI commands via MCP will no longer route here. Close the window when you're done.",
                 isReuse: true);
             Log($"Claim refused: proxy v{proxyVer} > worker v{_myVersion}. Marking obsolete.");
@@ -2969,7 +2969,7 @@ public class ConsoleWorker
 
     private static int GetProxyPidFromPipeName(string pipeName)
     {
-        // SP.{proxyPid}.{agentId}.{consolePid}
+        // RP.{proxyPid}.{agentId}.{consolePid}
         var parts = pipeName.Split('.');
         return parts.Length >= 2 && int.TryParse(parts[1], out var pid) ? pid : 0;
     }
@@ -3044,13 +3044,13 @@ public class ConsoleWorker
 
         if (proxyPid == null || agentId == null || shell == null)
         {
-            Console.Error.WriteLine("Usage: splash --console --proxy-pid <pid> --agent-id <id> --shell <shell> [--cwd <dir>]");
+            Console.Error.WriteLine("Usage: ripple --console --proxy-pid <pid> --agent-id <id> --shell <shell> [--cwd <dir>]");
             return 1;
         }
 
         cwd ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
-        // Pipe name: SP.{proxyPid}.{agentId}.{ownPid}
+        // Pipe name: RP.{proxyPid}.{agentId}.{ownPid}
         var ownPid = Environment.ProcessId;
         var pipeName = $"{ConsoleManager.PipePrefix}.{proxyPid}.{agentId}.{ownPid}";
 

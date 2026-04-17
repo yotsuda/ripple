@@ -1,4 +1,4 @@
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Platform-independent PTY session interface.

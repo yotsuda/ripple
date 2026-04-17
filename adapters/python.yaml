@@ -4,10 +4,10 @@ version: 0.1.0
 description: >
   CPython 3 interactive REPL with OSC 633 shell-integration-style command
   tracking. Emits OSC D / P / A from a sys.ps1 subclass whose __str__ is
-  re-evaluated by Python on every prompt render, which gives splash the
+  re-evaluated by Python on every prompt render, which gives ripple the
   same command-boundary observability it has for pwsh/bash/zsh without
   needing the regex-based escape hatch.
-homepage: https://github.com/yotsuda/splash
+homepage: https://github.com/yotsuda/ripple
 license: MIT
 family: repl
 aliases:
@@ -25,14 +25,14 @@ process:
     # Python 3.13 introduced pyrepl, a readline-style interactive editor
     # that re-renders the prompt on every keystroke and calls
     # str(sys.ps1) many times per input character. Both behaviors
-    # conflict with splash's OSC-based tracker (OSC D would fire
+    # conflict with ripple's OSC-based tracker (OSC D would fire
     # per-keystroke with meaningless positions, and deterministic input
     # echo stripping can't match re-rendered prompts). Force the old
     # basic REPL so sys.ps1 is evaluated exactly once per command
     # boundary, which is what our integration.py relies on.
     PYTHON_BASIC_REPL: "1"
     # Line-buffered stdout so command output is flushed before the next
-    # prompt renders (and before splash's OSC A fires on it). Without
+    # prompt renders (and before ripple's OSC A fires on it). Without
     # this, `print("x")` followed immediately by the next prompt can
     # race the tracker.
     PYTHONUNBUFFERED: "1"
@@ -59,7 +59,7 @@ init:
   hook_type: prompt_variable        # sys.ps1 replacement
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .py
   # {tempfile_path} gets substituted at runtime — just the absolute path,
   # no quoting dance because the command_template already wraps it.
@@ -97,16 +97,16 @@ input:
   # trailing blank line to close compound statements, so typing a
   # def/class/if/for block straight into the PTY only works with
   # line-by-line submission plus a manual terminator. Instead,
-  # multi-line command bodies are written to a .splash-exec-*.py
+  # multi-line command bodies are written to a .ripple-exec-*.py
   # tempfile and the single-line call below runs it in the REPL's
   # __main__ namespace (definitions leak out, cleanup via finally).
   multiline_detect: none
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .py
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.py"
-    invocation_template: '_splash_exec_file(r"{path}")'
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.py"
+    invocation_template: '_ripple_exec_file(r"{path}")'
   chunk_delay_ms: 0
 
 modes:
@@ -134,7 +134,7 @@ modes:
   # NOTE: this declaration is currently **declarative-only**. pdb's
   # input loop bypasses `sys.ps1`, so the integration script's OSC-
   # emitting prompt hook never fires for `(Pdb) `. An execute_command
-  # that triggers pdb.set_trace() times out because splash's tracker
+  # that triggers pdb.set_trace() times out because ripple's tracker
   # never sees an OSC A after the transition. Live verification of
   # auto_enter + level_capture runs against CCL's break loop instead
   # (ccl.yaml has the `modes: (error ...) enters break loop at level 1`
@@ -189,7 +189,7 @@ capabilities:
   shell_integration: osc633
   # Python's stdlib has no stable pre-input hook, so we can't emit OSC B
   # when a human starts typing. Leave user-busy detection off — the AI
-  # tracker still works because splash controls send_input directly.
+  # tracker still works because ripple controls send_input directly.
   user_busy_detection: none
 
 probe:
@@ -203,8 +203,8 @@ tests:
 
   - name: "stateful: variable persists across commands"
     setup_sequence:
-      - eval: "SPLASH_TEST = 'persist-ok'"
-    eval: "SPLASH_TEST"
+      - eval: "RIPPLE_TEST = 'persist-ok'"
+    eval: "RIPPLE_TEST"
     expect: 'persist-ok'
 
   - name: "cwd tracking: os.chdir reports via OSC P"

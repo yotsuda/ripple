@@ -2,12 +2,12 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
-using static Splash.Services.Win32Native;
+using static Ripple.Services.Win32Native;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
-/// Launches splash console worker processes with clean environment.
+/// Launches ripple console worker processes with clean environment.
 /// Uses Win32 CreateProcessW + CreateEnvironmentBlock (bInherit=false) to ensure
 /// the child process does NOT inherit the MCP server's environment variables.
 /// Equivalent to PowerShell.MCP's PwshLauncherWindows pattern.
@@ -59,28 +59,28 @@ public class ProcessLauncher
     private const uint CREATE_NEW_CONSOLE = 0x00000010;
 
     // STARTUPINFOW dwFlags / wShowWindow values used to spawn the
-    // worker console visible-but-inactive so a new splash shell
+    // worker console visible-but-inactive so a new ripple shell
     // doesn't steal keyboard focus from the editor or terminal the
     // user is currently working in. Without these, Windows spawns
     // CREATE_NEW_CONSOLE children as active foreground windows and
-    // any keystrokes the user types land in splash's shell until
+    // any keystrokes the user types land in ripple's shell until
     // they notice and re-focus their original window.
     private const uint STARTF_USESHOWWINDOW = 0x00000001;
     private const ushort SW_HIDE = 0;
     private const ushort SW_SHOWNOACTIVATE = 4;
 
     /// <summary>
-    /// Launch a splash console worker (--console mode) with clean environment.
+    /// Launch a ripple console worker (--console mode) with clean environment.
     /// The worker creates a PTY (ConPTY on Windows, forkpty on Linux/macOS),
     /// launches the shell, and serves commands via Named Pipe.
     ///
-    /// The worker constructs its pipe name as SP.{proxyPid}.{agentId}.{ownPid},
+    /// The worker constructs its pipe name as RP.{proxyPid}.{agentId}.{ownPid},
     /// matching the name the proxy constructs from the returned PID (same as PowerShell.MCP pattern).
     /// </summary>
     public int LaunchConsoleWorker(int proxyPid, string agentId, string shell, string? workingDirectory = null, string? banner = null, string? reason = null, bool noUserInput = false)
     {
         var exePath = Process.GetCurrentProcess().MainModule?.FileName
-            ?? throw new InvalidOperationException("Cannot determine splash executable path");
+            ?? throw new InvalidOperationException("Cannot determine ripple executable path");
 
         var cwd = workingDirectory ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
@@ -95,7 +95,7 @@ public class ProcessLauncher
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             // Hide the console window entirely for test workers. Normal
-            // splash usage shows the worker console (SW_SHOWNOACTIVATE)
+            // ripple usage shows the worker console (SW_SHOWNOACTIVATE)
             // because the user needs to see and interact with the shared
             // shell. During --adapter-tests there's no human in the loop:
             // hiding the window prevents the rapid window creation / focus
@@ -116,12 +116,12 @@ public class ProcessLauncher
     /// alacritty / kitty / foot on Linux).
     ///
     /// The worker PID must equal the value baked into the pipe name
-    /// SP.{proxyPid}.{agentId}.{workerPid}, but Process.Start on a terminal
-    /// emulator returns the emulator's PID, not the splash worker's.
+    /// RP.{proxyPid}.{agentId}.{workerPid}, but Process.Start on a terminal
+    /// emulator returns the emulator's PID, not the ripple worker's.
     ///
     /// Resolution: write a per-launch wrapper script that records its own
-    /// $$ to a handshake PID file before exec'ing splash. Because exec(3)
-    /// preserves the PID, the value in the file is the splash worker's
+    /// $$ to a handshake PID file before exec'ing ripple. Because exec(3)
+    /// preserves the PID, the value in the file is the ripple worker's
     /// actual PID. The proxy polls the file, reads the PID, and builds the
     /// same pipe name it would have on Windows — no protocol changes.
     /// </summary>
@@ -131,12 +131,12 @@ public class ProcessLauncher
         SweepStaleHandshakeFiles();
 
         var handshake = Guid.NewGuid().ToString("N");
-        var wrapperPath = $"/tmp/splash-launch-{handshake}.sh";
-        var pidFilePath = $"/tmp/splash-launch-{handshake}.pid";
+        var wrapperPath = $"/tmp/ripple-launch-{handshake}.sh";
+        var pidFilePath = $"/tmp/ripple-launch-{handshake}.pid";
 
-        // /tmp/splash-launch-<guid>.pid is written atomically via a .tmp +
+        // /tmp/ripple-launch-<guid>.pid is written atomically via a .tmp +
         // rename so the proxy never observes a half-written PID. exec
-        // replaces the shell with splash while preserving the PID already
+        // replaces the shell with ripple while preserving the PID already
         // written — that's the load-bearing guarantee of this design.
         var workerArgs = BuildWorkerArgs(exePath, proxyPid, agentId, shell, cwd);
         var wrapperContent =
@@ -189,7 +189,7 @@ public class ProcessLauncher
 
         try { File.Delete(wrapperPath); } catch { }
         throw new InvalidOperationException(
-            $"Timed out waiting for splash worker handshake ({pidFilePath}). " +
+            $"Timed out waiting for ripple worker handshake ({pidFilePath}). " +
             "The terminal emulator may have failed to start the wrapper script.");
     }
 
@@ -210,7 +210,7 @@ public class ProcessLauncher
         {
             // Terminal.app opens a new window and runs the argument as a
             // shell command. We pass the wrapper's path (short, no special
-            // chars — only /tmp/splash-launch-<hex>.sh), which is safe to
+            // chars — only /tmp/ripple-launch-<hex>.sh), which is safe to
             // embed in AppleScript. `activate` brings the window forward so
             // the user sees their new shell.
             var psi = new ProcessStartInfo
@@ -313,11 +313,11 @@ public class ProcessLauncher
     {
         // Handshake files from crashed launches leak into /tmp forever
         // without this — ConsoleWorker does the same for its *.log and
-        // .splash-exec-*.ps1 files. Best-effort, silent on error.
+        // .ripple-exec-*.ps1 files. Best-effort, silent on error.
         try
         {
             var cutoff = DateTime.UtcNow.AddHours(-1);
-            foreach (var pattern in new[] { "splash-launch-*.sh", "splash-launch-*.pid", "splash-launch-*.pid.tmp" })
+            foreach (var pattern in new[] { "ripple-launch-*.sh", "ripple-launch-*.pid", "ripple-launch-*.pid.tmp" })
             {
                 foreach (var p in Directory.EnumerateFiles("/tmp", pattern))
                 {
@@ -361,7 +361,7 @@ public class ProcessLauncher
             // the worker behind whatever the user is currently focused
             // on, so their editor / other terminal keeps keyboard focus
             // and the keystrokes they're already typing don't land in
-            // splash's shell. The console is still fully visible and
+            // ripple's shell. The console is still fully visible and
             // the user can click into it deliberately whenever they
             // want to inspect or interact with the shell.
             //

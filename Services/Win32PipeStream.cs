@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Stream wrapper that uses raw Win32 ReadFile/WriteFile for pipe handles.

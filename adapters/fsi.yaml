@@ -7,7 +7,7 @@ description: >
   expose a public API for replacing its prompt function — fsi.fs
   hardcodes "> " as the prompt and the only exposed interactive object
   (`fsi`) controls print width / depth but not the prompt string. So
-  this adapter uses splash's RegexPromptDetector instead of an
+  this adapter uses ripple's RegexPromptDetector instead of an
   injected OSC 633 emitter, exercising the schema's `prompt.strategy: regex`
   path for the first time. ;; is the F# Interactive command terminator.
 homepage: https://fsharp.org
@@ -59,7 +59,7 @@ init:
   hook_type: none
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .fsx
   init_invocation_template: '"{tempfile_path}"'
   script_resource: integration.fsx
@@ -87,13 +87,13 @@ input:
   line_ending: "\r"
   # F# Interactive uses ;; as the terminator for an evaluated
   # expression block. Without ;;, the REPL waits for more input.
-  # splash currently has no `terminator` value in multiline_detect,
-  # so we fall back to `none` and let splash send the user's command
-  # as-is — the splash convention is for the AI to include ;;
+  # ripple currently has no `terminator` value in multiline_detect,
+  # so we fall back to `none` and let ripple send the user's command
+  # as-is — the ripple convention is for the AI to include ;;
   # explicitly when it wants the input evaluated. This is the §18
   # schema gap the fsi adapter surfaces; a future schema bump might
   # add `multiline_detect: terminator` + `multiline_terminator: ";;"`
-  # so splash can auto-append.
+  # so ripple can auto-append.
   multiline_detect: none
   multiline_delivery: direct
   chunk_delay_ms: 0
@@ -135,8 +135,8 @@ tests:
 
   - name: "stateful: let-binding persists across commands"
     setup_sequence:
-      - eval: "let splashTest = \"persist-ok\";;"
-    eval: "splashTest;;"
+      - eval: "let rippleTest = \"persist-ok\";;"
+    eval: "rippleTest;;"
     expect: 'persist-ok'
 
   - name: "list expression with type inference"

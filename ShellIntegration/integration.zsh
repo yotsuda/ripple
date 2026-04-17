@@ -1,32 +1,32 @@
-# splash shell integration for zsh
+# ripple shell integration for zsh
 # Injects OSC 633 escape sequences for command lifecycle tracking.
-# Sourced automatically by splash console worker.
+# Sourced automatically by ripple console worker.
 
-if [[ "$__SPLASH_INJECTED" == "1" ]]; then
+if [[ "$__RIPPLE_INJECTED" == "1" ]]; then
     return
 fi
-__SPLASH_INJECTED=1
+__RIPPLE_INJECTED=1
 
-__sp_osc() {
+__rp_osc() {
     printf '\e]633;%s\a' "$1"
 }
 
 # precmd hook: runs before each prompt
-__sp_precmd() {
+__rp_precmd() {
     local exit_code=$?
-    __sp_osc "D;$exit_code"
-    __sp_osc "P;Cwd=$(pwd)"
-    __sp_osc "A"
+    __rp_osc "D;$exit_code"
+    __rp_osc "P;Cwd=$(pwd)"
+    __rp_osc "A"
 }
 
 # preexec hook: runs before command execution
-__sp_preexec() {
-    __sp_osc "C"
+__rp_preexec() {
+    __rp_osc "C"
 }
 
 autoload -Uz add-zsh-hook
-add-zsh-hook precmd __sp_precmd
-add-zsh-hook preexec __sp_preexec
+add-zsh-hook precmd __rp_precmd
+add-zsh-hook preexec __rp_preexec
 
 # Initial marker
-__sp_osc "B"
+__rp_osc "B"

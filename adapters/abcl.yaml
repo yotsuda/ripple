@@ -36,13 +36,13 @@ process:
   #
   # %LOCALAPPDATA% is expanded by the worker's ExpandTemplate at
   # launch time. The ABCL 1.9.2 binary distribution must be unzipped
-  # to %LOCALAPPDATA%\splash-deps\abcl-bin-1.9.2\ — user-local so
+  # to %LOCALAPPDATA%\ripple-deps\abcl-bin-1.9.2\ — user-local so
   # the adapter works without admin, and outside %USERPROFILE% so
   # AppLocker's user-dir PE block (which only applies to actual
   # executables under ConPTY CreateProcessW) doesn't come into play
   # because the only executable is java.exe.
   executable: java
-  command_template: '"{shell_path}" --add-opens java.base/java.lang=ALL-UNNAMED -jar %LOCALAPPDATA%\splash-deps\abcl-bin-1.9.2\abcl.jar --noinit --noinform --load {init_invocation}'
+  command_template: '"{shell_path}" --add-opens java.base/java.lang=ALL-UNNAMED -jar %LOCALAPPDATA%\ripple-deps\abcl-bin-1.9.2\abcl.jar --noinit --noinform --load {init_invocation}'
   inherit_environment: true
   encoding: utf-8
   # ABCL's interactive reader on Windows treats \r as Enter via
@@ -55,7 +55,7 @@ ready:
   timeout_ms: 0
   # JVM cold start + ABCL heap image + integration load ≈ 2–3 s on
   # this box. No artificial settle needed after the first prompt
-  # fires — the OSC A from splash-print-prompt is the definitive
+  # fires — the OSC A from ripple-print-prompt is the definitive
   # "ready" signal.
   settle_before_inject_ms: 0
   suppress_mirror_during_inject: false
@@ -67,7 +67,7 @@ init:
   hook_type: prompt_variable        # top-level::*repl-prompt-fun*
   delivery: launch_command
   tempfile:
-    prefix: .splash-integration-
+    prefix: .ripple-integration-
     extension: .lisp
   init_invocation_template: '"{tempfile_path}"'
   script_resource: integration.abcl.lisp
@@ -107,10 +107,10 @@ input:
     # Matches ccl.yaml.
   multiline_delivery: tempfile
   tempfile:
-    prefix: .splash-exec-
+    prefix: .ripple-exec-
     extension: .lisp
-    path_template: "{temp_dir}/.splash-exec-{pid}-{guid}.lisp"
-    invocation_template: '(splash-exec-file "{path}")'
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.lisp"
+    invocation_template: '(ripple-exec-file "{path}")'
   chunk_delay_ms: 0
 
 modes:
@@ -167,8 +167,8 @@ tests:
 
   - name: "stateful: defparameter persists across commands"
     setup_sequence:
-      - eval: "(defparameter *splash-test* 'persist-ok)"
-    eval: "*splash-test*"
+      - eval: "(defparameter *ripple-test* 'persist-ok)"
+    eval: "*ripple-test*"
     expect: 'PERSIST-OK'
 
   - name: "reader macro: block comment #| |# ignored"

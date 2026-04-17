@@ -1,6 +1,6 @@
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// Tests for the pure helper methods on ConsoleManager — drift detection,
@@ -40,7 +40,7 @@ public class ConsoleManagerTests
         if (OperatingSystem.IsWindows())
         {
             Assert(!ConsoleManager.IsCwdDrifted(@"C:\Foo", @"c:\foo"), "Windows: case-insensitive path match");
-            Assert(!ConsoleManager.IsCwdDrifted(@"C:\MyProj\splash", @"C:\myproj\SPLASH"), "Windows: mixed case matches");
+            Assert(!ConsoleManager.IsCwdDrifted(@"C:\MyProj\ripple", @"C:\myproj\RIPPLE"), "Windows: mixed case matches");
         }
 
         // IsCwdDrifted — POSIX-style paths (bash on WSL reports /mnt/c/... )

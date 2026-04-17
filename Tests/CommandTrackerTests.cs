@@ -1,6 +1,6 @@
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// Unit tests for CommandTracker.Busy semantics — in particular, that user-initiated
@@ -159,16 +159,16 @@ public class CommandTrackerTests
             // Now simulate the real command actually running, which will
             // deliver OSC C + output + OSC D + OSC A in proper order.
             t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
-            t.FeedOutput("C:\\MyProj\\splashshell\n");
+            t.FeedOutput("C:\\MyProj\\rippleshell\n");
             t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
-            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\MyProj\\splashshell"));
+            t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\MyProj\\rippleshell"));
             t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
 
             Assert(task.IsCompleted, "real OSC C/D/A resolves the task");
             var result = task.Result;
             Assert(!result.Output.Contains("Reason"), "reason banner is NOT in captured output");
-            Assert(result.Output.Contains("C:\\MyProj\\splashshell"), "real command output is captured");
-            Assert(result.Cwd == "C:\\MyProj\\splashshell", "post-command cwd is reported");
+            Assert(result.Output.Contains("C:\\MyProj\\rippleshell"), "real command output is captured");
+            Assert(result.Cwd == "C:\\MyProj\\rippleshell", "post-command cwd is reported");
         }
 
         // Test 9: recent-output ring buffer captures output from AI commands,

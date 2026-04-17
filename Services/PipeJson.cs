@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// AOT-safe JSON helpers for the pipe protocol. Uses Utf8JsonWriter for writes and

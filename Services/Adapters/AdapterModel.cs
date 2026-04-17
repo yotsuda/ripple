@@ -1,7 +1,7 @@
-namespace Splash.Services.Adapters;
+namespace Ripple.Services.Adapters;
 
 /// <summary>
-/// In-memory representation of a splash adapter YAML (schema v1).
+/// In-memory representation of a ripple adapter YAML (schema v1).
 /// Mirrors adapters/SCHEMA.md. Optional sections are nullable.
 ///
 /// This is the data model only — loading is in AdapterLoader,
@@ -249,7 +249,7 @@ public class InputSpec
     /// command payload, to clear whatever the user may have typed
     /// into the current prompt's line-editor buffer. Without this,
     /// user keystrokes accumulated while the console window had
-    /// focus (e.g. the user accidentally typed into splash's window
+    /// focus (e.g. the user accidentally typed into ripple's window
     /// after a fresh spawn stole focus from their editor) would be
     /// prepended to the AI command and both would submit together
     /// as one garbled line.
@@ -264,7 +264,7 @@ public class InputSpec
     /// raw bytes straight to the parser, which rejects
     /// <c>U+0001</c> as an invalid non-printable character. Empirical
     /// verification per adapter is the only way to know what's
-    /// safe: walk the adapter in splash, type into its console
+    /// safe: walk the adapter in ripple, type into its console
     /// window, run execute_command, and confirm the clear bytes
     /// wipe the buffer without syntax errors.
     ///
@@ -500,12 +500,12 @@ public class CapabilitiesSpec
     ///
     /// <c>windows_native</c> — Windows-style absolute paths
     /// (<c>C:\foo</c>). These can be handed to CreateProcess's
-    /// <c>lpCurrentDirectory</c> parameter directly, so splash can
+    /// <c>lpCurrentDirectory</c> parameter directly, so ripple can
     /// spawn a replacement console straight into a cached dead-cwd.
     /// pwsh / powershell / cmd / python-on-Windows / node-on-Windows.
     ///
     /// <c>posix</c> — POSIX paths (<c>/mnt/c/foo</c>, <c>/home/u</c>).
-    /// Not valid as a Win32 working directory. splash injects a
+    /// Not valid as a Win32 working directory. ripple injects a
     /// <c>cd</c> preamble at the command level instead. bash / zsh
     /// under WSL, MSYS2, Git Bash.
     ///

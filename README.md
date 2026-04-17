@@ -1,4 +1,4 @@
-# splash
+# ripple
 
 <div align="center">
   <img src="https://github.com/user-attachments/assets/1343f694-1c05-4899-9faa-d2b1138aa3ba" alt="social-image" width="640" />
@@ -6,14 +6,14 @@
 
 **A shell MCP server for AI that actually holds a session.** Load `Import-Module Az` once and let AI run 50 follow-up cmdlets in milliseconds each. Watch every command happen in a real terminal window — the same one you can type into yourself.
 
-> **Renamed from `splashshell`.** Previously published on npm as [`splashshell`](https://www.npmjs.com/package/splashshell) (v0.1.0 – v0.5.0); starting with v0.7.0 the package lives at [`@ytsuda/splash`](https://www.npmjs.com/package/@ytsuda/splash). `splashshell` is deprecated — uninstall it and install `@ytsuda/splash` to keep receiving updates. This repository was also renamed from `yotsuda/splashshell` to `yotsuda/splash`; GitHub redirects old clone URLs automatically.
+> **Renamed from `rippleshell`.** Previously published on npm as [`rippleshell`](https://www.npmjs.com/package/rippleshell) (v0.1.0 – v0.5.0); starting with v0.7.0 the package lives at [`@ytsuda/ripple`](https://www.npmjs.com/package/@ytsuda/ripple). `rippleshell` is deprecated — uninstall it and install `@ytsuda/ripple` to keep receiving updates. This repository was also renamed from `yotsuda/rippleshell` to `yotsuda/ripple`; GitHub redirects old clone URLs automatically.
 
 ## Install
 
-No runtime prerequisite — splash ships as a self-contained NativeAOT binary (~13 MB, Windows x64). `npx` fetches it on first run.
+No runtime prerequisite — ripple ships as a self-contained NativeAOT binary (~13 MB, Windows x64). `npx` fetches it on first run.
 
 ```bash
-claude mcp add-json splash -s user '{"command":"npx","args":["-y","@ytsuda/splash@latest"]}'
+claude mcp add-json ripple -s user '{"command":"npx","args":["-y","@ytsuda/ripple@latest"]}'
 ```
 
 <details>
@@ -24,9 +24,9 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "splash": {
+    "ripple": {
       "command": "npx",
-      "args": ["-y", "@ytsuda/splash@latest"]
+      "args": ["-y", "@ytsuda/ripple@latest"]
     }
   }
 }
@@ -36,16 +36,16 @@ The `@latest` tag is important: without it, npx will happily keep reusing a stal
 
 </details>
 
-## Why splash?
+## Why ripple?
 
-Other shell MCP servers are either **stateless** (fresh subshell per command, nothing persists) or **headless** (persistent PTY, but invisible to you). splash is neither — and that unlocks things the others can't do.
+Other shell MCP servers are either **stateless** (fresh subshell per command, nothing persists) or **headless** (persistent PTY, but invisible to you). ripple is neither — and that unlocks things the others can't do.
 
 ### PowerShell becomes a first-class AI environment
 
 Session persistence helps every shell, but for **PowerShell it's transformative**. Most MCP shell servers spin up a fresh subshell per command — which makes real PowerShell workflows impractical:
 
 - **10,000+ modules on [PowerShell Gallery](https://www.powershellgallery.com/).** Az (Azure), AWS.Tools, Microsoft.Graph (Entra ID / M365), ExchangeOnlineManagement, PnP.PowerShell, SqlServer, ActiveDirectory — plus every CLI in PATH (git, docker, kubectl, terraform, gh, az, aws, gcloud) and full access to .NET types.
-- **30–70 second cold imports, paid once.** `Import-Module Az.Compute, Az.Storage, Az.Network` can take over a minute on the first call. A subshell-per-command MCP server pays that cost on *every* command and the AI gives up on Azure workflows entirely. With splash, the AI imports once and every subsequent cmdlet runs in milliseconds.
+- **30–70 second cold imports, paid once.** `Import-Module Az.Compute, Az.Storage, Az.Network` can take over a minute on the first call. A subshell-per-command MCP server pays that cost on *every* command and the AI gives up on Azure workflows entirely. With ripple, the AI imports once and every subsequent cmdlet runs in milliseconds.
 - **Live .NET object graphs.** PowerShell pipes rich objects, not text. After `$vms = Get-AzVM -Status`, the AI can chain arbitrary follow-ups against the live object — filter, group, drill into nested properties — without re-hitting Azure. In a one-shot MCP server, that object vanishes the moment the command returns.
 - **Interactive build-up of complex work.** Set a variable, inspect it, reshape it, feed it back into the next cmdlet. Build a multi-step workflow one command at a time with every previous step's result still in scope.
 
@@ -64,11 +64,11 @@ $vms | Where-Object PowerState -eq "VM running" |
 Get-AzStorageAccount | Where-Object { -not $_.EnableHttpsTrafficOnly }
 ```
 
-PowerShell on splash is the difference between **"AI can answer one-off questions"** and **"AI can do real infrastructure work."** bash and cmd are fully supported too, but pwsh is where splash shines.
+PowerShell on ripple is the difference between **"AI can answer one-off questions"** and **"AI can do real infrastructure work."** bash and cmd are fully supported too, but pwsh is where ripple shines.
 
 ### Full transparency, in both directions
 
-splash opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
+ripple opens a **real, visible terminal window**. You see every AI command as it runs — same characters, same output, same prompt — and you can type into the same window yourself at any time. When a command hangs on an interactive prompt, stalls in watch mode, or just needs a Ctrl+C, the AI can read what's currently on the screen and send keystrokes (Enter, y/n, arrow keys, Ctrl+C) back to the running command — diagnosing and responding without human intervention.
 
 ## Tools
 
@@ -94,11 +94,11 @@ Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`
 
 ## REPL support
 
-On top of the four shells (pwsh/powershell, bash, zsh, cmd), splash ships adapters for eleven REPLs — **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+On top of the four shells (pwsh/powershell, bash, zsh, cmd), ripple ships adapters for eleven REPLs — **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
 
 Debugger adapters are a new `family: debugger` class: they expose the regular session contract *plus* a structured `commands.debugger` vocabulary (step_in / step_over / step_out / continue / print / dump / backtrace / source_list / locals / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s` (perldb), `step` (jdb), or `s` (pdb).
 
-All eighteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.splash/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
+All eighteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.ripple/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
 
 ## Multi-shell behavior
 
@@ -122,7 +122,7 @@ Other niceties: **console re-claim** — consoles outlive their parent MCP proce
 
 ## How it works
 
-splash runs as a stdio MCP server. When the AI calls `start_console`, splash spawns itself in `--console` mode as a ConPTY worker, which hosts the actual shell (cmd.exe, pwsh.exe, bash.exe) inside a real Windows console window. The parent process streams stdin/stdout over a named pipe, injects [OSC 633 shell integration](https://code.visualstudio.com/docs/terminal/shell-integration) scripts (the same protocol VS Code uses) to emit explicit command-lifecycle markers, and parses those markers to delimit command output, track cwd, and capture exit codes — no output-silence heuristics, no prompt-string detection.
+ripple runs as a stdio MCP server. When the AI calls `start_console`, ripple spawns itself in `--console` mode as a ConPTY worker, which hosts the actual shell (cmd.exe, pwsh.exe, bash.exe) inside a real Windows console window. The parent process streams stdin/stdout over a named pipe, injects [OSC 633 shell integration](https://code.visualstudio.com/docs/terminal/shell-integration) scripts (the same protocol VS Code uses) to emit explicit command-lifecycle markers, and parses those markers to delimit command output, track cwd, and capture exit codes — no output-silence heuristics, no prompt-string detection.
 
 <details>
 <summary>Architecture diagram</summary>
@@ -131,12 +131,12 @@ splash runs as a stdio MCP server. When the AI calls `start_console`, splash spa
 graph TB
     Client["MCP Client<br/>(Claude Code, etc.)"]
 
-    subgraph Proxy["splash proxy (stdio MCP server)"]
+    subgraph Proxy["ripple proxy (stdio MCP server)"]
         CM["Console Manager<br/>(cwd tracking, re-claim,<br/>cache drain, switching)"]
         Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>peek_console / send_input<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
     end
 
-    subgraph Consoles["Visible Console Windows (each runs splash --console)"]
+    subgraph Consoles["Visible Console Windows (each runs ripple --console)"]
         subgraph C1["#9876 Sapphire (bash)"]
             PTY1["ConPTY + bash<br/>(+ OSC 633)"]
         end
@@ -164,12 +164,12 @@ graph TB
 ### Build from source
 
 ```bash
-git clone https://github.com/yotsuda/splash.git
-cd splash
+git clone https://github.com/yotsuda/ripple.git
+cd ripple
 dotnet publish -c Release -r win-x64 -o ./dist
 ```
 
-The csproj has `PublishAot=true`, so the published binary is a NativeAOT single-exe with no .NET runtime dependency. The binary is `./dist/splash.exe` (~13 MB) — use the absolute path instead of the `npx` command in your MCP config.
+The csproj has `PublishAot=true`, so the published binary is a NativeAOT single-exe with no .NET runtime dependency. The binary is `./dist/ripple.exe` (~13 MB) — use the absolute path instead of the `npx` command in your MCP config.
 
 ## Platform support
 

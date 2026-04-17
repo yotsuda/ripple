@@ -122,8 +122,8 @@ tests:
 
   - name: "state: const persists across commands"
     setup_sequence:
-      - eval: "const splashTest = 100"
-    eval: "splashTest + 1"
+      - eval: "const rippleTest = 100"
+    eval: "rippleTest + 1"
     expect: '^101$'
 
   - name: "top-level await resolves"

@@ -24,7 +24,7 @@ ready:
 init:
   strategy: shell_integration
   hook_type: preexec
-  # rc_file delivery: splash writes integration.zsh as .zshrc into a
+  # rc_file delivery: ripple writes integration.zsh as .zshrc into a
   # per-worker temp dir and exports ZDOTDIR into the child environment
   # before CreateProcess. zsh reads $ZDOTDIR/.zshrc as part of its own
   # startup, so the precmd / preexec hooks are registered by the time
@@ -66,7 +66,7 @@ input:
   # without requiring `bindkey -e`, with Ctrl-A bound to
   # beginning-of-line and Ctrl-K bound to kill-line. Sending
   # "\x01\x0b" before each AI command wipes any keystrokes the
-  # user typed into splash's window while it was focused;
+  # user typed into ripple's window while it was focused;
   # no-op on an empty buffer. Users who have explicitly run
   # `bindkey -v` (vi-mode) see the bytes as keystroke sequences
   # that are harmless but may surprise them — documented caveat.

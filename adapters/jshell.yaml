@@ -67,11 +67,11 @@ output:
 input:
   line_ending: "\r"
   # jshell's tolerant parser handles multi-line input directly: if
-  # splash writes a multi-line block (e.g. a method definition) all
+  # ripple writes a multi-line block (e.g. a method definition) all
   # at once, jshell reads each line, sees the continuation state,
   # and waits for the closing brace before evaluating. Schema-wise
   # this is `prompt_based` (continuation prompt would be the
-  # detection signal), but splash's current runtime does not consume
+  # detection signal), but ripple's current runtime does not consume
   # multiline_detect at all — multi-line bodies just stream through
   # as `direct` delivery and jshell takes care of buffering. The
   # field is declared aspirationally so a future runtime that
@@ -117,13 +117,13 @@ tests:
 
   - name: "stateful: variable persists across commands"
     setup_sequence:
-      - eval: "int splashTest = 42;"
-    eval: "splashTest"
-    expect: 'splashTest ==> 42'
+      - eval: "int rippleTest = 42;"
+    eval: "rippleTest"
+    expect: 'rippleTest ==> 42'
 
   - name: "string concatenation with type inference"
-    eval: '"hello, " + "splash"'
-    expect: '"hello, splash"'
+    eval: '"hello, " + "ripple"'
+    expect: '"hello, ripple"'
 
   - name: "list/array expression returns typed result"
     eval: 'java.util.stream.IntStream.rangeClosed(1, 5).sum()'

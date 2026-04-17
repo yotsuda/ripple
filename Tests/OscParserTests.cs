@@ -1,6 +1,6 @@
-using Splash.Services;
+using Ripple.Services;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 public class OscParserTests
 {

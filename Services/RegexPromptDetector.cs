@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.RegularExpressions;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Detects REPL prompt boundaries by regex matching on the cleaned PTY
@@ -160,7 +160,7 @@ public sealed class RegexPromptDetector
             // to a prompt and, because they're NOT `ESC [` (CSI), the CSI
             // loop below would leave them intact, pushing real content off
             // column 1 and breaking `^` anchoring for the adapter's prompt
-            // regex. Strip them entirely — splash's visible-console title
+            // regex. Strip them entirely — ripple's visible-console title
             // is managed separately via ConsoleWorker's _desiredTitle path,
             // so dropping OSC from the regex detector's view doesn't lose
             // any user-facing behaviour.

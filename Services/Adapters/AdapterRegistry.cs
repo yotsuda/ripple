@@ -1,4 +1,4 @@
-namespace Splash.Services.Adapters;
+namespace Ripple.Services.Adapters;
 
 /// <summary>
 /// Immutable in-memory registry of loaded adapters, keyed by canonical name
@@ -28,18 +28,18 @@ public sealed class AdapterRegistry
     }
 
     /// <summary>
-    /// Default external adapter directory: ~/.splash/adapters. User-dropped
+    /// Default external adapter directory: ~/.ripple/adapters. User-dropped
     /// YAMLs here override embedded adapters of the same name, so a user
-    /// iterating on a local adapter doesn't need to rebuild splash.
+    /// iterating on a local adapter doesn't need to rebuild ripple.
     /// </summary>
     public static string DefaultExternalDirectory =>
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".splash",
+            ".ripple",
             "adapters");
 
     /// <summary>
-    /// Load all adapters shipped with the splash binary. Parse errors for
+    /// Load all adapters shipped with the ripple binary. Parse errors for
     /// individual adapters are surfaced via the returned LoadReport, not
     /// thrown.
     /// </summary>

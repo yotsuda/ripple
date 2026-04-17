@@ -1,9 +1,9 @@
 ﻿using System.Diagnostics;
 using System.Text.RegularExpressions;
-using Splash.Services;
-using Splash.Services.Adapters;
+using Ripple.Services;
+using Ripple.Services.Adapters;
 
-namespace Splash.Tests;
+namespace Ripple.Tests;
 
 /// <summary>
 /// Runs each loaded adapter's tests: block against a real worker.
@@ -11,12 +11,12 @@ namespace Splash.Tests;
 /// The point is two-fold:
 ///
 /// 1. Adapter authors (including community contributors via
-///    ~/.splash/adapters/ in Phase C milestone 1) can declare
+///    ~/.ripple/adapters/ in Phase C milestone 1) can declare
 ///    tests: blocks in YAML alongside their adapter and run them
-///    via `splash.exe --test --e2e` to confirm the adapter actually
+///    via `ripple.exe --test --e2e` to confirm the adapter actually
 ///    works end-to-end, without writing any C#.
 ///
-/// 2. splash gets a generic quality gate: every adapter that ships
+/// 2. ripple gets a generic quality gate: every adapter that ships
 ///    with the binary has its tests: block exercised on every CI
 ///    run, so a regression in either the adapter YAML or the
 ///    shared framework code (BuildCommandLine, env block, OSC
@@ -102,7 +102,7 @@ public static class AdapterDeclaredTestsRunner
             return (false, true);
         }
 
-        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+        var pipeName = $"RP.{proxyPid}.{agentId}.{workerPid}";
 
         try
         {
@@ -217,7 +217,7 @@ public static class AdapterDeclaredTestsRunner
             return (pass, fail);
         }
 
-        var pipeName = $"SP.{proxyPid}.{agentId}.{workerPid}";
+        var pipeName = $"RP.{proxyPid}.{agentId}.{workerPid}";
 
         try
         {

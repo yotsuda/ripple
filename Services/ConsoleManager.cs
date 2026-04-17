@@ -4,19 +4,19 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
-using Splash.Services.Adapters;
+using Ripple.Services.Adapters;
 
-namespace Splash.Services;
+namespace Ripple.Services;
 
 /// <summary>
 /// Manages shell console processes via Named Pipe discovery.
-/// Pipe naming: SP.{proxyPid}.{agentId}.{consolePid} (owned) / SP.{consolePid} (unowned)
+/// Pipe naming: RP.{proxyPid}.{agentId}.{consolePid} (owned) / RP.{consolePid} (unowned)
 /// Category naming: each proxy instance gets a unique category (Animals, Gems, etc.)
 /// and assigns names from that category to consoles.
 /// </summary>
 public class ConsoleManager
 {
-    public const string PipePrefix = "SP";
+    public const string PipePrefix = "RP";
 
     private readonly ProcessLauncher _launcher;
     private readonly object _lock = new();
@@ -39,8 +39,8 @@ public class ConsoleManager
         (typeof(ConsoleManager).Assembly.GetName().Version ?? new Version(0, 0)).ToString(3);
 
     // Shared memory for category allocation (same pattern as PowerShell.MCP)
-    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "Splash.AllocatedConsoleCategories.dat");
-    private const string MutexName = "Splash.AllocatedConsoleCategories";
+    private static readonly string SharedMemoryFile = Path.Combine(Path.GetTempPath(), "Ripple.AllocatedConsoleCategories.dat");
+    private const string MutexName = "Ripple.AllocatedConsoleCategories";
     private const int MaxEntries = 64;
     private const int EntrySize = 8;        // 4 bytes PID + 4 bytes category index
     private const int HeaderSize = 8;       // 4 bytes magic + 4 bytes count
@@ -260,7 +260,7 @@ public class ConsoleManager
             }
         }
 
-        // Launch splash.exe --console mode with ConPTY.
+        // Launch ripple.exe --console mode with ConPTY.
         // Banner/reason passed as CLI args so the worker can display them before the first prompt.
         int pid = _launcher.LaunchConsoleWorker(ProxyPid, agentId, resolvedShell, cwd, banner, reason);
 
@@ -304,7 +304,7 @@ public class ConsoleManager
         // tool-call window. Callers that ask for longer get a clean
         // preemptive-timeout response at 170s and can keep polling
         // via wait_for_completion. 0 is the "interactive" sentinel —
-        // splash flips to cache mode as soon as the pipeline is on the
+        // ripple flips to cache mode as soon as the pipeline is on the
         // PTY so execute_command returns immediately and the drain
         // wrapper salvages the result on the next tool call.
         timeoutSeconds = Math.Clamp(timeoutSeconds, 0, MaxExecuteTimeoutSeconds);
@@ -550,7 +550,7 @@ public class ConsoleManager
 
         // Out-of-band notice attached to the success result, used when we
         // silently corrected for a user-initiated cwd change in the source
-        // console so the AI sees what splash did on its behalf.
+        // console so the AI sees what ripple did on its behalf.
         string? routingNotice = null;
 
         if (isSwitching && sourceCwd != null && sameShellFamily)
@@ -790,7 +790,7 @@ public class ConsoleManager
                     Pid = consolePid,
                     Switched = true,
                     DisplayName = deadName,
-                    Output = $"Console {deadName} exited (shell process gone). Pipeline NOT executed — re-execute and splash will spin up a fresh console if needed.",
+                    Output = $"Console {deadName} exited (shell process gone). Pipeline NOT executed — re-execute and ripple will spin up a fresh console if needed.",
                 };
             }
 
@@ -881,7 +881,7 @@ public class ConsoleManager
                 Pid = consolePid,
                 Switched = true,
                 DisplayName = deadName,
-                Output = $"Console {deadName} died (pipe broken). Pipeline NOT executed — re-execute and splash will spin up a fresh console.",
+                Output = $"Console {deadName} died (pipe broken). Pipeline NOT executed — re-execute and ripple will spin up a fresh console.",
             };
         }
     }
@@ -1587,7 +1587,7 @@ public class ConsoleManager
                 // AI command's text and would otherwise leak across into
                 // a user busy line as a stale label. When the worker IS
                 // running an AI command, prefer LastAiCommand (it's the
-                // clean original without any cd preamble splash injected),
+                // clean original without any cd preamble ripple injected),
                 // falling back to the worker's text if the proxy never
                 // recorded one.
                 var workerRunning = statusResp.TryGetProperty("runningCommand", out var rc)
@@ -1784,9 +1784,9 @@ public class ConsoleManager
     // --- Pipe enumeration ---
 
     /// <summary>
-    /// Enumerates splash Named Pipes.
+    /// Enumerates ripple Named Pipes.
     /// Windows: \\.\pipe\SP.*
-    /// Linux/macOS: /tmp/CoreFxPipe_SP.*
+    /// Linux/macOS: /tmp/CoreFxPipe_RP.*
     /// </summary>
     public IEnumerable<string> EnumeratePipes(int? proxyPid = null, string? agentId = null)
     {
@@ -1837,7 +1837,7 @@ public class ConsoleManager
 
     /// <summary>
     /// Enumerate unowned pipes — those whose original proxy has exited.
-    /// Format: SP.{consolePid} (2 segments) vs owned SP.{proxyPid}.{agentId}.{consolePid} (4 segments).
+    /// Format: RP.{consolePid} (2 segments) vs owned RP.{proxyPid}.{agentId}.{consolePid} (4 segments).
     /// </summary>
     public IEnumerable<string> EnumerateUnownedPipes()
     {
