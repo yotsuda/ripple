@@ -8,7 +8,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>ripple</AssemblyName>
     <RootNamespace>Ripple</RootNamespace>
-    <Version>0.8.0</Version>
+    <Version>0.9.0</Version>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>

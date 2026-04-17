@@ -1,6 +1,6 @@
 {
   "name": "@ytsuda/ripple",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "REPL-sharing MCP server — AI and human work in the same live terminal. 18 embedded adapters: shells (bash, pwsh, zsh, cmd), REPLs (python, node, fsi, jshell, groovysh, racket, ccl, abcl, lua, deno, sqlite3), and debuggers (perldb, jdb, pdb). Real-time command visibility, session persistence, multi-console routing.",
   "license": "MIT",
   "author": "Yoshifumi Tsuda",
