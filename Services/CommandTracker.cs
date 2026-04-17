@@ -38,8 +38,19 @@ public class CommandTracker
     // SGR (Select Graphic Rendition, ending in 'm') so color information is
     // passed through to the AI for context (e.g. red errors, green success).
     // OSC sequences (window title etc.) are also stripped.
+    //
+    // Alternatives covered:
+    //   \x1b[...letter       — CSI sequences (cursor, erase, SGR "m" preserved)
+    //   \x1b]...\x07         — OSC with BEL terminator
+    //   \x1b]...\x1b\        — OSC with ST terminator
+    //   \x1b[()][0-9A-B]     — Character set designation (G0/G1)
+    //   \x1b[=>]             — DECKPAM / DECKPNM keypad mode (PSReadLine emits
+    //                          these around prompt redraws; leaving them through
+    //                          makes the ESC byte invisible and the trailing
+    //                          '=' or '>' look like a stray char at the start
+    //                          or end of captured output).
     private static readonly Regex AnsiRegex = new(
-        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]",
+        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]|\x1b[=>]",
         RegexOptions.Compiled);
 
 
