@@ -2,6 +2,7 @@
 using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
 using Splash.Services.Adapters;
@@ -351,6 +352,23 @@ public class ConsoleWorker
         var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var readTask = ReadOutputLoop(readCts.Token);
 
+        // Start user-input forwarding immediately — before shell integration
+        // loading, before WaitForReady. Early start is critical on Unix:
+        // PSReadLine (pwsh) fires DSR during its own startup sync, BEFORE the
+        // first OSC A that WaitForReady gates on. The outer terminal emulator
+        // answers DSR with the real cursor position, and that reply has to
+        // reach the shell for PSReadLine to continue. If input forwarding
+        // starts after WaitForReady the reply sits in splash's stdin buffer
+        // long enough that PSReadLine either times out on DSR wait
+        // (degraded-mode rendering — wrong cursor row) or consumes the
+        // buffered reply as typed characters once forwarding catches up
+        // (garbage in the command line). Forwarding from t=0 keeps the
+        // byte relay bidirectional for every sequence the shell and the
+        // outer terminal exchange during startup handshake. Windows is
+        // unaffected: ConPTY is its own terminal emulator so the outer /
+        // inner distinction doesn't exist there.
+        var inputTask = InputForwardLoop(ct);
+
         // Watch the child shell process. ConPTY does NOT close the output
         // pipe when the child exits, so ReadOutputLoop's blocking Read
         // would sit waiting forever if we relied on EOF. Instead wait on
@@ -448,9 +466,6 @@ public class ConsoleWorker
         }
 
         Log($"Shell ready, pipe={_pipeName}");
-
-        // Start forwarding user's keyboard input from visible console to ConPTY
-        var inputTask = InputForwardLoop(ct);
 
         // Monitor visible console window resizes and propagate to ConPTY
         var resizeTask = ResizeMonitorLoop(ct);
@@ -1267,10 +1282,19 @@ public class ConsoleWorker
     }
 
     /// <summary>
-    /// Forward user keyboard input from the worker's visible console to the ConPTY input pipe.
+    /// Forward user keyboard input from the worker's visible console to the PTY input pipe.
     /// When AI is executing a command (CommandTracker.Busy), input is held until the command completes.
+    /// Dispatches to the Windows or Unix implementation — stdin acquisition and raw-mode handling
+    /// differ enough between ConPTY + Win32 console and forkpty + termios that a single code path
+    /// would be unreadable.
     /// </summary>
     private Task InputForwardLoop(CancellationToken ct)
+    {
+        if (OperatingSystem.IsWindows()) return InputForwardLoopWindows(ct);
+        return InputForwardLoopUnix(ct);
+    }
+
+    private Task InputForwardLoopWindows(CancellationToken ct)
     {
         if (!OperatingSystem.IsWindows()) return Task.CompletedTask;
 
@@ -1351,6 +1375,122 @@ public class ConsoleWorker
         });
         thread.IsBackground = true;
         thread.Name = "Console-Input";
+        thread.Start();
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// Unix equivalent of InputForwardLoopWindows: read keystrokes the human typed
+    /// into the worker's visible terminal (our stdin fd 0), and forward them to the
+    /// forkpty master so the hosted shell receives them.
+    ///
+    /// Raw mode is critical — without it the kernel tty driver cooks input
+    /// (line-buffered until Enter, local echo, ^C → SIGINT), which would prevent
+    /// bash's readline from seeing arrow keys / tab / Ctrl-shortcuts and would
+    /// double-echo every keystroke (once locally, once from readline). We
+    /// snapshot the original termios, cfmakeraw() a copy, install it, and
+    /// restore the snapshot on worker exit.
+    ///
+    /// If stdin isn't a tty (proxy mode with a piped stdin, --test harness,
+    /// smoke tests), we skip raw mode and the loop falls through immediately;
+    /// the loop is harmless to start even when no human will ever type.
+    /// </summary>
+    [UnsupportedOSPlatform("windows")]
+    private Task InputForwardLoopUnix(CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource();
+        var thread = new Thread(() =>
+        {
+            IntPtr saved = IntPtr.Zero;
+            IntPtr modified = IntPtr.Zero;
+            bool rawInstalled = false;
+            try
+            {
+                if (UnixPty.IsATty(0) != 1)
+                {
+                    // Proxy mode / tests: stdin is a pipe, no user typing to forward.
+                    return;
+                }
+
+                saved = Marshal.AllocHGlobal(UnixPty.TermiosBufSize);
+                modified = Marshal.AllocHGlobal(UnixPty.TermiosBufSize);
+                if (UnixPty.TcGetAttr(0, saved) != 0)
+                {
+                    Log($"InputForwardLoopUnix: tcgetattr failed errno={Marshal.GetLastPInvokeError()}");
+                    return;
+                }
+                unsafe
+                {
+                    System.Buffer.MemoryCopy((void*)saved, (void*)modified, UnixPty.TermiosBufSize, UnixPty.TermiosBufSize);
+                }
+                UnixPty.CfMakeRaw(modified);
+                if (UnixPty.TcSetAttr(0, UnixPty.TCSANOW, modified) != 0)
+                {
+                    Log($"InputForwardLoopUnix: tcsetattr raw failed errno={Marshal.GetLastPInvokeError()}");
+                    return;
+                }
+                rawInstalled = true;
+
+                // Belt-and-braces termios restore: the finally block handles the
+                // normal path, this catches an out-of-band process exit (signal,
+                // crash) that skips managed cleanup.
+                var savedSnapshot = saved;
+                AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+                {
+                    try { UnixPty.TcSetAttr(0, UnixPty.TCSANOW, savedSnapshot); } catch { }
+                };
+
+                var buf = new byte[256];
+                while (!ct.IsCancellationRequested)
+                {
+                    int n = UnixPty.ReadFd(0, buf, buf.Length);
+                    if (n <= 0) break;
+
+                    try
+                    {
+                        if (_holdUserInput)
+                        {
+                            // Mirror the Windows hold-gate behaviour: Ctrl+C
+                            // (0x03) always passes through so the human can
+                            // interrupt a stuck AI command; other keystrokes
+                            // are queued for replay once the AI command
+                            // finishes and the gate is released.
+                            bool isCtrlC = n == 1 && buf[0] == 0x03;
+                            if (isCtrlC)
+                            {
+                                _pty!.InputStream.Write(buf, 0, n);
+                                _pty.InputStream.Flush();
+                            }
+                            else
+                            {
+                                var slice = new byte[n];
+                                Array.Copy(buf, slice, n);
+                                _heldUserInput.Enqueue(slice);
+                            }
+                        }
+                        else
+                        {
+                            _pty!.InputStream.Write(buf, 0, n);
+                            _pty.InputStream.Flush();
+                        }
+                    }
+                    catch (IOException) { break; }
+                }
+            }
+            catch (Exception ex) { Log($"InputForwardLoopUnix error: {ex.GetType().Name}: {ex.Message}"); }
+            finally
+            {
+                if (rawInstalled && saved != IntPtr.Zero)
+                {
+                    try { UnixPty.TcSetAttr(0, UnixPty.TCSANOW, saved); } catch { }
+                }
+                if (saved != IntPtr.Zero) Marshal.FreeHGlobal(saved);
+                if (modified != IntPtr.Zero) Marshal.FreeHGlobal(modified);
+                tcs.TrySetResult();
+            }
+        });
+        thread.IsBackground = true;
+        thread.Name = "Unix-Input";
         thread.Start();
         return tcs.Task;
     }
@@ -1512,6 +1652,167 @@ public class ConsoleWorker
     }
 
     /// <summary>
+    /// Scan recent PTY output for in-band terminal queries from the hosted
+    /// shell and inject synthetic responses back into the PTY input. On Unix
+    /// the inner forkpty has no real terminal emulator behind it — splash is
+    /// the middleman relaying bytes between the outer xfce4-terminal /
+    /// Terminal.app and the shell — so line-editor libraries that sync their
+    /// internal state by querying the terminal (PSReadLine fires DSR on
+    /// startup, various REPLs probe DA1 / DA2) never see a reply and can
+    /// hang indefinitely waiting for one. Answering here keeps splash a
+    /// pure relay on Windows (the real ConPTY handles these queries itself,
+    /// so the loop below no-ops unless the specific sequence actually
+    /// appears) while unblocking the Unix path.
+    ///
+    /// Returns the text with any handled query sequences stripped so the
+    /// downstream mirror (to the outer Terminal / xfce4-terminal) and
+    /// OSC/CSI parser never see them. Stripping is critical: if a query
+    /// leaks into the mirror, the outer terminal ALSO answers it, and
+    /// the reply races back through the stdin relay into the shell — the
+    /// shell's line editor then treats the duplicate reply as typed
+    /// characters and prints garbage like "R24" or "21R" into the command
+    /// buffer. Answering on splash's side and swallowing the query is the
+    /// single-authoritative path.
+    ///
+    /// Currently handled:
+    ///   • CSI 6 n (DSR — Device Status Report: cursor position). Answered
+    ///     with a "near the bottom of the screen" row so PSReadLine's
+    ///     upward-relative moves (history recall re-renders the previous
+    ///     prompt line by moving cursor up and rewriting) land on real
+    ///     screen rows instead of walking off the top. The row we pick
+    ///     is max(terminal.Rows - 1, 1). Col is 1, matching the typical
+    ///     state right after a fresh prompt. The outer terminal would
+    ///     report a more precise value, but forwarding its reply through
+    ///     our stdin relay has subtle timing + xrdp-passthrough issues —
+    ///     a static "safe lower bound" is a pragmatic compromise until a
+    ///     full virtual-terminal-tracking implementation lands.
+    ///
+    /// Future queries to consider: CSI c / CSI &gt; c (DA1 / DA2 device
+    /// attribute probes), CSI 14 t / CSI 18 t (window pixel / cell size),
+    /// OSC 10 / 11 ? (foreground / background colour query). Added on
+    /// demand when a new adapter needs them.
+    /// </summary>
+    private string AnswerAndStripTerminalQueries(string text)
+    {
+        // CSI 6 n  —  "\x1b[6n" is the only DSR variant PSReadLine uses.
+        // The longer form \x1b[?6n (private-marker DSR) isn't emitted by
+        // any adapter we host, so a plain substring check is enough.
+        const string Dsr = "\x1b[6n";
+        if (!text.Contains(Dsr)) return text;
+
+        if (_writer is not null)
+        {
+            try
+            {
+                // Static row = Console.WindowHeight (near the bottom of the
+                // visible viewport): once a shell has printed more than a
+                // screenful of output the real cursor is pinned there by
+                // scrolling anyway, and PSReadLine's relative-move renders
+                // survive a static-bottom answer far better than an
+                // optimistic \n-count tracker that under-shoots whenever
+                // the shell wraps a long line or emits a cursor-position
+                // CSI without an explicit '\n'. The user-observed
+                // "content jumps to the screen bottom after an AI
+                // command" is the cost of this compromise — small empty
+                // space above the prompt instead of wrong-row rendering.
+                int row = 24;
+                try { if (Console.WindowHeight > 1) row = Console.WindowHeight; } catch { }
+                int col = EstimateCursorCol();
+                var reply = System.Text.Encoding.UTF8.GetBytes($"\x1b[{row};{col}R");
+                _writer.Write(reply, 0, reply.Length);
+                _writer.Flush();
+            }
+            catch (IOException) { /* PTY closed — worker is tearing down */ }
+        }
+
+        return text.Replace(Dsr, string.Empty);
+    }
+
+    /// <summary>
+    /// Best-effort cursor column for DSR replies when the outer terminal's
+    /// real reply isn't available through the relay. Used only by
+    /// <see cref="AnswerAndStripTerminalQueries"/> on Unix.
+    ///
+    /// PSReadLine fires DSR right after the shell writes its prompt, so the
+    /// honest answer is "prompt end + 1". We compute that from
+    /// adapter-specific knowledge of the prompt format rather than parsing
+    /// the output stream (which would require a mini terminal emulator
+    /// that's out of scope for the Phase 2 relay):
+    ///
+    ///   • pwsh / powershell — default prompt is "PS &lt;cwd&gt;&gt; ",
+    ///     so column = 3 ("PS ") + cwd.Length + 2 ("&gt; ") + 1 (1-indexed
+    ///     cursor position after the space). Custom $PROFILE prompts
+    ///     break this approximation; ok as the common case.
+    ///
+    ///   • everyone else — we don't have a portable way to guess the
+    ///     prompt length (bash PS1 can be anything), so fall back to
+    ///     column 1. New keystrokes still land at the correct on-screen
+    ///     column because readline emits a `\r` + re-render cycle on
+    ///     input. History recall via up-arrow picks the wrong column
+    ///     in this fallback and renders into the prompt area — a known
+    ///     cosmetic limitation until proper virtual terminal tracking
+    ///     is added.
+    /// </summary>
+    /// <summary>
+    /// Best-effort cursor column for DSR replies when the outer terminal's
+    /// real reply isn't available through the relay. Used only by
+    /// <see cref="AnswerAndStripTerminalQueries"/> on Unix.
+    ///
+    /// A byte-level virtual-terminal tracker was tried and regressed worse
+    /// than a static guess: PSReadLine renders prompts with SGR colour
+    /// escapes whose widths don't match the counted byte advance, and
+    /// PSReadLine carries its own cursor model — when our estimate and
+    /// its model diverge even slightly, the two compound into bigger
+    /// visual drift than either alone. The current compromise:
+    ///
+    ///   • pwsh / powershell — compute column from the default prompt
+    ///     format "PS &lt;cwd&gt;&gt; ". Column = 3 ("PS ") + cwd.Length
+    ///     + 2 ("&gt; ") + 1 (1-indexed cursor after the space). Accurate
+    ///     for the out-of-the-box prompt, which matches what PSReadLine
+    ///     expects since it built its own model from the same string.
+    ///     Custom $PROFILE prompts defeat this approximation.
+    ///
+    ///   • everyone else — fall back to column 1. New keystrokes still
+    ///     land at the correct on-screen column because readline emits
+    ///     a \r + re-render cycle on input, so the initial column
+    ///     estimate drops out after the first render. History recall
+    ///     (up-arrow) uses absolute positioning tied to the DSR reply,
+    ///     so the column-1 fallback draws the recalled command into
+    ///     the prompt area — a known cosmetic gap until a full virtual
+    ///     terminal layer lands.
+    /// </summary>
+    private int EstimateCursorCol()
+    {
+        if (_isPwshFamily)
+        {
+            var cwd = _tracker.LastKnownCwd ?? _cwd ?? "/";
+            // "PS " + cwd + "> " + cursor-after-space = 3 + len + 2 + 1
+            return 3 + cwd.Length + 2 + 1;
+        }
+        if (_shellFamily == "bash" || _shellFamily == "zsh")
+        {
+            // Debian / Ubuntu / Fedora / Arch default PS1 is
+            //   "\u@\h:\w\$ "  →  "user@host:path$ ". Home directory and
+            // prefixes of home get "~"-substituted (the \w expansion).
+            // Length = user + "@" + host + ":" + displayPath + "$ "
+            //        = user + 1 + host + 1 + displayPath + 2
+            // Plus 1 for 1-indexed cursor position after the space.
+            var user = Environment.GetEnvironmentVariable("USER") ?? Environment.UserName;
+            var host = Environment.MachineName;
+            var home = Environment.GetEnvironmentVariable("HOME") ?? "";
+            var cwd = _tracker.LastKnownCwd ?? _cwd ?? "/";
+            string displayCwd = cwd;
+            if (!string.IsNullOrEmpty(home))
+            {
+                if (cwd == home) displayCwd = "~";
+                else if (cwd.StartsWith(home + "/")) displayCwd = "~" + cwd.Substring(home.Length);
+            }
+            return user.Length + 1 + host.Length + 1 + displayCwd.Length + 2 + 1;
+        }
+        return 1;
+    }
+
+    /// <summary>
     /// Wait for the child shell process to exit, then signal the main loop.
     /// Needed because ConPTY keeps the output pipe open indefinitely even
     /// after the child process dies, so ReadOutputLoop's blocking Read is
@@ -1552,6 +1853,7 @@ public class ConsoleWorker
                     if (read == 0) break;
 
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
+                    text = AnswerAndStripTerminalQueries(text);
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
 
