@@ -223,7 +223,7 @@ public class OutputSpec
     public bool StripAnsi { get; set; }
     public bool StripInputEcho { get; set; } = true;
     public bool StripPromptEcho { get; set; } = true;
-    public string InputEchoStrategy { get; set; } = "osc_boundaries"; // osc_boundaries | deterministic_byte_match | none
+    public string InputEchoStrategy { get; set; } = "osc_boundaries"; // osc_boundaries | deterministic_byte_match | fuzzy_byte_match | none
     public string LineEnding { get; set; } = "\n";
     public AsyncInterleaveSpec? AsyncInterleave { get; set; }
 }

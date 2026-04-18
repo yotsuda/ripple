@@ -274,7 +274,7 @@ output:
   post_prompt_settle_ms: 150
   strip_ansi: false
   strip_input_echo: true
-  input_echo_strategy: osc_boundaries | deterministic_byte_match | none
+  input_echo_strategy: osc_boundaries | deterministic_byte_match | fuzzy_byte_match | none
   line_ending: "\r\n"
   async_interleave:
     strategy: redraw_detect | quiesce | accept | none
@@ -291,7 +291,16 @@ output:
   output:
   - `osc_boundaries` — use OSC B→C region as echo, C→D as output
   - `deterministic_byte_match` — walk the output matching exact bytes sent
-    to stdin, skip ConPTY line-wrap CR/LF (cmd's strategy)
+    to stdin, skipping ConPTY line-wrap CR/LF and any ANSI escape sequences
+    injected by the REPL's own syntax highlighter (cmd, python, sqlite3,
+    lua, jshell — REPLs whose echo is plain or at most color-annotated).
+  - `fuzzy_byte_match` — the byte-match walker plus a one-shot leading
+    prompt-redraw skip, for linenoise-style REPLs (duckdb, psql, …) whose
+    echo opens with "`<prompt><input>`" because the prompt line is rewritten
+    on every keystroke. The prompt prefix is swallowed using the adapter's
+    own `prompt.primary` regex (with line anchors re-anchored at the scan
+    position), so the walker can start byte-matching on sentInput's first
+    real byte.
   - `none` — don't strip echo (REPLs where echo is cosmetically acceptable)
 - **`async_interleave`** — how to handle output produced by background
   concurrency primitives (iex BEAM processes, Python asyncio, Node EventEmitter).

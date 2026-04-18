@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Ripple.Services.Adapters;
 
 namespace Ripple.Services;
@@ -1021,25 +1022,93 @@ public class ConsoleWorker
     }
 
     /// <summary>
+    /// ANSI / DEC escape sequences that appear inside the PTY echo but were
+    /// never part of the bytes the worker typed to stdin. Unlike
+    /// CommandTracker's AnsiRegex (which deliberately keeps SGR so colors
+    /// reach the user), this matcher covers SGR too — the walker below needs
+    /// to skip every escape sequence to line up with the sentInput bytes.
+    /// Matches CSI, OSC (BEL- or ST-terminated), DEC G0/G1 charset selectors,
+    /// and DEC cursor-key mode toggles.
+    /// </summary>
+    private static readonly Regex AnsiEscapeRegex = new(
+        @"\x1b\[[0-9;?]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>]",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Derive a \G-anchored prefix matcher from an adapter's prompt regex,
+    /// for fuzzy_byte_match's one-shot "swallow the redrawn prompt" step.
+    /// Prompt regexes are written for "this IS the current prompt line"
+    /// matching (e.g. <c>^\S+ D $</c>) and carry line-anchors at either
+    /// end; we strip those anchors and re-anchor the pattern at the current
+    /// scan position. Returns null when the adapter has no regex-strategy
+    /// prompt or the pattern is empty.
+    /// </summary>
+    private static Regex? BuildPromptRedrawMatcher(string? promptPattern)
+    {
+        if (string.IsNullOrEmpty(promptPattern)) return null;
+        var p = promptPattern;
+        if (p.StartsWith('^')) p = p[1..];
+        if (p.EndsWith('$')) p = p[..^1];
+        if (p.Length == 0) return null;
+        try { return new Regex(@"\G" + p, RegexOptions.Compiled); }
+        catch (ArgumentException) { return null; }
+    }
+
+    /// <summary>
     /// Strip the leading bytes that ConPTY echoed back when an AI command
-    /// was written to cmd.exe's PTY input. cmd has no preexec hook to fire
-    /// OSC 633 C at the right moment, so the proxy tracker captures the
-    /// command echo as part of the output. We know exactly which bytes were
-    /// written, so the cleanup is deterministic: walk the output forwards,
-    /// matching characters from the expected echo, skipping CR/LF inserted
-    /// by ConPTY's terminal-width line wrap. After the echo is consumed,
-    /// drop any trailing newline that separates it from the real output.
+    /// was written to a REPL's PTY input. REPLs without a preexec hook to
+    /// fire OSC 633 C can't mark the echo/output boundary, so the worker
+    /// recovers it by walking the output and matching the exact bytes that
+    /// were written.
     ///
-    /// On any mismatch (escape characters that don't roundtrip exactly,
-    /// unexpected wrap behaviour) the original output is returned unchanged
+    /// The walker tolerates PTY / REPL artifacts that were never part of
+    /// sentInput:
+    ///   - CR/LF injected by ConPTY's terminal-width line wrap.
+    ///   - ANSI escape sequences injected by the REPL's own syntax
+    ///     highlighter (duckdb's linenoise, node's repl, etc.) around the
+    ///     echoed input. These appear in the echo but not in sentInput.
+    ///
+    /// When <paramref name="promptRedrawMatcher"/> is supplied (fuzzy mode),
+    /// the walker additionally consumes a leading prompt re-emission once:
+    /// linenoise-style REPLs rewrite the prompt on each keystroke, so the
+    /// captured window opens with "&lt;prompt&gt;&lt;input&gt;" rather than just
+    /// "&lt;input&gt;". The matcher (derived from the adapter's prompt regex)
+    /// swallows that prompt prefix so byte-matching can start on sentInput's
+    /// first real byte.
+    ///
+    /// On any unresolvable mismatch the original output is returned unchanged
     /// so the AI gets at-worst the pre-fix ugliness, never lost data.
     /// </summary>
-    internal static string StripCmdInputEcho(string output, string sentInput)
+    internal static string StripCmdInputEcho(string output, string sentInput, Regex? promptRedrawMatcher = null)
     {
         if (string.IsNullOrEmpty(output) || string.IsNullOrEmpty(sentInput))
             return output;
 
         int oi = 0;
+
+        // Fuzzy mode: consume a leading prompt redraw once. Skip the CR and
+        // ANSI noise that precedes the prompt bytes, then let the adapter's
+        // prompt regex swallow the prompt text itself. Subsequent prompt
+        // redraws (if any) are handled by the regular byte-matching loop
+        // because the sentInput bytes also re-appear alongside them.
+        if (promptRedrawMatcher != null)
+        {
+            while (oi < output.Length)
+            {
+                var oc = output[oi];
+                if (oc is '\r' or '\n') { oi++; continue; }
+                if (oc == '\x1b')
+                {
+                    var m = AnsiEscapeRegex.Match(output, oi);
+                    if (m.Success && m.Index == oi) { oi += m.Length; continue; }
+                }
+                break;
+            }
+            var pm = promptRedrawMatcher.Match(output, oi);
+            if (pm.Success && pm.Index == oi)
+                oi += pm.Length;
+        }
+
         int ci = 0;
         while (ci < sentInput.Length && oi < output.Length)
         {
@@ -1051,6 +1120,24 @@ public class ConsoleWorker
             {
                 oi++;
                 continue;
+            }
+
+            // ANSI escape sequences injected by the REPL's syntax
+            // highlighter appear in the echo but were never in sentInput
+            // (assuming sentInput is plain text, which it always is for
+            // AI-driven commands). Skip the full sequence and keep matching.
+            // The sentInput[ci] != '\x1b' guard preserves the (vanishingly
+            // rare) case of a literal ESC in the typed command — falls
+            // through to the byte compare so both sides advance together.
+            if (oc == '\x1b' && sentInput[ci] != '\x1b')
+            {
+                var m = AnsiEscapeRegex.Match(output, oi);
+                if (m.Success && m.Index == oi)
+                {
+                    oi += m.Length;
+                    continue;
+                }
+                return output;
             }
 
             if (oc != sentInput[ci])
@@ -2326,13 +2413,13 @@ public class ConsoleWorker
         }
 
         // Adapters whose input echo strategy is deterministic_byte_match
-        // (cmd, python, any REPL without a stdlib pre-input hook that can
-        // emit OSC B/C) have no way to fire OSC C at the moment the
-        // command starts, so the tracker would wait forever for a marker
-        // that never arrives. Paper over the gap: RegisterCommand has
-        // just reset _aiOutput to "", so position 0 is the true start
-        // of the command's captured window.
-        if (_adapter?.Output.InputEchoStrategy == "deterministic_byte_match")
+        // or fuzzy_byte_match (cmd, python, any REPL without a stdlib
+        // pre-input hook that can emit OSC B/C) have no way to fire OSC C
+        // at the moment the command starts, so the tracker would wait
+        // forever for a marker that never arrives. Paper over the gap:
+        // RegisterCommand has just reset _aiOutput to "", so position 0
+        // is the true start of the command's captured window.
+        if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
             _tracker.SkipCommandStartMarker();
 
         // Multi-line commands can't be written straight to the PTY: pwsh
@@ -2489,7 +2576,7 @@ public class ConsoleWorker
             // the time the AI's next tool call arrives.
             ReleaseHeldUserInput();
             var cleanedOutput = result.Output;
-            if (_adapter?.Output.InputEchoStrategy == "deterministic_byte_match")
+            if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
             {
                 // Shells/REPLs that can't fire OSC C (cmd, python, any
                 // interpreter without a stdlib pre-input hook) have no
@@ -2500,10 +2587,19 @@ public class ConsoleWorker
                 // multi-line on cmd: the `call "tmp" & del "tmp"`
                 // wrapper). enter is dropped because it's the line
                 // submission and never appears in the echo.
+                //
+                // fuzzy_byte_match additionally swallows a leading prompt
+                // redraw for linenoise-style REPLs (duckdb etc.) whose
+                // echo opens with "<prompt><input>" rather than just
+                // "<input>". The redraw matcher is derived from the
+                // adapter's prompt regex.
                 var echoExpected = ptyPayload;
                 if (echoExpected.EndsWith(enter))
                     echoExpected = echoExpected[..^enter.Length];
-                cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected);
+                Regex? promptRedrawMatcher = null;
+                if (_adapter.Output.InputEchoStrategy == "fuzzy_byte_match")
+                    promptRedrawMatcher = BuildPromptRedrawMatcher(_adapter.Prompt?.Primary);
+                cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected, promptRedrawMatcher);
             }
             // Re-evaluate which mode the REPL is now in. The detector
             // scans the tail of recent terminal output against every
