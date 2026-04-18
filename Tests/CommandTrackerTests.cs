@@ -3,9 +3,19 @@ using Ripple.Services;
 namespace Ripple.Tests;
 
 /// <summary>
-/// Unit tests for CommandTracker.Busy semantics — in particular, that user-initiated
-/// commands (OSCs fired without a preceding RegisterCommand) are also reflected in
-/// Busy so get_status reports "busy" and the proxy switches to a different console.
+/// Unit tests for CommandTracker.
+///
+/// Post-refactor the tracker is finalization-free: it only tracks Busy
+/// state, accumulates the recent-output ring, captures AI-command output
+/// into a <see cref="CommandOutputCapture"/>, and emits a
+/// <see cref="CompletedCommandSnapshot"/> once OSC C/D/A close a cycle.
+/// Cleaning, truncation, echo-stripping, StatusLine baking, and cache
+/// storage all live in ConsoleWorker now (see ConsoleWorkerTests).
+///
+/// These tests therefore exercise:
+///   - Busy semantics (user OSC, AI command, polling hint)
+///   - Recent-output ring VT-lite behaviour
+///   - Snapshot production: OSC boundary capture, flip-to-cache, preempt
 /// </summary>
 public class CommandTrackerTests
 {
@@ -24,6 +34,42 @@ public class CommandTrackerTests
 
         static OscParser.OscEvent Evt(OscParser.OscEventType t, int exit = 0, string? cwd = null)
             => new(t, exit, cwd);
+
+        // Helper: build a minimally-populated CommandRegistration. All
+        // per-adapter context (shell family, echo strategy, display name)
+        // is passed through verbatim to the emitted snapshot, so most
+        // tests can leave them null.
+        static CommandTracker.CommandRegistration Reg(
+            string command,
+            int timeoutMs = 30_000,
+            string? shellFamily = null,
+            string? displayName = null,
+            string? inputEchoStrategy = null)
+            => new(
+                CommandText: command,
+                PtyPayload: command + "\r",
+                InputEchoLineEnding: "\r",
+                InputEchoStrategy: inputEchoStrategy,
+                ShellFamily: shellFamily,
+                DisplayName: displayName,
+                PostPromptSettleMs: 150,
+                TimeoutMs: timeoutMs);
+
+        // Helper: subscribe to SnapshotProduced and return a holder that
+        // the test can query after driving OSC events. The tracker emits
+        // OUTSIDE its lock so synchronous assignment is safe.
+        static (Func<CompletedCommandSnapshot?> GetLast, Action Reset) CaptureSnapshot(CommandTracker t)
+        {
+            CompletedCommandSnapshot? last = null;
+            t.SnapshotProduced += s => last = s;
+            return (() => last, () => last = null);
+        }
+
+        // Helper: read the cleaned command-window output out of a snapshot.
+        // Mirrors what ConsoleWorker.FinalizeSnapshotAsync does for the
+        // happy path (no echo-strip, no truncation).
+        static string Cleaned(CompletedCommandSnapshot s)
+            => CommandOutputFinalizer.Clean(s.Capture, s.CommandStart, s.CommandEnd);
 
         // Test 1: fresh tracker is idle.
         {
@@ -115,7 +161,7 @@ public class CommandTrackerTests
         // still reflect Busy via _isAiCommand until the AI command resolves.
         {
             var t = new CommandTracker();
-            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            var task = t.RegisterCommand(Reg("Get-Date"));
             Assert(t.Busy, "AI cmd: Busy true after RegisterCommand");
 
             t.HandleEvent(Evt(OscParser.OscEventType.CommandInputStart));
@@ -126,9 +172,9 @@ public class CommandTrackerTests
         // Test 7: RegisterCommand refuses when another AI command is in flight.
         {
             var t = new CommandTracker();
-            _ = t.RegisterCommand("first", timeoutMs: 30_000);
+            _ = t.RegisterCommand(Reg("first"));
             bool threw = false;
-            try { _ = t.RegisterCommand("second", timeoutMs: 30_000); }
+            try { _ = t.RegisterCommand(Reg("second")); }
             catch (InvalidOperationException) { threw = true; }
             Assert(threw, "AI cmd: second RegisterCommand throws");
         }
@@ -140,7 +186,8 @@ public class CommandTrackerTests
         // would otherwise be returned as the command's output.
         {
             var t = new CommandTracker();
-            var task = t.RegisterCommand("Get-Location", timeoutMs: 30_000);
+            var (getLast, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("Get-Location"));
 
             // Simulate the bytes that arrived between worker-ready and the
             // real first prompt: the Write-Host reason text + the first
@@ -154,6 +201,7 @@ public class CommandTrackerTests
             t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
 
             Assert(!task.IsCompleted, "late first-prompt OSC A does NOT resolve before OSC C");
+            Assert(getLast() == null, "late first-prompt OSC A does NOT emit a snapshot");
             Assert(t.Busy, "AI cmd: still Busy after stray first prompt");
 
             // Now simulate the real command actually running, which will
@@ -164,11 +212,12 @@ public class CommandTrackerTests
             t.HandleEvent(Evt(OscParser.OscEventType.Cwd, cwd: "C:\\MyProj\\rippleshell"));
             t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
 
-            Assert(task.IsCompleted, "real OSC C/D/A resolves the task");
-            var result = task.Result;
-            Assert(!result.Output.Contains("Reason"), "reason banner is NOT in captured output");
-            Assert(result.Output.Contains("C:\\MyProj\\rippleshell"), "real command output is captured");
-            Assert(result.Cwd == "C:\\MyProj\\rippleshell", "post-command cwd is reported");
+            Assert(task.IsCompletedSuccessfully, "real OSC C/D/A resolves the task");
+            var snap = task.Result;
+            var output = Cleaned(snap);
+            Assert(!output.Contains("Reason"), "reason banner is NOT in captured output");
+            Assert(output.Contains("C:\\MyProj\\rippleshell"), "real command output is captured");
+            Assert(snap.Cwd == "C:\\MyProj\\rippleshell", "post-command cwd is reported");
         }
 
         // Test 9: recent-output ring buffer captures output from AI commands,
@@ -188,7 +237,7 @@ public class CommandTrackerTests
             Assert(t.GetRecentOutputSnapshot().Contains("user typed output"), "recent: user output captured");
 
             // AI command: real command output flows through too.
-            _ = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            _ = t.RegisterCommand(Reg("Get-Date"));
             t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
             t.FeedOutput("ai command output\n");
             var snapshot = t.GetRecentOutputSnapshot();
@@ -420,7 +469,7 @@ public class CommandTrackerTests
         {
             var t = new CommandTracker();
             PrimeShellReady(t);
-            _ = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            _ = t.RegisterCommand(Reg("Get-Date"));
             Assert(t.Busy, "polling hint vs AI: Busy from AI command");
 
             t.SetUserBusyHint(false);
@@ -447,17 +496,23 @@ public class CommandTrackerTests
         }
 
         // ================================================================
-        // Cache / drain tests — exercise FlipToCacheMode, _cachedResults
-        // accumulation, ConsumeCachedOutputs atomic drain semantics, and
-        // the worker-baked StatusLine on cached CommandResult entries.
-        // These back the cache-on-busy-receive pattern the ESC-cancel
-        // recovery path depends on.
+        // Snapshot-production tests — exercise the boundary the tracker
+        // owns post-refactor. The worker is responsible for cleaning /
+        // truncating / StatusLine / cache; those are covered in
+        // ConsoleWorkerTests. Here we verify:
+        //   - Normal completion emits a snapshot AND completes the task
+        //   - FlipToCacheMode detaches the task but still emits the
+        //     eventual snapshot through SnapshotProduced
+        //   - Preemptive timeout produces the same detach + eventual
+        //     snapshot shape as explicit flip
+        //   - Snapshot carries the exact registration metadata the
+        //     finalize-once path needs (echo strategy, ptyPayload,
+        //     shell family, display name)
         // ================================================================
 
-        // Helper: drive an AI command through the OSC event sequence that
-        // causes Resolve() to fire. Mirrors what a real shell's integration
-        // script emits around a command cycle.
-        static void DriveResolve(CommandTracker tracker, string output, int exit = 0, string? cwd = null)
+        // Helper: drive an AI command through OSC C → output → OSC D → OSC A.
+        // Mirrors the sequence a real shell's integration script emits.
+        static void DriveCycle(CommandTracker tracker, string output, int exit = 0, string? cwd = null)
         {
             tracker.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
             if (!string.IsNullOrEmpty(output))
@@ -468,47 +523,56 @@ public class CommandTrackerTests
             tracker.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
         }
 
-        // A fresh tracker has no cached output and draining returns an
-        // empty list rather than null.
+        // Normal completion: task completes with the snapshot AND the
+        // SnapshotProduced event fires with the same instance. Worker
+        // subscribes to the event; inline await uses the task. Both paths
+        // must see identical data.
+        //
+        // The tracker intentionally stays Busy through snapshot emission
+        // — Busy only clears once the worker's finalize-once path calls
+        // ReleaseAiCommand after the result has been delivered inline
+        // or appended to the cache. That closes the settle-window race
+        // where a fast-polling client could otherwise see
+        // {status: standby, hasCachedOutput: false} between the
+        // snapshot firing and the cache entry landing.
         {
             var t = new CommandTracker();
-            Assert(!t.HasCachedOutput, "cache: fresh tracker has no cached output");
-            Assert(t.ConsumeCachedOutputs().Count == 0, "cache: fresh drain returns empty list");
+            var (getLast, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("Get-Date"));
+            DriveCycle(t, "normal-output\n", exit: 0, cwd: "/home");
+
+            Assert(task.IsCompletedSuccessfully, "normal: task completed successfully");
+            var snap = task.Result;
+            Assert(snap.Command == "Get-Date", "normal: snapshot carries command text");
+            Assert(snap.ExitCode == 0, "normal: snapshot carries exit code");
+            Assert(snap.Cwd == "/home", "normal: snapshot carries cwd");
+            Assert(Cleaned(snap).Contains("normal-output"), "normal: capture contains output");
+            Assert(t.Busy, "normal: tracker stays Busy until worker releases (settle-window race guard)");
+
+            t.ReleaseAiCommand(snap.Generation);
+            Assert(!t.Busy, "normal: tracker idle after ReleaseAiCommand");
+
+            var emitted = getLast();
+            Assert(emitted != null, "normal: SnapshotProduced fired");
+            Assert(ReferenceEquals(emitted, snap), "normal: event & task snapshot are same instance");
         }
 
-        // FlipToCacheMode on an idle tracker is a safe no-op — it must not
-        // throw, flip any state, or fabricate cache entries. Matters for
-        // the "any tool arrives" trigger which fires regardless of state.
+        // FlipToCacheMode on an idle tracker is a safe no-op — matters for
+        // the "any tool arrives" trigger that fires regardless of state.
         {
             var t = new CommandTracker();
             t.FlipToCacheMode();
             Assert(!t.Busy, "flip: idle no-op leaves Busy=false");
-            Assert(!t.HasCachedOutput, "flip: idle no-op leaves cache empty");
-        }
-
-        // Normal completion path: the command resolves via the _tcs inline,
-        // and the cache stays empty because _shouldCacheOnComplete was never
-        // set. Baseline case for the ESC-free happy path.
-        {
-            var t = new CommandTracker();
-            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
-            DriveResolve(t, "normal-output\n", exit: 0, cwd: "/home");
-            Assert(task.IsCompletedSuccessfully, "normal: task completed successfully");
-            Assert(task.Result.Output.Contains("normal-output"), "normal: task result has output");
-            Assert(task.Result.ExitCode == 0, "normal: task result has exit code 0");
-            Assert(task.Result.Cwd == "/home", "normal: task result has cwd");
-            Assert(!t.HasCachedOutput, "normal: cache stays empty on normal completion");
-            Assert(!t.Busy, "normal: tracker idle after Resolve");
         }
 
         // Mid-command FlipToCacheMode: task faults with TimeoutException,
-        // _shouldCacheOnComplete is set, and when Resolve eventually fires
-        // (OSC D/A arriving later from the shell) the result lands in
-        // _cachedResults rather than the original TCS. This is the core
-        // "response channel broken mid-flight" recovery path.
+        // the tracker stays busy (shell hasn't finished), and when the
+        // eventual OSC cycle fires the snapshot flows through
+        // SnapshotProduced (the worker's fallback delivery path).
         {
             var t = new CommandTracker();
-            var task = t.RegisterCommand("Get-Date", timeoutMs: 30_000);
+            var (getLast, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("Get-Date"));
             Assert(!task.IsCompleted, "flip: task pending before flip");
 
             t.FlipToCacheMode();
@@ -516,182 +580,197 @@ public class CommandTrackerTests
             Assert(task.Exception!.InnerException is TimeoutException,
                 "flip: task fault is TimeoutException");
             Assert(t.Busy, "flip: tracker still Busy — command still running in shell");
-            Assert(!t.HasCachedOutput, "flip: cache still empty before Resolve fires");
+            Assert(getLast() == null, "flip: no snapshot yet (shell hasn't finished)");
 
-            // Shell eventually emits the command cycle. Since the TCS is
-            // already detached, Resolve's else branch runs and appends.
-            DriveResolve(t, "output-1\n", exit: 0, cwd: "/tmp");
-            Assert(!t.Busy, "flip: tracker idle after Resolve");
-            Assert(t.HasCachedOutput, "flip: cache populated after Resolve");
+            // Shell eventually emits the command cycle. The TCS is detached,
+            // so the snapshot only shows up on the event.
+            DriveCycle(t, "output-1\n", exit: 0, cwd: "/tmp");
+            Assert(t.Busy, "flip: tracker stays Busy until worker releases");
 
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 1, $"flip: one result drained (got {drained.Count})");
-            Assert(drained[0].Output.Contains("output-1"), "flip: drained result contains command output");
-            Assert(drained[0].ExitCode == 0, "flip: drained exit code preserved");
-            Assert(drained[0].Cwd == "/tmp", "flip: drained cwd preserved");
-            Assert(drained[0].Command == "Get-Date", "flip: drained command text preserved");
-            Assert(!string.IsNullOrEmpty(drained[0].StatusLine), "flip: drained result has non-empty StatusLine");
+            var snap = getLast();
+            Assert(snap != null, "flip: snapshot delivered via event after cycle");
+            Assert(Cleaned(snap!).Contains("output-1"), "flip: snapshot has command output");
+            Assert(snap!.ExitCode == 0, "flip: snapshot exit code preserved");
+            Assert(snap.Cwd == "/tmp", "flip: snapshot cwd preserved");
+            Assert(snap.Command == "Get-Date", "flip: snapshot command text preserved");
 
-            Assert(!t.HasCachedOutput, "flip: cache empty after drain");
-            Assert(t.ConsumeCachedOutputs().Count == 0, "flip: second drain returns empty");
+            t.ReleaseAiCommand(snap.Generation);
+            Assert(!t.Busy, "flip: tracker idle after ReleaseAiCommand");
         }
 
-        // Sequential flipped commands accumulate in the cache list without
-        // overwriting each other. Validates that append semantics preserve
-        // order and that a single CommandResult field (the old shape) would
-        // have silently dropped the earlier entry.
+        // Sequential flipped commands emit separate snapshots in order.
+        // Worker appends each to its _cachedResults; here we just verify
+        // the tracker produces distinct snapshots with the right payloads.
+        // Each DriveCycle leaves Busy set until ReleaseAiCommand fires,
+        // so the test simulates the worker's finalize-once path by
+        // releasing between commands.
         {
             var t = new CommandTracker();
+            var snapshots = new List<CompletedCommandSnapshot>();
+            t.SnapshotProduced += s => snapshots.Add(s);
 
-            _ = t.RegisterCommand("first", timeoutMs: 30_000);
+            _ = t.RegisterCommand(Reg("first"));
             t.FlipToCacheMode();
-            DriveResolve(t, "first-output\n", exit: 0);
-            Assert(t.HasCachedOutput, "multi: cache has entry after first flip");
+            DriveCycle(t, "first-output\n", exit: 0);
+            t.ReleaseAiCommand(snapshots[0].Generation);
 
-            _ = t.RegisterCommand("second", timeoutMs: 30_000);
+            _ = t.RegisterCommand(Reg("second"));
             t.FlipToCacheMode();
-            DriveResolve(t, "second-output\n", exit: 1);
-            Assert(t.HasCachedOutput, "multi: cache still populated after second");
+            DriveCycle(t, "second-output\n", exit: 1);
+            t.ReleaseAiCommand(snapshots[1].Generation);
 
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 2, $"multi: two results drained (got {drained.Count})");
-            Assert(drained[0].Command == "first", "multi: first command preserved in order");
-            Assert(drained[0].Output.Contains("first-output"), "multi: first output preserved");
-            Assert(drained[1].Command == "second", "multi: second command preserved in order");
-            Assert(drained[1].Output.Contains("second-output"), "multi: second output preserved");
-            Assert(drained[1].ExitCode == 1, "multi: second non-zero exit code preserved");
-            Assert(!t.HasCachedOutput, "multi: cache empty after drain");
+            Assert(snapshots.Count == 2, $"multi: two snapshots emitted (got {snapshots.Count})");
+            Assert(snapshots[0].Command == "first", "multi: first command in order");
+            Assert(Cleaned(snapshots[0]).Contains("first-output"), "multi: first output preserved");
+            Assert(snapshots[1].Command == "second", "multi: second command in order");
+            Assert(Cleaned(snapshots[1]).Contains("second-output"), "multi: second output preserved");
+            Assert(snapshots[1].ExitCode == 1, "multi: second non-zero exit preserved");
         }
 
-        // ConsumeCachedOutputs is atomic — one call drains everything,
-        // leaves the list empty, and never returns a partial view. Drain
-        // happens on every tool-call response, so splitting it into pieces
-        // would require multiple round trips to empty the cache.
+        // Registration metadata flows into the snapshot verbatim — shell
+        // family, display name, echo strategy, and PTY payload baseline
+        // are all needed by the worker's finalize-once path (echo strip,
+        // StatusLine baking).
         {
             var t = new CommandTracker();
-            for (int i = 0; i < 3; i++)
-            {
-                _ = t.RegisterCommand($"cmd-{i}", timeoutMs: 30_000);
-                t.FlipToCacheMode();
-                DriveResolve(t, $"out-{i}\n", exit: 0);
-            }
+            var (getLast, _) = CaptureSnapshot(t);
+            var reg = new CommandTracker.CommandRegistration(
+                CommandText: "dir",
+                PtyPayload: "dir\r",
+                InputEchoLineEnding: "\r",
+                InputEchoStrategy: "deterministic_byte_match",
+                ShellFamily: "cmd",
+                DisplayName: "Catfish",
+                PostPromptSettleMs: 200,
+                TimeoutMs: 30_000);
+            _ = t.RegisterCommand(reg);
+            DriveCycle(t, "Volume in drive C\n", exit: 0);
 
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 3, $"atomic: three results drained (got {drained.Count})");
-            Assert(!t.HasCachedOutput, "atomic: cache empty after single drain call");
-            Assert(drained[0].Command == "cmd-0", "atomic: order preserved [0]");
-            Assert(drained[1].Command == "cmd-1", "atomic: order preserved [1]");
-            Assert(drained[2].Command == "cmd-2", "atomic: order preserved [2]");
-        }
-
-        // Cache survives RegisterCommand. A stale entry from an earlier
-        // flipped command must NOT be cleared when a fresh command is
-        // registered — otherwise a user who calls execute twice without
-        // an intervening drain would silently lose the first result.
-        {
-            var t = new CommandTracker();
-
-            _ = t.RegisterCommand("earlier", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "earlier-output\n", exit: 0);
-            Assert(t.CachedOutputCount == 1, "survive: cache has 1 entry");
-
-            // Fresh command on the now-idle tracker. Cache must carry over.
-            var task = t.RegisterCommand("later", timeoutMs: 30_000);
-            Assert(t.CachedOutputCount == 1, "survive: cache preserved across RegisterCommand");
-
-            // Complete the second normally — cache still has only the first.
-            DriveResolve(t, "later-output\n", exit: 0);
-            Assert(task.IsCompletedSuccessfully, "survive: second command completed normally");
-            Assert(t.CachedOutputCount == 1, "survive: normal completion does not add to cache");
-
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 1, $"survive: only the flipped result in cache (got {drained.Count})");
-            Assert(drained[0].Command == "earlier", "survive: earlier (flipped) command preserved");
-        }
-
-        // SetDisplayContext propagates into the baked StatusLine on cached
-        // CommandResult entries. Ensures drain output looks identical to an
-        // inline result — the worker captures display name + shell family
-        // at Resolve time rather than relying on the proxy reformatting.
-        {
-            var t = new CommandTracker();
-            t.SetDisplayContext("Dolphin", "pwsh");
-            _ = t.RegisterCommand("Get-Process", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "proc-output\n", exit: 0, cwd: "C:\\Users");
-
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 1, "statusline: one drained");
-            var sl = drained[0].StatusLine;
-            Assert(sl.Contains("Dolphin"), $"statusline: contains display name — got: {sl}");
-            Assert(sl.Contains("pwsh"), $"statusline: contains shell family — got: {sl}");
-            Assert(sl.Contains("Get-Process"), $"statusline: contains command — got: {sl}");
-            Assert(sl.Contains("Completed"), $"statusline: contains status verb — got: {sl}");
-            Assert(sl.Contains("Location: C:\\Users"),
-                $"statusline: contains location — got: {sl}");
-            Assert(sl.StartsWith("✓"), $"statusline: success marker — got: {sl}");
-        }
-
-        // cmd shell family renders the neutral "Finished / exit code unavailable"
-        // variant because cmd's PROMPT can't expose real %ERRORLEVEL%.
-        {
-            var t = new CommandTracker();
-            t.SetDisplayContext("Catfish", "cmd");
-            _ = t.RegisterCommand("dir", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "Volume in drive C\n", exit: 0);
-
-            var drained = t.ConsumeCachedOutputs();
-            var sl = drained[0].StatusLine;
-            Assert(sl.Contains("Finished"),
-                $"statusline-cmd: says Finished — got: {sl}");
-            Assert(sl.Contains("exit code unavailable"),
-                $"statusline-cmd: notes exit code unavailable — got: {sl}");
-            Assert(!sl.Contains("Completed"),
-                "statusline-cmd: does not say Completed (cmd exits are unreliable)");
-            Assert(sl.StartsWith("○"), $"statusline-cmd: neutral marker — got: {sl}");
-        }
-
-        // Non-zero exit on a reliable shell renders as "Failed (exit N)".
-        {
-            var t = new CommandTracker();
-            t.SetDisplayContext("Wolf", "bash");
-            _ = t.RegisterCommand("false", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "", exit: 1);
-
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained[0].ExitCode == 1, "statusline-fail: exit code 1 captured");
-            var sl = drained[0].StatusLine;
-            Assert(sl.Contains("Failed"), $"statusline-fail: Failed verb — got: {sl}");
-            Assert(sl.Contains("exit 1"), $"statusline-fail: notes exit 1 — got: {sl}");
-            Assert(sl.StartsWith("✗"), $"statusline-fail: failure marker — got: {sl}");
+            var snap = getLast();
+            Assert(snap != null, "metadata: snapshot emitted");
+            Assert(snap!.ShellFamily == "cmd", "metadata: shell family carried");
+            Assert(snap.DisplayName == "Catfish", "metadata: display name carried");
+            Assert(snap.InputEchoStrategy == "deterministic_byte_match",
+                "metadata: echo strategy carried");
+            Assert(snap.PtyPayloadBaseline == "dir\r", "metadata: pty payload baseline carried");
+            Assert(snap.InputEchoLineEnding == "\r", "metadata: line ending carried");
+            Assert(snap.PostPromptSettleMs == 200, "metadata: settle ms carried");
         }
 
         // 170s preemptive cap — RegisterCommand with a huge timeoutMs must
         // cap internally and not immediately fault. The exact capped value
         // isn't directly observable but the call must succeed and the task
-        // must stay pending. The capped timer itself is covered by the
-        // short-timeout test below.
+        // must stay pending.
         {
             var t = new CommandTracker();
-            var task = t.RegisterCommand("long", timeoutMs: 3_600_000); // 1 hour
+            var task = t.RegisterCommand(Reg("long", timeoutMs: 3_600_000)); // 1 hour
             Assert(t.Busy, "cap: Busy after RegisterCommand with large timeout");
             Assert(!task.IsCompleted, "cap: task not completed immediately");
-            // Drive Resolve so the next test starts fresh.
-            DriveResolve(t, "ok\n", exit: 0);
+            DriveCycle(t, "ok\n", exit: 0);
             Assert(task.IsCompletedSuccessfully, "cap: task resolves normally via OSC");
+        }
+
+        // Post-OSC-A trailing bytes still reach the capture the finalizer
+        // slices. Regression guard for the Codex-flagged bug where
+        // BuildAndReleaseSnapshot called Cleanup() synchronously, nulling
+        // _capture before the worker's WaitCaptureStable loop could observe
+        // real length growth from trailing rows (Format-Table tails, cmd
+        // PROMPT repaint, bash progress-bar final frames) emitted between
+        // OSC A and the settle deadline. The fix: hand _capture off to
+        // _settlingCapture in BuildAndReleaseSnapshot so FeedOutput can
+        // keep routing post-OSC-A bytes into the SAME capture object that
+        // the snapshot references. The worker owns detach via
+        // DetachSettlingCapture once it has read its final slice.
+        {
+            var t = new CommandTracker();
+            var (getLast, _) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("trailing"));
+            DriveCycle(t, "main-line\n", exit: 0);
+
+            var snap = getLast();
+            Assert(snap != null, "post-osc-a: snapshot emitted");
+
+            // OSC A has already fired and the tracker has called
+            // BuildAndReleaseSnapshot. In the old code _capture would
+            // be null, so _settlingCapture would also be null, and
+            // these FeedOutput calls would be discarded silently.
+            var lengthAfterSnapshot = snap!.Capture.Length;
+            t.FeedOutput("trailing-row-after-osc-a\n");
+            var lengthAfterTrail = snap.Capture.Length;
+
+            Assert(lengthAfterTrail > lengthAfterSnapshot,
+                $"post-osc-a: capture length grew after trailing FeedOutput (before={lengthAfterSnapshot}, after={lengthAfterTrail})");
+
+            // Read the trailing region from the SAME capture object the
+            // snapshot owns. This is exactly the read shape
+            // ConsoleWorker.FinalizeSnapshotAsync uses after WaitCaptureStable
+            // observes growth — slice from CommandStart to the current
+            // Length, not from CommandStart to snap.CommandEnd (which was
+            // set at OSC D and pre-dates the trailing bytes).
+            var extended = snap.Capture.ReadSlice(snap.CommandStart, snap.Capture.Length - snap.CommandStart);
+            Assert(extended.Contains("main-line"),
+                "post-osc-a: main command output still present in extended slice");
+            Assert(extended.Contains("trailing-row-after-osc-a"),
+                "post-osc-a: trailing bytes arrived in the same capture");
+
+            // Worker's final handoff: once it has read its slice, it
+            // cuts the tracker's write path so further PTY bytes don't
+            // try to append to a disposed capture. Post-detach
+            // FeedOutput must not extend the handed-off capture.
+            t.DetachSettlingCapture(snap.Capture);
+            var lengthBeforeOrphan = snap.Capture.Length;
+            t.FeedOutput("post-detach bytes\n");
+            Assert(snap.Capture.Length == lengthBeforeOrphan,
+                "post-osc-a: after detach, further FeedOutput does NOT extend the capture");
+
+            // DetachSettlingCapture with a stale capture (already replaced
+            // by a newer RegisterCommand) must be a safe no-op.
+            var orphaned = new CommandOutputCapture();
+            t.DetachSettlingCapture(orphaned);  // should not throw
+            orphaned.Complete();
+        }
+
+        // Back-to-back commands: a new RegisterCommand arriving before the
+        // worker finishes the previous finalize must displace the stale
+        // settling capture so the new command gets exclusive routing.
+        // Trailing bytes for the prior command land nowhere (the worker's
+        // slice has already been read by then), which is the correct
+        // tradeoff — the new command's bytes must not bleed into the old
+        // capture.
+        {
+            var t = new CommandTracker();
+            var (getLast, reset) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("first"));
+            DriveCycle(t, "first-output\n", exit: 0);
+            var firstSnap = getLast();
+            Assert(firstSnap != null, "back-to-back: first snapshot emitted");
+
+            // No DetachSettlingCapture yet — simulate a racing new
+            // RegisterCommand before the worker finishes finalize.
+            reset();
+            _ = t.RegisterCommand(Reg("second"));
+            DriveCycle(t, "belongs to second\n", exit: 0);
+            var secondSnap = getLast();
+            Assert(secondSnap != null, "back-to-back: second snapshot emitted");
+            Assert(!ReferenceEquals(firstSnap!.Capture, secondSnap!.Capture),
+                "back-to-back: second snapshot uses a fresh capture");
+            Assert(Cleaned(secondSnap).Contains("belongs to second"),
+                "back-to-back: second capture owns its own bytes");
+            // The first capture's bytes must NOT bleed into the second
+            // capture — the tracker cut the write path to the first
+            // capture at RegisterCommand("second") time.
+            Assert(!Cleaned(secondSnap).Contains("first-output"),
+                "back-to-back: first capture's bytes do NOT leak into second");
         }
 
         // Preemptive timeout fires FlipToCacheMode through the CTS
         // registration, the task faults with TimeoutException, and the
-        // eventual OSC cycle appends the result to the cache. End-to-end
-        // exercise of the wall-clock path — uses a 1s timeout so the
-        // total test wait is bounded.
+        // eventual OSC cycle emits the snapshot through the event. Uses a
+        // 1s timeout so the total test wait is bounded.
         {
             var t = new CommandTracker();
-            var task = t.RegisterCommand("slow", timeoutMs: 1000);
+            var (getLast, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("slow", timeoutMs: 1000));
 
             var deadline = DateTime.UtcNow.AddSeconds(3);
             while (DateTime.UtcNow < deadline && !task.IsCompleted)
@@ -701,38 +780,194 @@ public class CommandTrackerTests
             Assert(task.Exception!.InnerException is TimeoutException,
                 "preempt: fault is TimeoutException");
             Assert(t.Busy, "preempt: tracker still busy (command still running in shell)");
-            Assert(!t.HasCachedOutput, "preempt: cache still empty before shell finishes");
+            Assert(getLast() == null, "preempt: no snapshot yet (shell hasn't finished)");
 
-            DriveResolve(t, "slow-output\n", exit: 0);
-            Assert(!t.Busy, "preempt: tracker idle after Resolve");
-            Assert(t.HasCachedOutput, "preempt: cache populated after Resolve");
+            DriveCycle(t, "slow-output\n", exit: 0);
+            Assert(t.Busy, "preempt: tracker stays Busy until worker releases");
 
-            var drained = t.ConsumeCachedOutputs();
-            Assert(drained.Count == 1, $"preempt: one result drained (got {drained.Count})");
-            Assert(drained[0].Output.Contains("slow-output"),
-                "preempt: output captured via cache path");
-            Assert(drained[0].Command == "slow", "preempt: command text preserved");
+            var snap = getLast();
+            Assert(snap != null, "preempt: snapshot delivered via event after cycle");
+            Assert(Cleaned(snap!).Contains("slow-output"),
+                "preempt: output captured via event path");
+            Assert(snap!.Command == "slow", "preempt: command text preserved");
+
+            t.ReleaseAiCommand(snap.Generation);
+            Assert(!t.Busy, "preempt: tracker idle after ReleaseAiCommand");
         }
 
-        // CachedOutputCount reflects the current list length without
-        // draining — lets callers detect whether a drain would return
-        // anything without consuming it.
+        // Settle-window race guard (Codex Bug 1): the tracker must
+        // stay Busy across the interval between snapshot emission and
+        // the worker's ReleaseAiCommand, because get_status's
+        // "standby + hasCachedOutput=false" response during that
+        // window causes ConsoleManager.WaitForCompletionAsync to drop
+        // the pid as "cache lost". We simulate a fast poller that
+        // queries Busy immediately after each OSC event: at no point
+        // between RegisterCommand and ReleaseAiCommand should Busy
+        // read false.
         {
             var t = new CommandTracker();
-            Assert(t.CachedOutputCount == 0, "count: initially 0");
+            var (getLast, _) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("race"));
+            Assert(t.Busy, "race: Busy set by RegisterCommand");
 
-            _ = t.RegisterCommand("a", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "a-out\n", exit: 0);
-            Assert(t.CachedOutputCount == 1, "count: 1 after first flip+resolve");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            Assert(t.Busy, "race: Busy after OSC C");
 
-            _ = t.RegisterCommand("b", timeoutMs: 30_000);
-            t.FlipToCacheMode();
-            DriveResolve(t, "b-out\n", exit: 0);
-            Assert(t.CachedOutputCount == 2, "count: 2 after second flip+resolve");
+            t.FeedOutput("race-output\n");
+            Assert(t.Busy, "race: Busy after output");
 
-            t.ConsumeCachedOutputs();
-            Assert(t.CachedOutputCount == 0, "count: 0 after drain");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            Assert(t.Busy, "race: Busy after OSC D");
+
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(t.Busy, "race: Busy after OSC A (snapshot emitted, finalize pending)");
+
+            var snap = getLast();
+            Assert(snap != null, "race: snapshot emitted");
+            // Simulate the worker's settle window: bytes can still
+            // arrive between emission and ReleaseAiCommand. Busy must
+            // not flicker off at any sampled moment.
+            t.FeedOutput("trailing-byte");
+            Assert(t.Busy, "race: Busy during settle window");
+
+            t.ReleaseAiCommand(snap!.Generation);
+            Assert(!t.Busy, "race: Busy clears only after ReleaseAiCommand");
+        }
+
+        // Generation-token guard (Codex Bug 1): a stale
+        // ReleaseAiCommand fired by a previous command's finalize
+        // AFTER a new command has registered must no-op — the
+        // tracker must not clear the new command's busy flag.
+        {
+            var t = new CommandTracker();
+            var (getLast, reset) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("first"));
+            DriveCycle(t, "first-output\n", exit: 0);
+            var firstSnap = getLast();
+            Assert(firstSnap != null, "gen: first snapshot emitted");
+
+            // Simulate a back-to-back RegisterCommand before the
+            // worker's finalize-once path had a chance to call
+            // ReleaseAiCommand for the first snapshot. Under the new
+            // semantics _tcs is null after emission, so the new
+            // RegisterCommand is accepted and bumps the generation.
+            reset();
+            _ = t.RegisterCommand(Reg("second"));
+            Assert(t.Busy, "gen: Busy still set after new registration");
+
+            // Stale release from the first finalize now fires. It
+            // must NOT clear Busy because the generation differs.
+            t.ReleaseAiCommand(firstSnap!.Generation);
+            Assert(t.Busy, "gen: stale release from first finalize is a no-op");
+
+            // Complete the second command normally — the fresh
+            // generation's release clears Busy as expected.
+            DriveCycle(t, "second-output\n", exit: 0);
+            var secondSnap = getLast();
+            Assert(secondSnap != null, "gen: second snapshot emitted");
+            Assert(secondSnap!.Generation != firstSnap.Generation,
+                "gen: generations differ between commands");
+            t.ReleaseAiCommand(secondSnap.Generation);
+            Assert(!t.Busy, "gen: matched release clears Busy");
+        }
+
+        // OSC A offset capture (Codex Bug 2): the snapshot must
+        // carry the capture length at the moment OSC A fired so the
+        // finalizer can cap its read slice before prompt text
+        // arrives. Non-pwsh shells stream prompt chars (bash `$ `,
+        // cmd PROMPT repaint) immediately after OSC A, and without
+        // this cap the "extend past CommandEnd for trailing command
+        // output" rule would swallow them into the result.
+        {
+            var t = new CommandTracker();
+            var (getLast, _) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("prompt-bleed"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.FeedOutput("real-command-output\n");
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            // Simulate bash / cmd streaming the next prompt AFTER
+            // OSC A fires — this must NOT bleed into the finalized
+            // slice.
+            t.FeedOutput("$ ");
+
+            var snap = getLast();
+            Assert(snap != null, "prompt-offset: snapshot emitted");
+            Assert(snap!.PromptStartOffset.HasValue,
+                "prompt-offset: PromptStartOffset is populated on the snapshot");
+            Assert(snap.PromptStartOffset < snap.Capture.Length,
+                "prompt-offset: post-OSC-A bytes landed in the capture but outside the cap");
+
+            // The finalizer's effectiveEnd = Min(Max(CommandEnd, Length), PromptStartOffset)
+            // picks a slice that stops at OSC A, so the cleaned
+            // result must not contain the `$ ` prompt bytes.
+            var cutoff = snap.PromptStartOffset ?? snap.Capture.Length;
+            var effectiveEnd = Math.Min(
+                Math.Max(snap.CommandEnd, snap.Capture.Length),
+                cutoff);
+            var cleaned = CommandOutputFinalizer.Clean(snap.Capture, snap.CommandStart, effectiveEnd);
+            Assert(cleaned.Contains("real-command-output"),
+                "prompt-offset: cleaned slice contains the real command output");
+            Assert(!cleaned.Contains("$ "),
+                $"prompt-offset: cleaned slice does NOT contain the post-OSC-A prompt (got: {cleaned})");
+        }
+
+        // Codex Review — Bug 2: disposing _timeoutReg must happen
+        // outside _lock. The preemptive-timeout callback
+        // (FlipToCacheMode) tries to reacquire _lock; with
+        // CancellationTokenRegistration.Dispose blocking until that
+        // callback finishes, disposing under the lock is a classic
+        // AB-BA deadlock. Both dispose sites — AbortPending and the
+        // BuildAndReleaseSnapshot emission path — must complete even
+        // when the timeout fires concurrently.
+        //
+        // Drive the race in a background task and bound the worst-
+        // case wait: the fixed code finishes in milliseconds, while
+        // the pre-fix code would block until the test runner's
+        // timeout cancels the process.
+        {
+            // Abort-pending vs. concurrent preemptive timeout. Fire a
+            // short timeout so the CTS is already cancelled (or
+            // cancelling) by the time AbortPending takes _lock and
+            // tries to dispose _timeoutReg.
+            var t = new CommandTracker();
+            var task = t.RegisterCommand(Reg("abort-timeout-race", timeoutMs: 1));
+
+            var finished = Task.Run(() =>
+            {
+                // Spin briefly so the CTS has a chance to start firing
+                // FlipToCacheMode on the threadpool while we take the
+                // lock inside AbortPending.
+                System.Threading.Thread.SpinWait(1000);
+                t.AbortPending();
+            });
+            Assert(finished.Wait(TimeSpan.FromSeconds(5)),
+                "timeout-dispose: AbortPending returns even with preemptive-timeout callback racing");
+            Assert(task.IsFaulted, "timeout-dispose: pending task faulted after AbortPending");
+        }
+
+        {
+            // Normal completion vs. concurrent preemptive timeout.
+            // BuildAndReleaseSnapshot used to call _timeoutReg.Dispose
+            // under _lock; fix the race by disposing outside.
+            var t = new CommandTracker();
+            var (getLast, _) = CaptureSnapshot(t);
+            _ = t.RegisterCommand(Reg("complete-timeout-race", timeoutMs: 1));
+
+            var finished = Task.Run(() =>
+            {
+                System.Threading.Thread.SpinWait(1000);
+                t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+                t.FeedOutput("race-body\n");
+                t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+                t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            });
+            Assert(finished.Wait(TimeSpan.FromSeconds(5)),
+                "timeout-dispose: snapshot emission returns even with preemptive-timeout callback racing");
+            var snap = getLast();
+            Assert(snap != null,
+                "timeout-dispose: snapshot still emitted after racing completion + timeout");
+            if (snap != null) t.ReleaseAiCommand(snap.Generation);
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");

@@ -1,6 +1,5 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace Ripple.Services;
 
@@ -8,22 +7,38 @@ namespace Ripple.Services;
 /// Tracks command lifecycle using OSC 633 events.
 /// Runs in the console worker process.
 ///
-/// Flow:
-///   RegisterCommand() → command written to PTY →
-///   OSC C (CommandExecuted) → output captured →
-///   OSC D;{exitCode} (CommandFinished) → OSC P;Cwd=... → OSC A (PromptStart) →
-///   Resolve() with { output, exitCode, cwd } → proxy drains post-primary
-///   buffer via WaitAndDrainPostOutputAsync (stable_ms comes from the
-///   adapter's output.post_prompt_settle_ms)
+/// Scope (post ripple issue #1 refactor):
+///   - detect command boundaries (OSC C / OSC D / OSC A plus the cmd.exe
+///     and regex-prompt fallbacks) and translate them into raw-capture
+///     offsets on a <see cref="CommandOutputCapture"/>.
+///   - route every PTY-produced char into either that capture (while an
+///     AI command is in flight) or the "not my command" ring used by
+///     peek_console / timeout partialOutput.
+///   - expose a tail-bounded snapshot of the in-flight AI command so the
+///     worker's timeout response has something meaningful to surface in
+///     <c>partialOutput</c>.
 ///
-/// On timeout: caller's Task is cancelled, but output capture continues.
-/// When the shell eventually completes, the result is cached for WaitForCompletion.
+/// Explicitly NOT tracker responsibilities (these all moved to
+/// <see cref="ConsoleWorker"/>'s finalize-once path):
+///   - cleaning ANSI / prompt noise off the command output window.
+///   - applying truncation or writing spill files.
+///   - assembling <see cref="CommandResult"/> objects.
+///   - owning a completed-result cache and status-line formatting.
+///
+/// Flow:
+///   RegisterCommand(registration) → command written to PTY →
+///   OSC C (CommandExecuted) → MarkCommandStart on the capture →
+///   OSC D;{exitCode} (CommandFinished) → MarkCommandEnd on the capture →
+///   OSC A (PromptStart) → emit <see cref="CompletedCommandSnapshot"/> →
+///   worker finalizes once.
+///
+/// On timeout: the worker's caller side cancels, but the tracker keeps
+/// capturing. When the shell eventually resolves the command the
+/// snapshot is still emitted; the worker decides whether to deliver it
+/// inline or cache it for the next <c>wait_for_completion</c>.
 /// </summary>
 public class CommandTracker
 {
-    private const int MaxAiOutputBytes = 1024 * 1024; // 1MB
-    private const int PostPrimaryMaxBytes = 64 * 1024; // 64 KB for trailing-output delta
-
     // Rolling window of everything the PTY has emitted recently, regardless
     // of whether an AI command was in flight or the user typed something
     // themselves. Used by (a) execute_command's timeout response, which
@@ -33,43 +48,50 @@ public class CommandTracker
     // Small and fixed-size so the token cost of returning it stays bounded.
     private const int RecentOutputCapacity = 4096;
 
-    // Non-SGR ANSI escape sequence pattern.
-    // Strips cursor movement, erase, and other control sequences, but preserves
-    // SGR (Select Graphic Rendition, ending in 'm') so color information is
-    // passed through to the AI for context (e.g. red errors, green success).
-    // OSC sequences (window title etc.) are also stripped.
-    //
-    // Alternatives covered:
-    //   \x1b[...letter       — CSI sequences (cursor, erase, SGR "m" preserved)
-    //   \x1b]...\x07         — OSC with BEL terminator
-    //   \x1b]...\x1b\        — OSC with ST terminator
-    //   \x1b[()][0-9A-B]     — Character set designation (G0/G1)
-    //   \x1b[=>]             — DECKPAM / DECKPNM keypad mode (PSReadLine emits
-    //                          these around prompt redraws; leaving them through
-    //                          makes the ESC byte invisible and the trailing
-    //                          '=' or '>' look like a stray char at the start
-    //                          or end of captured output).
-    private static readonly Regex AnsiRegex = new(
-        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]|\x1b[=>]",
-        RegexOptions.Compiled);
-
-
-    // pwsh prompt pattern: "PS <drive>:\<path>> "
-    // ConPTY may emit this glued to the previous line via cursor positioning,
-    // so we strip it inline before splitting on \n.
-    private static readonly Regex PwshPromptInline = new(
-        @"PS [A-Z]:\\[^\n>]*> ?",
-        RegexOptions.Compiled);
-
     private readonly object _lock = new();
-    private TaskCompletionSource<CommandResult>? _tcs;
+    private TaskCompletionSource<CompletedCommandSnapshot>? _tcs;
     private CancellationTokenRegistration _timeoutReg;
     private bool _isAiCommand;
     private bool _userCommandBusy;
     private bool _userBusyByPolling; // set by ConsoleWorker's CPU/child polling for cmd
     private bool _shellReady; // flipped on first PromptStart; gates user-busy tracking
-    private string _aiOutput = "";
-    private bool _truncated;
+
+    // Monotonic token stamped onto every CompletedCommandSnapshot at
+    // emission time so the worker's finalize-once path can safely
+    // release the tracker's AI-command busy flag without clobbering a
+    // newer command that registered while the previous finalize was
+    // still running. See ReleaseAiCommand.
+    private long _commandGeneration;
+
+    // Absolute char offset (in _capture) at which the current AI
+    // command's OSC A (PromptStart) fired. Set by HandleEvent when
+    // PromptStart closes a matched C/D cycle and propagated into the
+    // emitted snapshot. Reset on every RegisterCommand so a back-to-
+    // back command doesn't inherit the previous command's value. Null
+    // when OSC A hasn't fired yet for the in-flight command — in
+    // practice the snapshot is never emitted before OSC A, but callers
+    // treat it as nullable so early-exit / shell-exit paths that
+    // bypass OSC A still produce a usable snapshot.
+    private long? _promptStartOffset;
+
+    // Per-command capture store. Replaces the old _aiOutput string field
+    // and its 1MB truncation behaviour — the capture keeps a small hot
+    // window and spills the rest to a worker-private scratch file, with
+    // offset-based reads for the finalizer. Null when no AI command is
+    // tracked.
+    private CommandOutputCapture? _capture;
+
+    // Capture handed off to the worker's finalize-once path but still
+    // accepting PTY bytes that arrive AFTER OSC A has fired. Non-pwsh
+    // shells can emit trailing rows (Format-Table tails, cmd PROMPT
+    // repaint, progress-bar final frames) between OSC A and the
+    // worker's WaitCaptureStable settle deadline; those bytes must
+    // land in the same capture the finalizer slices so the cleaned
+    // output matches what the user saw. The worker takes ownership
+    // via DetachSettlingCapture once it has read its final slice; the
+    // tracker no-ops the detach if a newer command already replaced
+    // this reference. Guarded by _lock on every read/write.
+    private CommandOutputCapture? _settlingCapture;
 
     // Circular buffer storing the last RecentOutputCapacity chars of the
     // PTY output stream (OSC-stripped but still with SGR colors/cursor
@@ -83,42 +105,28 @@ public class CommandTracker
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
 
-    // Slice markers: _aiOutput position at OSC C (command about to run) and
-    // OSC D (command finished). CleanOutput slices [commandStart..commandEnd)
-    // from _aiOutput to produce the result, which cleanly excludes both the
-    // AcceptLine finalize rendering that PSReadLine writes between OSC B and
-    // OSC C and the prompt text that comes after OSC D / OSC A.
-    private int _commandStart = -1;
-    private int _commandEnd = -1;
-
-    // Trailing output that arrives AFTER Resolve() has returned the primary
-    // CommandResult — e.g. the pwsh prompt repaint or pwsh Format-Table rows
-    // that finish streaming after the OSC A marker. The proxy drains this via
-    // the drain_post_output pipe message after each successful execute.
-    private readonly StringBuilder _postPrimaryOutput = new();
-
-    // Cached results from commands whose response channel was lost —
-    // either a preemptive 170s timeout fired and returned a timeout
-    // response while the command kept running, or a new pipe request
-    // arrived while busy (proving the prior response channel broke)
-    // and FlipToCacheMode flipped the in-flight command. List, not
-    // single, because multiple such events can stack up on one console
-    // before any tool call drains the cache.
-    private readonly List<CommandResult> _cachedResults = new();
-
-    // When true, the in-flight command's Resolve() will append its
-    // result to _cachedResults instead of handing it to _tcs. Set by
-    // FlipToCacheMode when we decide the caller won't receive the
-    // result via the normal channel. Cleared on RegisterCommand for
-    // the next command's lifecycle.
-    private bool _shouldCacheOnComplete;
-
-    // Display identity set by ConsoleWorker at claim time. Used by
-    // Resolve() to bake a self-describing status line into the
-    // CommandResult before it is cached or delivered, so drain
-    // consumers don't have to reformat with proxy-side metadata.
-    private string? _displayName;
-    private string? _shellFamily;
+    // Registration metadata captured at RegisterCommand time. The
+    // finalizer-once path in ConsoleWorker uses these fields (not
+    // whatever the worker's adapter currently says) so a cached
+    // snapshot stays consistent with the configuration that was in
+    // effect when the command ran.
+    private string? _registeredShellFamily;
+    private string? _registeredDisplayName;
+    private int _registeredPostPromptSettleMs;
+    private string? _registeredInputEchoStrategy;
+    private string _registeredInputEchoLineEnding = "\n";
+    private string _registeredPtyPayload = "";
+    // Per-registration inline-delivery routing id. The worker allocates
+    // a monotonic id before calling RegisterCommand and stores it in
+    // its _inlineDeliveriesById dictionary alongside the inline TCS.
+    // The tracker stamps it onto the emitted snapshot so the worker's
+    // finalize-once path can deliver to the correct awaiter even when
+    // two concurrent execute requests sneak past the Busy gate and
+    // reach the finalize step on separate capture instances. Null when
+    // the worker chose not to wire an inline delivery (no ordinary
+    // flow does this today; tests that invoke the tracker directly
+    // without the worker can also leave it unset).
+    private long? _registeredInlineDeliveryId;
 
     // Last known cwd from any prompt (AI command or user command)
     private string? _lastKnownCwd;
@@ -135,25 +143,15 @@ public class CommandTracker
     }
 
     public bool Busy => _isAiCommand || _userCommandBusy || _userBusyByPolling;
-    public bool HasCachedOutput => _cachedResults.Count > 0;
-    public int CachedOutputCount { get { lock (_lock) return _cachedResults.Count; } }
 
     /// <summary>
-    /// Set the display identity used for cached result status lines.
-    /// Called by ConsoleWorker when a proxy claims this console, so
-    /// any command that later gets cached already carries a status
-    /// line that matches the display name / shell family the proxy
-    /// uses elsewhere. No-op if called with nulls — the tracker will
-    /// fall back to the pid-only form in BuildStatusLine.
+    /// True while an AI command is in flight. Distinct from
+    /// <see cref="Busy"/> (which also covers user-typed commands the
+    /// tracker never registered). The worker uses this to gate echo /
+    /// hold-gate behaviour that only makes sense for AI-dispatched
+    /// work.
     /// </summary>
-    public void SetDisplayContext(string? displayName, string? shellFamily)
-    {
-        lock (_lock)
-        {
-            _displayName = displayName;
-            _shellFamily = shellFamily;
-        }
-    }
+    public bool IsAiCommand { get { lock (_lock) return _isAiCommand; } }
 
     /// <summary>
     /// Update the polling-based user-busy hint. Used by ConsoleWorker for
@@ -188,50 +186,92 @@ public class CommandTracker
         get { lock (_lock) return _isAiCommand ? _stopwatch?.Elapsed.TotalSeconds : null; }
     }
 
-    public record CommandResult(
-        string Output,
-        int ExitCode,
-        string? Cwd,
-        string? Command,
-        string Duration,
-        string StatusLine);
-
     // MCP protocol imposes a 3-minute (180s) ceiling on tool-call
     // response latency. Past that the client stops listening and
     // anything we try to write is discarded. To guarantee that a
     // busy execute_command always gets a valid response back before
     // that ceiling, the tracker caps its own timeout at 170s and
-    // fires FlipToCacheMode at the cap — the execute_command handler
-    // sees the TimeoutException, returns a "timed out, cached for
-    // next tool call" response, and the still-running command's
-    // eventual result is appended to _cachedResults for the next
-    // drain to pick up.
+    // fails the awaiting task at the cap — the execute_command
+    // handler sees the TimeoutException, returns a "timed out,
+    // cached for next tool call" response, and the still-running
+    // command's eventual snapshot flows to the worker's cache via
+    // the same finalize-once path so the next drain picks it up.
     public const int PreemptiveTimeoutMs = 170_000;
 
     /// <summary>
+    /// All per-command input the worker needs to persist in the tracker
+    /// at registration time. Keeping this as a single parameter object
+    /// (rather than a growing method signature) makes it trivial to
+    /// extend without churning every caller, and documents which
+    /// metadata is consumed on the finalize-once path.
+    /// </summary>
+    public sealed record CommandRegistration(
+        string CommandText,
+        string PtyPayload,
+        string InputEchoLineEnding,
+        string? InputEchoStrategy,
+        string? ShellFamily,
+        string? DisplayName,
+        int PostPromptSettleMs,
+        int TimeoutMs = PreemptiveTimeoutMs,
+        long? InlineDeliveryId = null);
+
+    /// <summary>
     /// Register an AI-initiated command. Returns a Task that completes
-    /// when the shell signals command completion via OSC markers.
+    /// with a <see cref="CompletedCommandSnapshot"/> once the shell
+    /// signals command completion via OSC markers. The worker is
+    /// responsible for finalization — see <see cref="CompletedCommandSnapshot"/>.
+    ///
     /// The timeout is capped at <see cref="PreemptiveTimeoutMs"/> (170s)
     /// so the execute_command handler can always return a meaningful
     /// response within the MCP protocol's 3-minute window, even when
     /// the underlying command keeps running in the background.
     /// </summary>
-    public Task<CommandResult> RegisterCommand(string commandText, int timeoutMs = PreemptiveTimeoutMs)
+    public Task<CompletedCommandSnapshot> RegisterCommand(CommandRegistration registration)
     {
+        ArgumentNullException.ThrowIfNull(registration);
+
         // 0 is the "interactive" sentinel — caller wants ripple to flip
         // to cache mode as soon as possible so the MCP response comes
         // back without blocking on a shell waiting for user input.
         // Any other value is clamped to the MCP 170s ceiling so the
         // response path stays live.
+        var timeoutMs = registration.TimeoutMs;
         if (timeoutMs < 0) timeoutMs = 0;
         timeoutMs = Math.Min(timeoutMs, PreemptiveTimeoutMs);
 
+        Task<CompletedCommandSnapshot> task;
         lock (_lock)
         {
-            if (_isAiCommand)
+            // A live _tcs means a command is still awaiting its OSC
+            // cycle (snapshot has NOT been emitted yet). That's the
+            // "genuinely overlapping" case and must refuse.
+            //
+            // _isAiCommand alone is not enough to refuse: the finalize-
+            // once path now keeps _isAiCommand set across the settle +
+            // cache-insert window AFTER BuildAndReleaseSnapshot has
+            // cleared _tcs (so Busy stays true and get_status doesn't
+            // flicker to "standby"). If a back-to-back RegisterCommand
+            // lands during that window the tracker must accept it; the
+            // stale finalize's ReleaseAiCommand will no-op via the
+            // generation check below.
+            if (_tcs != null)
                 throw new InvalidOperationException("Another command is already executing.");
 
-            _tcs = new TaskCompletionSource<CommandResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // A still-present _settlingCapture here means the previous
+            // finalize hasn't called DetachSettlingCapture yet (a
+            // back-to-back command arrived before the worker's slice
+            // read completed). Cut the tracker's write path so the new
+            // command's PTY bytes route to _capture exclusively and
+            // don't bleed into the old capture's tail. Disposal of the
+            // detached capture is owned by the worker's finalize-once
+            // path (ConsoleWorker calls snapshot.Capture.Complete()
+            // after reading its slice); the tracker must not dispose
+            // here or an off-thread slice read would hit
+            // ObjectDisposedException.
+            _settlingCapture = null;
+
+            _tcs = new TaskCompletionSource<CompletedCommandSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
             // Capture the Task reference locally BEFORE wiring up the
             // CancellationTokenSource. When timeoutMs is 0 (or very
             // small), `new CancellationTokenSource(timeoutMs)` can be
@@ -241,43 +281,43 @@ public class CommandTracker
             // the broken response channel, so `return _tcs.Task` below
             // would NullReferenceException. Capturing `task` locally
             // means the null-out is harmless — we return the captured
-            // (already-faulted) reference. See commit 8275846 for the
-            // original NRE incident and the clamp-to-1000ms workaround
-            // this replaces.
-            var task = _tcs.Task;
+            // (already-faulted) reference.
+            task = _tcs.Task;
             _isAiCommand = true;
-            _aiOutput = "";
-            _truncated = false;
+            // Bump the generation so any in-flight ReleaseAiCommand
+            // from a previous command's finalize will no-op against the
+            // new command. See ReleaseAiCommand for the token check.
+            _commandGeneration++;
+            _promptStartOffset = null;
+            _capture = new CommandOutputCapture();
             _exitCode = 0;
             _cwd = null;
-            _commandSent = commandText;
-            _commandStart = -1;
-            _commandEnd = -1;
-            _shouldCacheOnComplete = false;
-            // _cachedResults is NOT cleared here — stale entries from
-            // prior flipped commands stay in the list until a drain
-            // (ConsumeCachedOutputs) picks them up. This is what lets
-            // the next tool call salvage results that were flipped
-            // because the prior response channel broke.
-            _postPrimaryOutput.Clear();
+            _commandSent = registration.CommandText;
+            _registeredShellFamily = registration.ShellFamily;
+            _registeredDisplayName = registration.DisplayName;
+            _registeredPostPromptSettleMs = Math.Max(0, registration.PostPromptSettleMs);
+            _registeredInputEchoStrategy = registration.InputEchoStrategy;
+            _registeredInputEchoLineEnding = registration.InputEchoLineEnding ?? "\n";
+            _registeredPtyPayload = registration.PtyPayload ?? "";
+            _registeredInlineDeliveryId = registration.InlineDeliveryId;
             _stopwatch = Stopwatch.StartNew();
 
             // Setup preemptive timeout. When the 170s cap (or the
-            // caller's shorter request) fires, we delegate to
-            // FlipToCacheMode so the in-flight command's eventual
-            // result ends up in _cachedResults instead of being
-            // silently discarded. HandleExecuteAsync catches the
-            // TimeoutException and turns it into a "cached for next
-            // tool call" response the AI can act on.
+            // caller's shorter request) fires, we surface a
+            // TimeoutException on the awaiting task; the worker turns
+            // that into a "cached for next tool call" response, and
+            // the in-flight snapshot eventually routes through the
+            // same finalize-once path (but the worker cache, not the
+            // inline channel). See FlipToCacheMode below.
             var timeoutCts = new CancellationTokenSource(timeoutMs);
             _timeoutReg = timeoutCts.Token.Register(FlipToCacheMode);
-
-            return task;
         }
+
+        return task;
     }
 
     /// <summary>
-    /// Flip the in-flight AI command to cache-on-complete mode. Called
+    /// Detach the in-flight AI command from its awaiting caller. Called
     /// when the pipe handler decides the response channel to the
     /// original caller has been lost — either because a preemptive
     /// 170s timer fired, or because a new pipe request arrived while
@@ -285,17 +325,16 @@ public class CommandTracker
     /// listening for the previous response). The blocked
     /// <c>_tcs</c> is failed with a <see cref="TimeoutException"/> so
     /// HandleExecuteAsync unwinds and returns a "cached for next tool
-    /// call" response, and <see cref="Resolve"/> will later append
-    /// the real result to <c>_cachedResults</c> instead of delivering
-    /// it through the dead channel. Safe no-op if there is no
-    /// in-flight AI command or if the TCS is already completed.
+    /// call" response; the real <see cref="CompletedCommandSnapshot"/>
+    /// arrives later via <see cref="SnapshotProduced"/> and the worker
+    /// caches it there. Safe no-op if there is no in-flight AI command
+    /// or if the TCS is already completed.
     /// </summary>
     public void FlipToCacheMode()
     {
         lock (_lock)
         {
             if (!_isAiCommand) return;
-            _shouldCacheOnComplete = true;
             if (_tcs != null && !_tcs.Task.IsCompleted)
             {
                 var tcs = _tcs;
@@ -306,19 +345,28 @@ public class CommandTracker
                 // CancellationTokenRegistration.Dispose blocks until the
                 // callback finishes, which would deadlock against the
                 // thread currently inside the callback. The registration
-                // is cleaned up by Resolve() / AbortPending() when the
-                // command eventually completes.
+                // is cleaned up when Resolve() / AbortPending() fires.
                 tcs.TrySetException(new TimeoutException("Response channel lost, command flipped to cache mode"));
             }
         }
     }
 
     /// <summary>
-    /// Mark the command-start position as 0 (start of <c>_aiOutput</c>) for shells
-    /// that cannot emit OSC 633 C at the right moment. cmd.exe has no preexec hook,
-    /// so there is no way for its prompt integration to fire OSC C before the
-    /// command output begins — this method lets the worker paper over that gap so
-    /// AI commands can still resolve when cmd's PROMPT fires OSC D + OSC A.
+    /// Event raised on primary command completion, regardless of whether
+    /// an inline caller is still listening. The worker subscribes once
+    /// and routes every snapshot through its shared finalize-once path
+    /// — inline vs. cache choice happens there based on whether the
+    /// registration's awaited task is still attached.
+    /// </summary>
+    public event Action<CompletedCommandSnapshot>? SnapshotProduced;
+
+    /// <summary>
+    /// Mark the command-start position as the start of the capture for
+    /// shells that cannot emit OSC 633 C at the right moment. cmd.exe
+    /// has no preexec hook, so there is no way for its prompt
+    /// integration to fire OSC C before the command output begins —
+    /// this method lets the worker paper over that gap so AI commands
+    /// can still resolve when cmd's PROMPT fires OSC D + OSC A.
     ///
     /// Safe no-op when no AI command is active or when OSC C already fired.
     /// </summary>
@@ -326,8 +374,8 @@ public class CommandTracker
     {
         lock (_lock)
         {
-            if (_isAiCommand && _commandStart < 0)
-                _commandStart = 0;
+            if (!_isAiCommand) return;
+            _capture?.ForceCommandStartAtZero();
         }
     }
 
@@ -338,27 +386,54 @@ public class CommandTracker
     /// </summary>
     public void AbortPending()
     {
+        CommandOutputCapture? orphaned = null;
+        CancellationTokenRegistration? timeoutToDispose = null;
         lock (_lock)
         {
             if (_tcs != null && !_tcs.Task.IsCompleted)
             {
                 var tcs = _tcs;
                 _tcs = null;
-                _timeoutReg.Dispose();
-                Cleanup();
+                // Dispose outside the lock: CancellationTokenRegistration.Dispose
+                // blocks until any in-flight callback (FlipToCacheMode)
+                // finishes, and that callback reacquires _lock — classic
+                // AB-BA deadlock. Detaching _tcs above makes the callback
+                // a no-op when it re-enters, so releasing the Dispose
+                // outside the lock is safe.
+                timeoutToDispose = _timeoutReg;
+                _timeoutReg = default;
+                // The capture was never handed to a snapshot (no
+                // OSC cycle completed), so its scratch file would
+                // leak if ResetPerCommandState just nulled the
+                // reference. Dispose outside the lock below.
+                orphaned = _capture;
+                // Shell exit: nobody will finalize this command and
+                // therefore nobody will call ReleaseAiCommand. Clear
+                // the AI-busy flag here so the worker doesn't stay
+                // in "busy" forever on a dead shell.
+                _isAiCommand = false;
+                ResetPerCommandState();
                 tcs.TrySetException(new InvalidOperationException("Shell process exited before the command completed."));
             }
+        }
+
+        timeoutToDispose?.Dispose();
+        if (orphaned is not null)
+        {
+            try { orphaned.Complete(); } catch { /* best effort */ }
         }
     }
 
     /// <summary>
     /// Feed an OSC event from the parser. The caller must pass events in
     /// source order, interleaved with matching FeedOutput calls, so that
-    /// _aiOutput.Length at event-dispatch time is the offset at which the
-    /// event fired in the original byte stream.
+    /// the capture's Length at event-dispatch time is the offset at
+    /// which the event fired in the original byte stream.
     /// </summary>
     public void HandleEvent(OscParser.OscEvent evt)
     {
+        CompletedCommandSnapshot? emit = null;
+        CancellationTokenRegistration? timeoutToDispose = null;
         lock (_lock)
         {
             // Always track cwd, even outside AI commands (for user manual cd)
@@ -424,10 +499,10 @@ public class CommandTracker
             {
                 case OscParser.OscEventType.CommandExecuted:
                     // OSC C: PreCommandLookupAction has fired, everything
-                    // preceding this point in _aiOutput is AcceptLine finalize
-                    // noise. Record the position so CleanOutput knows where
-                    // the real command output begins.
-                    _commandStart = _aiOutput.Length;
+                    // preceding this point in the capture is AcceptLine
+                    // finalize noise. Record the position so the finalizer
+                    // knows where the real command output begins.
+                    _capture?.MarkCommandStart();
                     break;
 
                 case OscParser.OscEventType.CommandFinished:
@@ -435,7 +510,7 @@ public class CommandTracker
                     // print the prompt. Snapshot the position here so the
                     // prompt text is excluded from the result.
                     _exitCode = evt.ExitCode;
-                    _commandEnd = _aiOutput.Length;
+                    _capture?.MarkCommandEnd();
                     break;
 
                 case OscParser.OscEventType.Cwd:
@@ -451,58 +526,77 @@ public class CommandTracker
                     // unrelated to our AI command — most commonly the
                     // very first prompt after pwsh startup, which can
                     // arrive AFTER RegisterCommand if the shell was slow
-                    // to initialize (Defender first-scan, Import-Module
-                    // PSReadLine, sourcing the banner prefix, etc) and
-                    // WaitForReady's timeout fell through. Resolving here
-                    // would hand the AI the reason banner / PSReadLine
-                    // prediction rendering as "command output" and leave
-                    // the real command unanswered. Ignore this OSC A and
-                    // wait for the real one.
-                    if (_commandStart >= 0 && _commandEnd >= 0)
-                        Resolve();
+                    // to initialize and WaitForReady's timeout fell
+                    // through. Resolving here would hand the AI the
+                    // reason banner / PSReadLine prediction rendering as
+                    // "command output" and leave the real command
+                    // unanswered. Ignore this OSC A and wait for the
+                    // real one.
+                    var window = _capture?.CommandWindow ?? (null, null);
+                    if (window.Start.HasValue && window.End.HasValue)
+                    {
+                        // Snapshot the capture's length AT the moment
+                        // OSC A fired — events are dispatched in source
+                        // order interleaved with FeedOutput, so
+                        // _capture.Length here is the byte offset
+                        // separating trailing command output (arrived
+                        // before OSC A) from prompt text (arrives after).
+                        // The finalizer uses this as a hard cap on
+                        // effectiveEnd so shells that stream a prompt
+                        // immediately after OSC A (bash `$ `, cmd
+                        // PROMPT) never leak prompt chars into the
+                        // command's cleaned output.
+                        _promptStartOffset = _capture?.Length;
+                        emit = BuildAndReleaseSnapshot(window.Start.Value, window.End.Value, out timeoutToDispose);
+                    }
                     break;
             }
         }
+
+        // Dispose the preemptive-timeout registration outside the lock:
+        // Dispose blocks until any in-flight FlipToCacheMode callback
+        // finishes, and that callback reacquires _lock, so disposing
+        // under the lock would deadlock.
+        timeoutToDispose?.Dispose();
+
+        // Raise the snapshot event OUTSIDE the tracker lock so subscribers
+        // (the worker's finalize-once path) can read from _capture without
+        // racing our next FeedOutput append or HandleEvent call. The
+        // snapshot itself owns the capture reference, and Resolve has
+        // already detached it from _capture so further appends can't
+        // corrupt the finalization window.
+        if (emit != null)
+            RaiseSnapshot(emit);
     }
 
     /// <summary>
-    /// Feed cleaned output from the PTY (OSC stripped). During an AI command
-    /// the text is appended to _aiOutput for later OSC C/D slicing; outside
-    /// an AI command it goes to the post-primary drain buffer for the
-    /// proxy. In BOTH modes the text is also mirrored into _recentBuf, a
-    /// small rolling window that peek_console and execute timeout responses
-    /// return as "what's on screen right now" context.
+    /// Feed cleaned output from the PTY (OSC stripped). While an AI
+    /// command is running the bytes land in the active capture;
+    /// after OSC A has fired and the snapshot has been handed off,
+    /// trailing bytes still belonging to the command result keep
+    /// flowing into <c>_settlingCapture</c> until the worker detaches
+    /// it. Outside any AI command capture context the bytes are
+    /// ignored by the tracker — the worker's finalize-once path owns
+    /// the post-prompt settle window for AI commands, and nothing
+    /// reads user-output bytes after a prompt anymore. In every
+    /// branch the text is also mirrored into <c>_recentBuf</c>, a
+    /// small rolling window that peek_console and execute timeout
+    /// responses return as "what's on screen right now" context.
     /// </summary>
     public void FeedOutput(string text)
     {
+        if (string.IsNullOrEmpty(text)) return;
         lock (_lock)
         {
             AppendRecent(text);
 
-            if (_isAiCommand)
-            {
-                if (_aiOutput.Length < MaxAiOutputBytes)
-                {
-                    _aiOutput += text;
-                    if (_aiOutput.Length > MaxAiOutputBytes)
-                    {
-                        _aiOutput = _aiOutput[..MaxAiOutputBytes];
-                        _truncated = true;
-                    }
-                }
-                return;
-            }
-
-            // No AI command active: this is either pre-first-prompt shell boot
-            // noise, a user-typed command's output, or trailing bytes arriving
-            // after a primary Resolve() has returned. Capture into the
-            // post-primary buffer — the proxy drains it via drain_post_output.
-            // Bounded at PostPrimaryMaxBytes so a runaway shell can't grow the
-            // buffer forever if the proxy never drains.
-            var remaining = PostPrimaryMaxBytes - _postPrimaryOutput.Length;
-            if (remaining <= 0) return;
-            if (text.Length <= remaining) _postPrimaryOutput.Append(text);
-            else _postPrimaryOutput.Append(text, 0, remaining);
+            // Prefer the in-flight capture while a command is being
+            // tracked; fall through to _settlingCapture so bytes that
+            // arrive after OSC A (but before the worker's settle
+            // deadline) still reach the same capture object the
+            // finalizer will slice.
+            var target = _capture ?? _settlingCapture;
+            target?.Append(text);
         }
     }
 
@@ -571,20 +665,22 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Snapshot of the AI output accumulated for the current in-flight
-    /// command only (i.e. what FeedOutput has written since the OSC C
-    /// that started this command). Returns an empty string outside an
-    /// AI command. Used by execute_command's timeout response as the
-    /// `partialOutput` payload so the AI sees only the bytes produced
-    /// by the command it just launched — not whatever the shell had
-    /// on screen from previous commands whose results have already
-    /// been drained.
+    /// Tail-bounded snapshot of what the current in-flight AI command has
+    /// produced so far. Returns an empty string outside an AI command.
+    /// Used by execute_command's timeout response as the
+    /// <c>partialOutput</c> payload so the AI sees only the bytes
+    /// produced by the command it just launched — NOT whatever the
+    /// shell had on screen from previous commands whose results have
+    /// already been drained, and NOT a preview of any oversize spill
+    /// file (those only exist after finalization, which by definition
+    /// has not happened yet when this is called).
     /// </summary>
-    public string GetCurrentAiOutputSnapshot()
+    public string GetCurrentCommandSnapshot(int? maxChars = null)
     {
         lock (_lock)
         {
-            return _isAiCommand ? _aiOutput : "";
+            if (!_isAiCommand || _capture is null) return "";
+            return _capture.GetCurrentCommandSnapshot(maxChars);
         }
     }
 
@@ -1021,152 +1117,116 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Atomically drain all cached command results and clear the
-    /// internal list. Each call returns the complete set of cached
-    /// entries accumulated since the last drain — never partial.
-    /// Callers render every returned CommandResult (each has its own
-    /// baked-in status line) so nothing is silently lost when multiple
-    /// flipped commands stacked up before the drain fired.
+    /// Resolve the in-flight AI command into a <see cref="CompletedCommandSnapshot"/>.
+    /// Completes the awaiting caller's task (if still attached), hands
+    /// the capture handle to the snapshot, and clears the tracker's
+    /// per-command capture state. Deliberately leaves
+    /// <c>_isAiCommand = true</c> — the worker's finalize-once path
+    /// calls <see cref="ReleaseAiCommand"/> after the result has
+    /// landed in the cache (or been delivered inline), so the
+    /// tracker's <see cref="Busy"/> / <see cref="Status"/> view stays
+    /// semantically "busy" across the entire settle + finalize
+    /// window. Without that, a fast-polling client can observe
+    /// <c>{status: standby, hasCachedOutput: false}</c> between
+    /// emission and cache insertion and treat the command as lost.
+    /// Caller must hold <see cref="_lock"/>.
     /// </summary>
-    public List<CommandResult> ConsumeCachedOutputs()
+    private CompletedCommandSnapshot? BuildAndReleaseSnapshot(
+        long commandStart,
+        long commandEnd,
+        out CancellationTokenRegistration? timeoutToDispose)
+    {
+        timeoutToDispose = null;
+        if (_capture is null) return null;
+
+        var duration = _stopwatch?.Elapsed.TotalSeconds.ToString("F1") ?? "0.0";
+
+        // Move ownership of the active capture into _settlingCapture
+        // BEFORE ResetPerCommandState nulls _capture. FeedOutput
+        // continues routing post-OSC-A bytes into the same object
+        // via this reference so the worker's settle window sees real
+        // length growth instead of polling a frozen capture. The
+        // worker owns the disposal lifetime from here on and detaches
+        // by calling DetachSettlingCapture once it has read its final
+        // slice.
+        var capture = _capture;
+        _settlingCapture = capture;
+
+        var snapshot = new CompletedCommandSnapshot(
+            Capture: capture,
+            CommandStart: commandStart,
+            CommandEnd: commandEnd,
+            ExitCode: _exitCode,
+            Duration: duration,
+            Cwd: _cwd,
+            Command: _commandSent,
+            ShellFamily: _registeredShellFamily,
+            DisplayName: _registeredDisplayName,
+            PostPromptSettleMs: _registeredPostPromptSettleMs,
+            InputEchoStrategy: _registeredInputEchoStrategy,
+            InputEchoLineEnding: _registeredInputEchoLineEnding,
+            PtyPayloadBaseline: _registeredPtyPayload,
+            PromptStartOffset: _promptStartOffset,
+            Generation: _commandGeneration,
+            InlineDeliveryId: _registeredInlineDeliveryId);
+
+        // Hand the inline caller (if still attached) the snapshot
+        // directly; the worker's shared finalize-once path consumes
+        // it via the same code either way. If the caller is gone
+        // (FlipToCacheMode already detached _tcs or the timeout
+        // fired), we still raise the event so the worker's cache
+        // branch picks the snapshot up.
+        var tcs = _tcs;
+        _tcs = null;
+        // Dispose outside the lock: CancellationTokenRegistration.Dispose
+        // blocks until any in-flight callback (FlipToCacheMode)
+        // finishes, and that callback reacquires _lock — classic
+        // AB-BA deadlock. Detaching _tcs above makes the callback
+        // a no-op when it re-enters, so the caller releases the
+        // Dispose after exiting the lock.
+        timeoutToDispose = _timeoutReg;
+        _timeoutReg = default;
+        ResetPerCommandState();
+        tcs?.TrySetResult(snapshot);
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Clear the tracker's AI-busy flag after the worker's finalize-
+    /// once path has delivered (inline) or cached the snapshot. The
+    /// <paramref name="generation"/> check prevents a late release
+    /// from a stale finalize from clobbering a newer command that
+    /// registered while the previous finalize was still running:
+    /// <see cref="RegisterCommand"/> bumps <see cref="_commandGeneration"/>
+    /// on every new command, so the stale release's token will no
+    /// longer match and this method becomes a no-op. Safe to call
+    /// from any thread; the tracker reacquires <see cref="_lock"/>.
+    /// </summary>
+    public void ReleaseAiCommand(long generation)
     {
         lock (_lock)
         {
-            if (_cachedResults.Count == 0) return new List<CommandResult>();
-            var drained = new List<CommandResult>(_cachedResults);
-            _cachedResults.Clear();
-            return drained;
+            if (generation != _commandGeneration) return;
+            _isAiCommand = false;
         }
     }
 
     /// <summary>
-    /// Discard whatever is in the post-primary buffer without waiting. Used
-    /// by shells (pwsh/powershell) where nothing useful ever arrives after
-    /// OSC PromptStart — the trailing bytes are just the prompt repaint and
-    /// PSReadLine prediction animation, which would otherwise leak into the
-    /// next command's delta capture.
+    /// Worker handoff: the finalize-once path calls this after reading
+    /// its final slice from the capture. Clears the tracker's
+    /// settling-capture reference so no further PTY bytes route into
+    /// the soon-to-be-disposed capture. No-op if a newer
+    /// RegisterCommand has already replaced the reference (guards
+    /// against a late finalize racing the next command's start).
     /// </summary>
-    public void ClearPostPrimary()
+    internal void DetachSettlingCapture(CommandOutputCapture capture)
     {
-        lock (_lock) _postPrimaryOutput.Clear();
-    }
-
-    /// <summary>
-    /// Wait for the post-primary output buffer to stabilise (no growth for
-    /// stableMs), then drain it and return the cleaned delta. Called from
-    /// the worker's drain_post_output pipe handler after the primary execute
-    /// response has been delivered to the proxy.
-    /// </summary>
-    public async Task<string> WaitAndDrainPostOutputAsync(int stableMs, int maxMs, CancellationToken ct)
-    {
-        stableMs = Math.Max(1, stableMs);
-        maxMs = Math.Max(stableMs, maxMs);
-        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(maxMs);
-
-        int lastLen;
-        lock (_lock) lastLen = _postPrimaryOutput.Length;
-        var lastChange = DateTime.UtcNow;
-
-        while (DateTime.UtcNow < deadline)
-        {
-            var remaining = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
-            var pollMs = Math.Clamp(Math.Min(30, stableMs / 2), 5, remaining);
-            try { await Task.Delay(pollMs, ct); }
-            catch (OperationCanceledException) { break; }
-
-            int currentLen;
-            lock (_lock) currentLen = _postPrimaryOutput.Length;
-
-            if (currentLen != lastLen)
-            {
-                lastLen = currentLen;
-                lastChange = DateTime.UtcNow;
-                continue;
-            }
-
-            if ((DateTime.UtcNow - lastChange).TotalMilliseconds >= stableMs)
-                break;
-        }
-
-        string raw;
+        if (capture is null) return;
         lock (_lock)
         {
-            raw = _postPrimaryOutput.ToString();
-            _postPrimaryOutput.Clear();
-        }
-        return CleanDelta(raw);
-    }
-
-    /// <summary>
-    /// Clean a trailing-output delta — strip ANSI, drop trailing prompt and
-    /// blank lines, normalise CRLF. Unlike CleanOutput this does NOT strip
-    /// AcceptLine noise (no command echo in the delta) and does NOT trim
-    /// leading blanks (they might be meaningful Format-Table spacing).
-    /// </summary>
-    private static string CleanDelta(string raw)
-    {
-        if (string.IsNullOrEmpty(raw)) return "";
-
-        var output = StripAnsi(raw);
-        var lines = output.Split('\n');
-        var cleaned = new List<string>(lines.Length);
-        foreach (var rawLine in lines)
-        {
-            var line = rawLine.TrimEnd('\r');
-            var trimmed = line.TrimEnd();
-            if (trimmed == ">>" || trimmed.StartsWith(">> ")) continue;
-            cleaned.Add(line);
-        }
-
-        while (cleaned.Count > 0)
-        {
-            var last = cleaned[^1].Trim();
-            if (string.IsNullOrEmpty(last) ||
-                last is "$" or "#" or "%" or ">>" ||
-                IsShellPrompt(last))
-            {
-                cleaned.RemoveAt(cleaned.Count - 1);
-            }
-            else break;
-        }
-
-        return string.Join('\n', cleaned).TrimEnd();
-    }
-
-    private void Resolve()
-    {
-        lock (_lock)
-        {
-            var output = CleanOutput();
-            var duration = _stopwatch?.Elapsed.TotalSeconds.ToString("F1") ?? "0.0";
-            var statusLine = BuildStatusLine(_commandSent, _exitCode, duration, _cwd, _shellFamily, _displayName);
-            var result = new CommandResult(output, _exitCode, _cwd, _commandSent, duration, statusLine);
-
-            var deliverInline = !_shouldCacheOnComplete
-                                && _tcs != null
-                                && !_tcs.Task.IsCompleted;
-
-            if (deliverInline)
-            {
-                var tcs = _tcs!;
-                _timeoutReg.Dispose();
-                Cleanup();
-                tcs.TrySetResult(result);
-            }
-            else
-            {
-                // Response channel is known broken (either FlipToCacheMode
-                // fired, or the timeout CancellationTokenSource already
-                // detached _tcs before Resolve got called). Append to the
-                // cache list so the next tool call's drain picks it up.
-                // The command has finished running by now, so disposing
-                // the timer registration is safe — no more callbacks
-                // will fire even if we hadn't.
-                _timeoutReg.Dispose();
-                _cachedResults.Add(result);
-                _shouldCacheOnComplete = false;
-                Cleanup();
-            }
+            if (ReferenceEquals(_settlingCapture, capture))
+                _settlingCapture = null;
         }
     }
 
@@ -1194,73 +1254,20 @@ public class CommandTracker
         return firstLine;
     }
 
-    /// <summary>
-    /// Build a self-describing status line for a command result, using
-    /// what the worker knows at Resolve time: the proxy-supplied
-    /// display name, the adapter's shell family, the command text,
-    /// exit code, duration and resolved cwd. Baking this into the
-    /// CommandResult (rather than formatting at drain time on the
-    /// proxy side) keeps cached results self-contained: a cache
-    /// drain just reads the status line out and prints it, without
-    /// having to re-join metadata from the proxy's ConsoleInfo
-    /// which may have drifted since the command was registered.
-    /// Mirrors the visual format ShellTools.FormatStatusLine produces
-    /// for inline results.
-    /// </summary>
-    private static string BuildStatusLine(
-        string? command, int exitCode, string duration, string? cwd,
-        string? shellFamily, string? displayName)
+    private void RaiseSnapshot(CompletedCommandSnapshot snapshot)
     {
-        var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
-        var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
-        var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
-        var cmd = TruncateForStatusLine(command);
-
-        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
-        // worker always reports ExitCode=0 for cmd. Render a neutral
-        // "Finished" line with no success marker so the AI doesn't assume
-        // every cmd command succeeded.
-        if (shellFamily == "cmd")
-            return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-
-        return exitCode == 0
-            ? $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
-            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-    }
-
-    /// <summary>
-    /// Slice the command-output window out of _aiOutput and clean it up.
-    /// The window is [_commandStart, _commandEnd), filled in by OSC C and
-    /// OSC D. If OSC C never fired (parse error, OSC markers misconfigured)
-    /// we fall back to the whole buffer. If OSC D never fired but OSC A did
-    /// (unusual), we take everything up to _aiOutput.Length.
-    /// </summary>
-    private string CleanOutput()
-    {
-        var start = _commandStart >= 0 ? _commandStart : 0;
-        var end = _commandEnd >= 0 ? _commandEnd : _aiOutput.Length;
-        if (end < start) end = start;
-        if (end > _aiOutput.Length) end = _aiOutput.Length;
-
-        var raw = _aiOutput.Substring(start, end - start);
-
-        var output = StripAnsi(raw);
-        var lines = output.Split('\n');
-        var cleaned = new List<string>();
-        foreach (var rawLine in lines)
+        try
         {
-            var line = rawLine.TrimEnd('\r');
-            var trimmed = line.TrimEnd();
-            // pwsh continuation prompt lines from multi-line input aren't
-            // command output and look jarring in the result.
-            if (trimmed == ">>" || trimmed.StartsWith(">> ")) continue;
-            cleaned.Add(line);
+            SnapshotProduced?.Invoke(snapshot);
         }
-
-        var result = string.Join('\n', cleaned).Trim();
-        if (_truncated)
-            result += "\n\n[Output truncated at 1MB]";
-        return result;
+        catch
+        {
+            // Subscribers (the worker) already log their own errors;
+            // the tracker must not let a broken listener break the
+            // next command's registration. Swallowing here keeps the
+            // tracker's invariants intact even when the finalize-once
+            // path throws.
+        }
     }
 
     /// <summary>
@@ -1274,44 +1281,35 @@ public class CommandTracker
     }
 
     /// <summary>
-    /// Detect shell prompt lines. Used as fallback when OSC markers are unavailable.
-    /// Checks common formats + generic trailing prompt characters.
+    /// Clear the per-command bookkeeping after a snapshot has been
+    /// emitted (normal path) or a pending command has been aborted
+    /// (shell-exit path). Intentionally does NOT clear
+    /// <see cref="_isAiCommand"/>: on the normal path the worker's
+    /// finalize-once handler keeps the AI-busy flag alive until
+    /// <see cref="ReleaseAiCommand"/> fires, so the tracker stays
+    /// <see cref="Busy"/> across the settle + cache-insert window.
+    /// The abort path flips the flag explicitly before calling this
+    /// helper because nobody will ever finalize the orphaned
+    /// capture. Caller must hold <see cref="_lock"/>.
     /// </summary>
-    private static bool IsShellPrompt(string line)
+    private void ResetPerCommandState()
     {
-        // pwsh: "PS <path>>"
-        if (line.StartsWith("PS ") && line.EndsWith(">")) return true;
-        // cmd: "<drive>:\...>"
-        if (line.Length >= 2 && line[1] == ':' && line.EndsWith(">")) return true;
-        // bash/zsh/fish: ends with $, #, %, >, ❯, λ
-        // ccl/abcl top-level: ends with ? (other Common Lisp REPL prompts)
-        if (line.EndsWith('$') || line.EndsWith('#') || line.EndsWith('%') ||
-            line.EndsWith('>') || line.EndsWith('❯') || line.EndsWith('λ') ||
-            line.EndsWith('?'))
-            return true;
-        return false;
-    }
-
-    private void Cleanup()
-    {
-        _tcs = null;
-        _isAiCommand = false;
-        _aiOutput = "";
+        // The capture reference is handed off to the snapshot; the
+        // finalizer owns its lifetime from here. Null out the tracker
+        // field so the next RegisterCommand starts fresh.
+        _capture = null;
+        _promptStartOffset = null;
         _commandSent = "";
         _stopwatch = null;
-        _commandStart = -1;
-        _commandEnd = -1;
+        _registeredShellFamily = null;
+        _registeredDisplayName = null;
+        _registeredPostPromptSettleMs = 0;
+        _registeredInputEchoStrategy = null;
+        _registeredInputEchoLineEnding = "\n";
+        _registeredPtyPayload = "";
+        _registeredInlineDeliveryId = null;
         // _recentBuf survives deliberately — it's a rolling window
         // spanning command boundaries so peek_console can still show
         // what was on screen just before/during the next call.
     }
-
-    private static string StripAnsi(string text)
-    {
-        text = AnsiRegex.Replace(text, "");  // strip non-SGR sequences, keep colors
-        text = text.Replace("\r\n", "\n");   // CRLF → LF
-        text = text.Replace("\r", "");       // remove any remaining standalone CR
-        return text;
-    }
-
 }

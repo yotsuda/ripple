@@ -313,6 +313,411 @@ public class ConsoleWorkerTests
         if (fail > 0) Environment.Exit(1);
     }
 
+    // Named constants so the wire-field assertions read as contracts,
+    // not magic strings. Mirrored verbatim from the
+    // HandleGetCachedOutput producer so any rename breaks BOTH ends in
+    // review rather than silently desyncing proxy clients.
+    private const string WireSpillFilePathField = "spillFilePath";
+    private const string WireOutputField = "output";
+    private const string WireExitCodeField = "exitCode";
+    private const string WireStatusLineField = "statusLine";
+    private const string WireResultsField = "results";
+    private const string WireStatusField = "status";
+    private const string WireStatusOk = "ok";
+    private const string WireStatusNoCache = "no_cache";
+
+    /// <summary>
+    /// Platform-agnostic unit tests for the worker's cache / drain /
+    /// spill-lease plumbing. Unlike the existing E2E suite these tests
+    /// do NOT spin up a PTY — they instantiate a <see cref="ConsoleWorker"/>
+    /// directly, seed cache entries through the internal test hooks, and
+    /// assert the observable contract:
+    ///
+    ///   - drain response serializes <c>spillFilePath</c> as a wire field
+    ///     using the exact name the MCP proxy / clients consume
+    ///     (closes audit Gap 3 — the field was previously only covered
+    ///     by the Windows-only <c>--spill-tests</c> integration run);
+    ///   - draining a cache entry that owned a spill file releases its
+    ///     lease so the next age-based sweep actually deletes the file
+    ///     (closes audit Gap 2 — the "drain releases lease" transition
+    ///     was documented but never exercised as a test).
+    ///
+    /// No real filesystem I/O: the helper is swapped for an instance
+    /// backed by an in-memory <see cref="IOutputSpillFileSystem"/> and
+    /// a tunable <see cref="IClock"/> so the age-cutoff branch is
+    /// driven deterministically.
+    /// </summary>
+    public static void RunCacheUnitTests()
+    {
+        var pass = 0;
+        var fail = 0;
+        void Assert(bool condition, string name)
+        {
+            if (condition) { pass++; Console.WriteLine($"  PASS: {name}"); }
+            else { fail++; Console.Error.WriteLine($"  FAIL: {name}"); }
+        }
+
+        Console.WriteLine("=== ConsoleWorker Cache Unit Tests ===");
+
+        // Gap 3 — drain response exposes spillFilePath as a wire field,
+        // platform-agnostically. Previously only the Windows-only
+        // SpillIntegrationTests asserted this; the field is part of the
+        // proxy/MCP contract so it deserves unit-level coverage that runs
+        // on every dotnet build.
+        {
+            var worker = BuildDetachedWorker();
+            const string spillPath = @"C:\fake-temp\ripple.output\ripple_output_wire_test.txt";
+            var seeded = new ConsoleWorker.CommandResult(
+                Output: "Output too large (20000 characters). Full output saved to: " + spillPath,
+                ExitCode: 0,
+                Cwd: @"C:\fake-cwd",
+                Command: "emit-big",
+                Duration: "0.12",
+                StatusLine: "✓ #wire-test | Status: Completed | Pipeline: emit-big | Duration: 0.12s",
+                SpillFilePath: spillPath);
+            worker.TestSeedCachedResult(seeded);
+
+            var response = worker.TestDrainCachedOutput();
+
+            var status = response.TryGetProperty(WireStatusField, out var s) ? s.GetString() : null;
+            Assert(status == WireStatusOk, $"drain-wire: status == ok (got {status})");
+            Assert(response.TryGetProperty(WireResultsField, out var results)
+                    && results.ValueKind == JsonValueKind.Array
+                    && results.GetArrayLength() == 1,
+                "drain-wire: results array has one entry");
+
+            var entry = results[0];
+            Assert(entry.TryGetProperty(WireSpillFilePathField, out var sp)
+                    && sp.ValueKind == JsonValueKind.String
+                    && sp.GetString() == spillPath,
+                "drain-wire: spillFilePath field present and matches seeded path");
+            Assert(entry.TryGetProperty(WireOutputField, out var o) && o.GetString() == seeded.Output,
+                "drain-wire: output field carries seeded preview string");
+            Assert(entry.TryGetProperty(WireExitCodeField, out var e) && e.GetInt32() == 0,
+                "drain-wire: exitCode field present and == 0");
+            Assert(entry.TryGetProperty(WireStatusLineField, out var sl) && sl.GetString() == seeded.StatusLine,
+                "drain-wire: statusLine field carries baked line");
+
+            // Entries without a spill file MUST NOT emit the field (the
+            // producer only writes spillFilePath when non-null). Regression
+            // guard for the "always-present but sometimes empty string"
+            // failure mode that would force proxy clients to do null/empty
+            // discrimination on the consumer side.
+            var worker2 = BuildDetachedWorker();
+            var underThresholdSeed = new ConsoleWorker.CommandResult(
+                Output: "small",
+                ExitCode: 0,
+                Cwd: @"C:\fake-cwd",
+                Command: "emit-small",
+                Duration: "0.01",
+                StatusLine: "✓ #wire-test | Status: Completed | Pipeline: emit-small | Duration: 0.01s",
+                SpillFilePath: null);
+            worker2.TestSeedCachedResult(underThresholdSeed);
+            var response2 = worker2.TestDrainCachedOutput();
+            var entry2 = response2.GetProperty(WireResultsField)[0];
+            Assert(!entry2.TryGetProperty(WireSpillFilePathField, out _),
+                "drain-wire: spillFilePath omitted when no spill file was produced");
+        }
+
+        // Gap 2 — drain releases lease, but drain itself must NOT delete
+        // the spill file. The drain response publishes spillFilePath to
+        // the caller; deleting the file before the caller has opened it
+        // would strand the caller holding a path to nothing. Age-based
+        // cleanup still runs opportunistically on the next
+        // FinalizeSnapshotAsync, which is the natural cadence. Once the
+        // lease is released AND a later sweep fires, the file is
+        // reclaimed.
+        {
+            var now = new DateTimeOffset(2026, 4, 18, 12, 0, 0, TimeSpan.Zero);
+            var clock = new CacheTestClock(now);
+            var fs = new CacheTestFileSystem();
+            var spillDir = @"C:\fake-temp\ripple.output";
+            var helper = new OutputTruncationHelper(fs, clock, spillDir);
+
+            var worker = BuildDetachedWorker();
+            worker.TestReplaceTruncationHelper(helper);
+
+            // Seed a spill file that is ALREADY past the age cutoff. The
+            // live-lease predicate is the only thing keeping it around.
+            var spillPath = Path.Combine(spillDir, "ripple_output_lease_test.txt");
+            fs.PutFile(spillPath, "huge-output-body", now.AddMinutes(-240));
+
+            var seeded = new ConsoleWorker.CommandResult(
+                Output: "Output too large (20000 characters). Full output saved to: " + spillPath,
+                ExitCode: 0,
+                Cwd: @"C:\fake-cwd",
+                Command: "emit-big",
+                Duration: "0.12",
+                StatusLine: "✓ #lease-test | Status: Completed | Pipeline: emit-big | Duration: 0.12s",
+                SpillFilePath: spillPath);
+            worker.TestSeedCachedResult(seeded);
+
+            // Before drain: lease is in the set, cleanup must NOT delete.
+            Assert(worker.TestGetLiveSpillPaths().Contains(spillPath),
+                "lease: spill path is in live set after seed");
+            worker.TestTriggerSpillCleanup();
+            Assert(fs.Exists(spillPath),
+                "lease: cleanup skips aged spill file while lease is live");
+
+            // Drain releases the lease as part of its post-serialize
+            // release step (HandleGetCachedOutput removes the path from
+            // _liveSpillPaths after the response is built).
+            var drain = worker.TestDrainCachedOutput();
+            Assert(drain.TryGetProperty(WireStatusField, out var ds) && ds.GetString() == WireStatusOk,
+                "lease: drain returns status == ok");
+            Assert(!worker.TestGetLiveSpillPaths().Contains(spillPath),
+                "lease: drain releases lease (path no longer in live set)");
+
+            // Regression guard for the Codex audit remediation round 2
+            // "spillFilePath survives drain" fix: the drain path must
+            // NOT invoke TriggerSpillCleanup. The caller has the path
+            // in the response it just received and has not yet had a
+            // chance to open it; deleting on drain would strand that
+            // path holder. The file must still be on disk after the
+            // drain completes.
+            Assert(fs.Exists(spillPath),
+                "lease: drained spill file survives drain (caller still needs it)");
+
+            // Opportunistic age-based cleanup, simulating "the next
+            // FinalizeSnapshotAsync runs and opportunistically sweeps":
+            // now that the lease is released and the file is aged,
+            // the sweep deletes it. This pins the cleanup cadence
+            // moving from "drain-triggered" to "next-finalize-triggered".
+            worker.TestTriggerSpillCleanup();
+            Assert(!fs.Exists(spillPath),
+                "lease: unleased aged spill file swept by a later cleanup pass");
+
+            // Regression guard: a SECOND drain of an empty cache returns
+            // no_cache and does not throw, and does not re-resurrect the
+            // deleted file. This pins the drain endpoint as idempotent.
+            var drain2 = worker.TestDrainCachedOutput();
+            Assert(drain2.TryGetProperty(WireStatusField, out var ds2) && ds2.GetString() == WireStatusNoCache,
+                "lease: follow-up drain returns no_cache");
+        }
+
+        // Codex Review — Bug 1: a finalize failure must route through
+        // whichever delivery channel is still attached instead of
+        // silently dropping the command. Inline awaiters see the
+        // exception propagated through the TCS so HandleExecuteAsync
+        // returns a structured error. Detached (flip-to-cache) callers
+        // see a fallback CachedCommandResult with `Output` starting
+        // "finalize failed:" so wait_for_completion returns a real
+        // response instead of `no_cache`.
+        {
+            // Inline path: _inlineDelivery attached → TrySetException
+            var worker = BuildDetachedWorker();
+            worker.TestReplaceTruncationHelper(new ThrowingTruncationHelper());
+            var snapshot = BuildFinalizeTestSnapshot();
+            var tcs = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+
+            worker.TestRunFinalizeSnapshotAsync(snapshot, tcs).GetAwaiter().GetResult();
+
+            Assert(tcs.Task.IsFaulted,
+                "finalize-fail-inline: inline TCS is faulted (not hanging)");
+            Assert(tcs.Task.Exception!.InnerException is InvalidOperationException,
+                "finalize-fail-inline: inline TCS exception is the one the helper threw");
+            Assert(worker.TestGetCachedResultCount() == 0,
+                "finalize-fail-inline: nothing appended to the cache (inline path won the race)");
+        }
+        {
+            // Flip-to-cache path: no inline delivery attached → fallback
+            // cache entry with "finalize failed:" prefix so
+            // wait_for_completion returns a structured error payload.
+            var worker = BuildDetachedWorker();
+            worker.TestReplaceTruncationHelper(new ThrowingTruncationHelper());
+            var snapshot = BuildFinalizeTestSnapshot();
+
+            worker.TestRunFinalizeSnapshotAsync(snapshot, inlineDelivery: null)
+                .GetAwaiter().GetResult();
+
+            Assert(worker.TestGetCachedResultCount() == 1,
+                "finalize-fail-cache: fallback CachedCommandResult appended");
+
+            var drain = worker.TestDrainCachedOutput();
+            Assert(drain.TryGetProperty(WireStatusField, out var st) && st.GetString() == WireStatusOk,
+                "finalize-fail-cache: drain returns status == ok (not no_cache)");
+            var entry = drain.GetProperty(WireResultsField)[0];
+            var output = entry.GetProperty(WireOutputField).GetString() ?? "";
+            Assert(output.StartsWith("finalize failed:"),
+                $"finalize-fail-cache: Output begins with 'finalize failed:' (got: {output})");
+            Assert(output.Contains("InvalidOperationException"),
+                "finalize-fail-cache: Output carries the throwing exception type");
+        }
+
+        // Audit remediation round 2, Issue 1 — two concurrent execute
+        // registrations must never cross-deliver: finalizing command A
+        // completes A's TCS and NEVER touches B's TCS. The pre-fix
+        // shared _inlineDelivery field let B overwrite A's slot (or
+        // vice versa) so A's finalize could deliver into B's awaiter
+        // and strand A's caller on a never-completed Task. The fix
+        // routes delivery by the snapshot's per-registration
+        // InlineDeliveryId.
+        {
+            var worker = BuildDetachedWorker();
+
+            // Register command B's TCS first, as if B had reached the
+            // same critical section slightly earlier and is now parked
+            // awaiting its own snapshot. B does NOT get a snapshot in
+            // this test — we only prove A's finalize leaves B alone.
+            var tcsB = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var idB = worker.TestRegisterInlineDelivery(tcsB);
+
+            // Command A: a fresh TCS + a distinct id, wired through the
+            // seam that binds the id onto the snapshot before finalize
+            // runs. With the id-routing fix, the finalize looks the
+            // TCS up by the snapshot's id and hands A's result to A's
+            // TCS without even considering B's entry.
+            var tcsA = new TaskCompletionSource<ConsoleWorker.CommandResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var snapshotA = BuildFinalizeTestSnapshot() with { Command = "command-A" };
+
+            Assert(worker.TestGetInlineDeliveryCount() == 1,
+                "id-routing: exactly B's entry exists before A finalize");
+
+            worker.TestRunFinalizeSnapshotAsync(snapshotA, tcsA).GetAwaiter().GetResult();
+
+            Assert(tcsA.Task.IsCompletedSuccessfully,
+                "id-routing: A's TCS completed (result delivered to A's caller)");
+            Assert(tcsA.Task.Result.Command == "command-A",
+                "id-routing: A's TCS received A's CommandResult verbatim");
+            Assert(!tcsB.Task.IsCompleted,
+                "id-routing: B's TCS remains uncompleted (A's snapshot did NOT cross-deliver)");
+            Assert(worker.TestGetInlineDeliveryCount() == 1,
+                "id-routing: only A's entry was removed from the dict; B's entry survives");
+
+            // Cache must be empty — A was delivered inline via its own
+            // id, so nothing should have been appended as a fallback.
+            Assert(worker.TestGetCachedResultCount() == 0,
+                "id-routing: cache empty (A delivered inline, no fallback append)");
+            // Keep idB around so the later Dispose'/GC assertions stay
+            // meaningful even though nothing consumes it.
+            _ = idB;
+        }
+
+        Console.WriteLine($"\n{pass} passed, {fail} failed");
+        if (fail > 0) Environment.Exit(1);
+    }
+
+    /// <summary>
+    /// Minimal snapshot driving the finalize-failure tests. Carries just
+    /// enough context for BuildStatusLine and the fallback CommandResult
+    /// to populate their fields; the capture has a tiny body so
+    /// Length-based invariants still hold.
+    /// </summary>
+    private static CompletedCommandSnapshot BuildFinalizeTestSnapshot()
+    {
+        var capture = new CommandOutputCapture();
+        capture.Append("hello\n");
+        capture.MarkCommandStart();
+        capture.MarkCommandEnd();
+        return new CompletedCommandSnapshot(
+            Capture: capture,
+            CommandStart: 0,
+            CommandEnd: capture.Length,
+            ExitCode: 0,
+            Duration: "0.0",
+            Cwd: @"C:\fake-cwd",
+            Command: "finalize-failure-test",
+            ShellFamily: "pwsh",
+            DisplayName: "#finalize-fail",
+            PostPromptSettleMs: 0,
+            InputEchoStrategy: null,
+            InputEchoLineEnding: "\r",
+            PtyPayloadBaseline: "finalize-failure-test\r",
+            PromptStartOffset: capture.Length,
+            Generation: 0);
+    }
+
+    /// <summary>
+    /// Truncation helper that unconditionally throws from
+    /// <see cref="OutputTruncationHelper.Process"/>. Exercises the
+    /// finalize-once path's catastrophic-failure branch without having
+    /// to drive a real filesystem into a fault state.
+    /// </summary>
+    private sealed class ThrowingTruncationHelper : OutputTruncationHelper
+    {
+        public override OutputTruncationResult Process(string output)
+            => throw new InvalidOperationException("synthetic finalize failure");
+    }
+
+    /// <summary>
+    /// Builds a <see cref="ConsoleWorker"/> instance that exists only
+    /// to exercise the cache / drain plumbing. The constructor does
+    /// not spawn a PTY or open a pipe — those happen inside
+    /// <see cref="ConsoleWorker.RunAsync"/>, which we deliberately do
+    /// not call here. Shell and cwd values are inert placeholders
+    /// because every code path under test reads only from the
+    /// worker's cache / spill-lease state.
+    /// </summary>
+    private static ConsoleWorker BuildDetachedWorker()
+    {
+        return new ConsoleWorker(
+            pipeName: "RP.unit-test",
+            proxyPid: Environment.ProcessId,
+            shell: "pwsh.exe",
+            cwd: Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+    }
+
+    /// <summary>
+    /// Minimal in-memory filesystem used by the cache-lease test. Mirrors
+    /// the subset of <see cref="IOutputSpillFileSystem"/> that
+    /// <c>CleanupOldSpillFiles</c> actually calls (enumerate, read mtime,
+    /// delete). Separate from <c>OutputTruncationHelperTests.FakeFileSystem</c>
+    /// because that one is nested private; duplicating the minimal surface
+    /// here keeps the test file self-contained and lets the two suites
+    /// evolve independently.
+    /// </summary>
+    private sealed class CacheTestFileSystem : IOutputSpillFileSystem
+    {
+        private readonly Dictionary<string, (string Contents, DateTimeOffset Mtime)> _files =
+            new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _dirs = new(StringComparer.OrdinalIgnoreCase);
+
+        public string GetTempPath() => @"C:\fake-temp";
+        public bool DirectoryExists(string path) => _dirs.Contains(path);
+        public void CreateDirectory(string path) => _dirs.Add(path);
+        public void WriteAllText(string path, string contents)
+        {
+            _files[path] = (contents, DateTimeOffset.UtcNow);
+        }
+        public IEnumerable<string> EnumerateFiles(string directory, string searchPattern)
+        {
+            var star = searchPattern.IndexOf('*');
+            string prefix = star >= 0 ? searchPattern[..star] : searchPattern;
+            string suffix = star >= 0 ? searchPattern[(star + 1)..] : "";
+            foreach (var kv in _files)
+            {
+                if (!string.Equals(Path.GetDirectoryName(kv.Key), directory, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var name = Path.GetFileName(kv.Key);
+                if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                    && name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                    yield return kv.Key;
+            }
+        }
+        public DateTimeOffset GetLastWriteTimeUtc(string path)
+        {
+            if (_files.TryGetValue(path, out var entry)) return entry.Mtime;
+            throw new FileNotFoundException(path);
+        }
+        public void DeleteFile(string path) => _files.Remove(path);
+
+        public void PutFile(string path, string contents, DateTimeOffset mtime)
+        {
+            _dirs.Add(Path.GetDirectoryName(path)!);
+            _files[path] = (contents, mtime);
+        }
+        public bool Exists(string path) => _files.ContainsKey(path);
+    }
+
+    private sealed class CacheTestClock : IClock
+    {
+        public CacheTestClock(DateTimeOffset now) { UtcNow = now; }
+        public DateTimeOffset UtcNow { get; set; }
+    }
+
     public static async Task Run()
     {
         var pass = 0;

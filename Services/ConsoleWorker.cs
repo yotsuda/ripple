@@ -122,6 +122,45 @@ public class ConsoleWorker
     private readonly RegexPromptDetector? _regexPromptDetector;
     private bool _regexFirstPromptSeen;
     private readonly CommandTracker _tracker = new();
+
+    // Worker-owned finalize-once state. Issue #1 moved truncation / spill /
+    // cache ownership out of the tracker and into the worker so the inline
+    // execute_command path and the deferred wait_for_completion path
+    // always read from the same finalized CommandResult. The tracker now
+    // only emits a CompletedCommandSnapshot; the worker runs cleaning,
+    // echo-stripping, truncation, and cache insertion in one place.
+    // Non-readonly so TestReplaceTruncationHelper can swap in an
+    // instance backed by a fake filesystem / clock for unit tests that
+    // need to observe the lease / cleanup transitions without touching
+    // real %TEMP%. Production code never writes to this field after
+    // construction.
+    private OutputTruncationHelper _truncationHelper = new();
+    private readonly object _cacheLock = new();
+    private readonly List<CachedCommandResult> _cachedResults = new();
+    // Live spill-file lease set. Each cache entry that references a spill
+    // file adds its path here; CollectCachedOutputs drains release the
+    // lease. OutputTruncationHelper.CleanupOldSpillFiles is passed a
+    // predicate backed by this set so age-based deletion never removes
+    // a spill file that an undrained cache entry still points at.
+    private readonly HashSet<string> _liveSpillPaths = new(StringComparer.OrdinalIgnoreCase);
+    // Per-registration inline delivery routing. Replaces the old single-
+    // slot _inlineDelivery field so two concurrent execute requests
+    // landing on different pipe server instances can never overwrite
+    // each other's TCS and cross-deliver results. HandleExecuteAsync
+    // allocates a monotonic id via _commandIdSeq, parks the inline TCS
+    // in this dictionary under that id, and threads the id through
+    // CommandRegistration → CompletedCommandSnapshot.InlineDeliveryId.
+    // FinalizeSnapshotAsync looks the matching TCS up by the snapshot's
+    // id (not by reading a shared field) and delivers there; a missing
+    // id falls through to the cache branch. Guarded by _cacheLock so
+    // the snapshot handler and a concurrent FlipToCacheMode / detach
+    // can never race on the same TaskCompletionSource.
+    private long _commandIdSeq;
+    private readonly Dictionary<long, TaskCompletionSource<CommandResult>> _inlineDeliveriesById = new();
+    // Display identity supplied by the proxy at claim / set_title time.
+    // Baked into every finalized CommandResult's statusLine so cache
+    // entries stay self-describing — §7 of the ripple issue #1 plan.
+    private string? _displayName;
     private bool _ready;
     private volatile int _outputLength;
     // Controls whether PTY output is mirrored to the worker's visible console.
@@ -139,9 +178,43 @@ public class ConsoleWorker
     private Stream? _stdoutStream;
 
     /// <summary>
-    /// Current console status for get_status requests.
+    /// Current console status for get_status requests. Cache ownership
+    /// moved from the tracker to the worker in ripple issue #1, so
+    /// "completed" is derived from the worker's cached-result list.
     /// </summary>
-    private string Status => _tracker.Busy ? "busy" : (_tracker.HasCachedOutput ? "completed" : "standby");
+    private string Status
+    {
+        get
+        {
+            if (_tracker.Busy) return "busy";
+            lock (_cacheLock) return _cachedResults.Count > 0 ? "completed" : "standby";
+        }
+    }
+
+    /// <summary>
+    /// Finalized command result held in the worker's cache. Carries the
+    /// same wire fields the old tracker-side cache exposed
+    /// (<c>output</c>, <c>exitCode</c>, <c>cwd</c>, <c>command</c>,
+    /// <c>duration</c>, <c>statusLine</c>) plus the public spill path
+    /// so cache-draining callers can retrieve it without reparsing the
+    /// truncation preview.
+    /// </summary>
+    private sealed record CachedCommandResult(CommandResult Result, string? SpillFilePath);
+
+    /// <summary>
+    /// Finalized command result returned from the shared finalize-once
+    /// path. Inline execute_command responses and cached entries drained
+    /// by wait_for_completion both read from this shape, so the two
+    /// paths can never diverge on output content or status line.
+    /// </summary>
+    internal sealed record CommandResult(
+        string Output,
+        int ExitCode,
+        string? Cwd,
+        string Command,
+        string Duration,
+        string StatusLine,
+        string? SpillFilePath);
 
     private readonly string? _banner;
     private readonly string? _reason;
@@ -270,6 +343,15 @@ public class ConsoleWorker
         _isPwshFamily = _shellFamily is "pwsh" or "powershell";
         _defaultEnter = _adapter?.Input.LineEnding
             ?? (_isPwshFamily || _shellFamily == "cmd" ? "\r" : "\n");
+
+        // Subscribe once to the tracker's completion event. Every primary
+        // completion — whether an inline caller is still listening or the
+        // response channel has been flipped to cache mode — routes through
+        // FinalizeSnapshotAsync. Having one subscriber, one handler, and
+        // one finalize path is how the inline and wait_for_completion
+        // branches stay guaranteed equivalent (plan §2, exec-order step 2).
+        _tracker.SnapshotProduced += snapshot =>
+            _ = Task.Run(() => FinalizeSnapshotAsync(snapshot));
     }
 
     public async Task RunAsync(CancellationToken ct)
@@ -2130,7 +2212,7 @@ public class ConsoleWorker
             "get_status" => SerializeResponse(w =>
             {
                 w.WriteString("status", Status);
-                w.WriteBoolean("hasCachedOutput", _tracker.HasCachedOutput);
+                w.WriteBoolean("hasCachedOutput", HasCachedOutput);
                 w.WriteString("shellFamily", _shellFamily);
                 w.WriteString("shellPath", _shell);
                 w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
@@ -2168,41 +2250,12 @@ public class ConsoleWorker
                 }
             }),
             "send_input" => await HandleSendInputAsync(request, ct),
-            "drain_post_output" => await HandleDrainPostOutputAsync(request, ct),
             "set_title" => HandleSetTitle(request),
             "display_banner" => await HandleDisplayBannerAsync(request, ct),
             "claim" => HandleClaim(request),
             "ping" => SerializeResponse(w => w.WriteString("status", "ok")),
             _ => SerializeResponse(w => w.WriteString("error", $"Unknown request type: {type}")),
         };
-    }
-
-    /// <summary>
-    /// Wait for trailing output (bytes arriving after the primary Resolve)
-    /// to stabilise, then return the cleaned delta. Called by the proxy
-    /// immediately after a successful execute response so the AI receives
-    /// any output the shell streamed after OSC PromptStart.
-    ///
-    /// For pwsh/powershell the drain is skipped entirely and an empty delta
-    /// is returned: pwsh emits OSC A as part of its prompt function return
-    /// value, so by the time the worker sees OSC A all command output has
-    /// already been captured. The only bytes that arrive after OSC A are
-    /// the prompt text ("PS C:\foo> ") and PSReadLine prediction rendering
-    /// (ghost text based on history), both of which are noise for the AI
-    /// and would otherwise leak into the delta.
-    /// </summary>
-    private async Task<JsonElement> HandleDrainPostOutputAsync(JsonElement request, CancellationToken ct)
-    {
-        if (_isPwshFamily)
-        {
-            _tracker.ClearPostPrimary();
-            return SerializeResponse(w => w.WriteNull("delta"));
-        }
-
-        var stableMs = request.TryGetProperty("stable_ms", out var sm) && sm.ValueKind == JsonValueKind.Number ? sm.GetInt32() : 100;
-        var maxMs = request.TryGetProperty("max_ms", out var mm) && mm.ValueKind == JsonValueKind.Number ? mm.GetInt32() : 500;
-        var delta = await _tracker.WaitAndDrainPostOutputAsync(stableMs, maxMs, ct);
-        return SerializeResponse(w => w.WriteStringOrNull("delta", delta));
     }
 
     /// <summary>
@@ -2336,7 +2389,7 @@ public class ConsoleWorker
             return SerializeResponse(w => w.WriteString("error", "Missing 'command' field in request"));
         var timeoutMs = request.TryGetProperty("timeout", out var tp) ? tp.GetInt32() : CommandTracker.PreemptiveTimeoutMs;
 
-        // Reject if another command is still running (e.g., timed-out command in background).
+        // Fast-path reject if another command is still running (e.g., timed-out command in background).
         // The arrival of this execute_command is definitive proof that the prior
         // command's response channel has been lost — the caller cannot both be
         // awaiting the prior result and issuing a new execute at the same time
@@ -2344,6 +2397,11 @@ public class ConsoleWorker
         // new execute replaces the previous expectation). Flip the in-flight
         // command to cache mode so its result gets appended to _cachedResults
         // and surfaces on the next drain instead of being silently discarded.
+        //
+        // This is only a fast-path — two concurrent requests can still both
+        // observe !Busy here and race through the tempfile I/O below. The
+        // authoritative registration-atomic re-check happens under
+        // _cacheLock immediately before RegisterCommand.
         if (_tracker.Busy)
         {
             _tracker.FlipToCacheMode();
@@ -2391,36 +2449,6 @@ public class ConsoleWorker
         bool isMultiLinePosix = shellName is "bash" or "sh" or "zsh" && command.Contains('\n');
         if (_isPwshFamily && !isMultiLinePwsh)
             RenderPwshCommandEcho(command);
-
-        // Register command with tracker (it will resolve when OSC PromptStart arrives).
-        // With concurrent pipe listeners, two execute requests can race between
-        // the `_tracker.Busy` check above and here — the tracker's internal lock
-        // serialises RegisterCommand and throws if another command is already
-        // registered. Turn that back into a clean "busy" response so the proxy
-        // routes the loser to a different console instead of surfacing an error.
-        Task<CommandTracker.CommandResult> resultTask;
-        try
-        {
-            resultTask = _tracker.RegisterCommand(command, timeoutMs);
-        }
-        catch (InvalidOperationException)
-        {
-            // Concurrent race path — another execute snuck in between the
-            // Busy check above and here. Flip whatever won the race so its
-            // result still makes it into the cache.
-            _tracker.FlipToCacheMode();
-            return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
-        }
-
-        // Adapters whose input echo strategy is deterministic_byte_match
-        // or fuzzy_byte_match (cmd, python, any REPL without a stdlib
-        // pre-input hook that can emit OSC B/C) have no way to fire OSC C
-        // at the moment the command starts, so the tracker would wait
-        // forever for a marker that never arrives. Paper over the gap:
-        // RegisterCommand has just reset _aiOutput to "", so position 0
-        // is the true start of the command's captured window.
-        if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
-            _tracker.SkipCommandStartMarker();
 
         // Multi-line commands can't be written straight to the PTY: pwsh
         // (and bash) would treat each embedded \n as "submit line now",
@@ -2536,6 +2564,100 @@ public class ConsoleWorker
             ptyPayload = command + enter;
         }
 
+        // Atomic registration block. Allocating the inline-delivery id,
+        // parking the TCS in _inlineDeliveriesById, AND calling
+        // RegisterCommand all happen under _cacheLock so a concurrent
+        // execute request can never observe a partial state where the
+        // tracker has a live command but the worker has no dictionary
+        // entry to route its snapshot through (which was the old TOCTOU
+        // root cause — a shared _inlineDelivery field could be
+        // overwritten between the second caller's Busy check and the
+        // first caller's registration, mis-delivering results across
+        // commands).
+        //
+        // RegisterCommand does nest into the tracker's internal _lock,
+        // but the tracker never reaches back into _cacheLock, so the
+        // lock order (_cacheLock → tracker._lock) is consistent with
+        // every other site in this file (FinalizeSnapshotAsync exits
+        // _cacheLock before calling DetachSettlingCapture /
+        // ReleaseAiCommand).
+        //
+        // Setting the TCS up BEFORE RegisterCommand also closes the
+        // original preemptive-timeout race: when timeoutMs == 0 the
+        // tracker's FlipToCacheMode callback can fire synchronously
+        // from RegisterCommand and hand a snapshot to
+        // FinalizeSnapshotAsync before control returns here. With the
+        // id-keyed dictionary write already persisted, the finalize
+        // path still finds the correct TCS.
+        var inlineDelivery = new TaskCompletionSource<CommandResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        long inlineDeliveryId = 0;
+        Task<CompletedCommandSnapshot>? snapshotTask = null;
+        bool busyRace = false;
+        lock (_cacheLock)
+        {
+            // Authoritative Busy re-check INSIDE the lock. The outer
+            // fast-path check can race with another execute that is
+            // between its RegisterCommand and FinalizeSnapshotAsync —
+            // bridging Busy and registration under the same lock is
+            // what makes the two checks equivalent.
+            if (_tracker.Busy)
+            {
+                busyRace = true;
+            }
+            else
+            {
+                inlineDeliveryId = ++_commandIdSeq;
+                _inlineDeliveriesById[inlineDeliveryId] = inlineDelivery;
+                try
+                {
+                    snapshotTask = _tracker.RegisterCommand(new CommandTracker.CommandRegistration(
+                        CommandText: command,
+                        PtyPayload: ptyPayload,
+                        InputEchoLineEnding: enter,
+                        InputEchoStrategy: _adapter?.Output.InputEchoStrategy,
+                        ShellFamily: _shellFamily,
+                        DisplayName: _displayName,
+                        PostPromptSettleMs: _adapter?.Output.PostPromptSettleMs ?? 150,
+                        TimeoutMs: timeoutMs,
+                        InlineDeliveryId: inlineDeliveryId));
+                }
+                catch (InvalidOperationException)
+                {
+                    // Concurrent race at the tracker level — somebody else
+                    // registered a command between the Busy re-check above
+                    // and here (shouldn't happen with the atomic re-check,
+                    // but kept as belt-and-braces because the tracker's
+                    // own gate is what enforces "at most one live _tcs").
+                    // Remove the dictionary entry we just inserted so it
+                    // doesn't linger as a phantom slot.
+                    _inlineDeliveriesById.Remove(inlineDeliveryId);
+                    busyRace = true;
+                }
+            }
+        }
+
+        if (busyRace)
+        {
+            // FlipToCacheMode takes the tracker's lock. Drop _cacheLock
+            // before calling in — FinalizeSnapshotAsync never holds
+            // _cacheLock while touching the tracker, and this keeps
+            // that invariant intact.
+            _tracker.FlipToCacheMode();
+            return SerializeResponse(w => { w.WriteString("status", "busy"); w.WriteString("command", command); });
+        }
+
+        // Adapters whose input echo strategy is deterministic_byte_match
+        // or fuzzy_byte_match (cmd, python, linenoise-style REPLs — any
+        // REPL without a stdlib pre-input hook that can emit OSC B/C)
+        // have no way to fire OSC C at the moment the command starts,
+        // so the tracker would wait forever for a marker that never
+        // arrives. Paper over the gap: the capture's command start is
+        // forced to 0 so the finalizer slice begins at the true start
+        // of the captured window.
+        if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
+            _tracker.SkipCommandStartMarker();
+
         // Hold user input while the AI command is in flight. Any
         // keystrokes the user types into the visible console window
         // are buffered by InputForwardLoop instead of being forwarded
@@ -2565,146 +2687,516 @@ public class ConsoleWorker
 
         await WriteToPty(ptyPayload, ct);
 
+        // Await either:
+        //   - the inline delivery (fully finalized CommandResult the
+        //     shared finalize-once path built from the snapshot), OR
+        //   - the tracker's snapshot task completing with a
+        //     TimeoutException when the preemptive timer fires /
+        //     FlipToCacheMode detaches.
+        // Whichever completes first drives the exit path. snapshotTask
+        // surfaces TimeoutException and shell-exit errors; inline
+        // delivery surfaces the happy-path CommandResult.
+        //
+        // snapshotTask is guaranteed non-null past the busyRace guard
+        // above — it was assigned inside the same lock-protected
+        // critical section that allocated inlineDeliveryId.
+        var snapshotTaskLocal = snapshotTask!;
+        var raceTask = Task.WhenAny(inlineDelivery.Task, snapshotTaskLocal);
+        await raceTask;
+
+        if (snapshotTaskLocal.IsFaulted || snapshotTaskLocal.IsCanceled)
+        {
+            ReleaseHeldUserInput();
+            try { await snapshotTaskLocal; }
+            catch (TimeoutException)
+            {
+                // Timeout = command is still running in the background.
+                // The real snapshot will flow through FinalizeSnapshotAsync
+                // into _cachedResults when the shell eventually resolves;
+                // wait_for_completion drains it from there. Return the
+                // tracker's bounded in-flight partial (NOT a spill
+                // preview) as diagnostic context.
+                //
+                // Detach THIS command's inline-delivery TCS from the
+                // routing dictionary: the HTTP/pipe response has moved
+                // on and nobody will await this task again. Without the
+                // removal, FinalizeSnapshotAsync's Step 6 would still
+                // find the TCS under our id and call TrySetResult on
+                // it — delivering the snapshot into an orphaned awaiter
+                // instead of _cachedResults, so wait_for_completion
+                // would never drain the cached result (worker would
+                // report "standby" with empty cache). Matches the
+                // plan §2 guarantee that timed-out commands route into
+                // cache via the finalize-once path.
+                lock (_cacheLock) _inlineDeliveriesById.Remove(inlineDeliveryId);
+                var partial = _tracker.GetCurrentCommandSnapshot();
+                return SerializeResponse(w =>
+                {
+                    w.WriteString("output", "");
+                    w.WriteNumber("exitCode", 0);
+                    w.WriteNull("cwd");
+                    w.WriteString("duration", (timeoutMs / 1000.0).ToString("F1"));
+                    w.WriteBoolean("timedOut", true);
+                    if (!string.IsNullOrEmpty(partial))
+                        w.WriteString("partialOutput", partial);
+                });
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Shell exited mid-command — no snapshot will ever
+                // arrive, but still detach this command's inline TCS
+                // so it doesn't linger in the routing dictionary (an
+                // orphaned entry would never be reaped because no
+                // finalize is ever coming).
+                lock (_cacheLock) _inlineDeliveriesById.Remove(inlineDeliveryId);
+                return SerializeResponse(w =>
+                {
+                    w.WriteString("output", ex.Message);
+                    w.WriteNumber("exitCode", -1);
+                    w.WriteNull("cwd");
+                    w.WriteString("duration", "0.0");
+                    w.WriteBoolean("timedOut", false);
+                    w.WriteBoolean("shellExited", true);
+                });
+            }
+            // Any other exception — surface as-is so the proxy sees the
+            // same shape of error it did before the refactor.
+        }
+
+        // Happy path: inline delivery completed with a fully finalized
+        // CommandResult. Release held user input BEFORE serializing so
+        // the held keystrokes replay into the shell's fresh prompt
+        // while the proxy is still formatting the JSON. This gives the
+        // shell a head start on processing any user-typed partial
+        // command so it's visible in the console window by the time
+        // the AI's next tool call arrives.
+        //
+        // FinalizeSnapshotAsync routes catastrophic finalize failures
+        // through the inline TCS via TrySetException so the awaiter
+        // unwinds instead of hanging forever on an uncompleted task.
+        // Surface the failure with the same wire shape as the shell-
+        // exit branch (minus the shellExited flag) so the proxy can
+        // render a useful message.
+        CommandResult result;
         try
         {
-            var result = await resultTask;
-            // Release user-input hold BEFORE building the response so
-            // the held keystrokes replay into the shell's fresh prompt
-            // while the proxy is still formatting the JSON. This gives
-            // the shell a head start on processing any user-typed
-            // partial command so it's visible in the console window by
-            // the time the AI's next tool call arrives.
-            ReleaseHeldUserInput();
-            var cleanedOutput = result.Output;
-            if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
-            {
-                // Shells/REPLs that can't fire OSC C (cmd, python, any
-                // interpreter without a stdlib pre-input hook) have no
-                // marker separating ConPTY's input echo from the command
-                // output. Strip the echoed input bytes from the head of
-                // the captured slice instead — the exact bytes we wrote
-                // to the PTY (single-line: the literal command;
-                // multi-line on cmd: the `call "tmp" & del "tmp"`
-                // wrapper). enter is dropped because it's the line
-                // submission and never appears in the echo.
-                //
-                // fuzzy_byte_match additionally swallows a leading prompt
-                // redraw for linenoise-style REPLs (duckdb etc.) whose
-                // echo opens with "<prompt><input>" rather than just
-                // "<input>". The redraw matcher is derived from the
-                // adapter's prompt regex.
-                var echoExpected = ptyPayload;
-                if (echoExpected.EndsWith(enter))
-                    echoExpected = echoExpected[..^enter.Length];
-                Regex? promptRedrawMatcher = null;
-                if (_adapter.Output.InputEchoStrategy == "fuzzy_byte_match")
-                    promptRedrawMatcher = BuildPromptRedrawMatcher(_adapter.Prompt?.Primary);
-                cleanedOutput = StripCmdInputEcho(cleanedOutput, echoExpected, promptRedrawMatcher);
-            }
-            // Re-evaluate which mode the REPL is now in. The detector
-            // scans the tail of recent terminal output against every
-            // auto_enter mode's detect regex; falls back to the
-            // adapter's default mode otherwise. Result is cached on
-            // the worker so get_status / cached_output can report the
-            // same value without re-scanning.
-            //
-            // Scans the recent-output ring rather than the OSC-C..D
-            // slice because the mode transition is visible in the
-            // NEXT prompt (e.g. CCL drops to `1 > ` after an error),
-            // which arrives AFTER the OSC A that fires Resolve — so
-            // it's never inside cleanedOutput. The ring is updated
-            // unconditionally by FeedOutput and captures the post-A
-            // prompt as soon as its bytes land. Because ConPTY
-            // typically delivers OSC A and the following prompt
-            // bytes in the same chunk, the ring has the new prompt
-            // by the time we read it; a short poll with a fresh
-            // ring snapshot on each tick covers the rare case where
-            // the prompt trails by a few milliseconds.
-            if (_adapter?.Modes is { Count: > 0 } modes)
-            {
-                // Start with an explicit "no match yet" ModeMatch rather
-                // than `default` — records are reference types, so `default`
-                // is null and the compiler (rightly) can't prove the while
-                // loop reassigns it before the post-loop `match.Name`
-                // access. The loop body always runs at least once and
-                // overwrites this value, but flowing through a non-null
-                // sentinel makes the safety invariant explicit.
-                var match = new ModeMatch(Name: null, Level: null);
-                string? defaultModeName = null;
-                foreach (var m in modes)
-                {
-                    if (m.Default) { defaultModeName = m.Name; break; }
-                }
-                defaultModeName ??= modes[0].Name;
-
-                var deadline = DateTime.UtcNow.AddMilliseconds(150);
-                while (true)
-                {
-                    // Scan the RAW ring bytes rather than the VtLite-
-                    // rendered snapshot. VtLite reshapes the terminal
-                    // grid and may collapse the post-A prompt into a
-                    // cell position that no longer matches the mode's
-                    // anchored regex (`^<prompt>$`). The raw stream
-                    // preserves the prompt as its own final line, which
-                    // is what the adapter-author wrote the regex
-                    // against.
-                    var snap = _tracker.GetRawRecentBytes();
-                    match = ModeDetector.Detect(modes, snap);
-                    // Stop as soon as we see a non-default auto_enter
-                    // mode match — that's the signal the REPL moved.
-                    if (match.Name != null && match.Name != defaultModeName) break;
-                    if (DateTime.UtcNow >= deadline) break;
-                    try { await Task.Delay(15, ct); }
-                    catch (OperationCanceledException) { break; }
-                }
-                _currentMode = match.Name;
-                _currentModeLevel = match.Level;
-            }
-            return SerializeResponse(w =>
-            {
-                w.WriteStringOrNull("output", cleanedOutput);
-                w.WriteNumber("exitCode", result.ExitCode);
-                w.WriteStringOrNull("cwd", result.Cwd);
-                w.WriteStringOrNull("duration", result.Duration);
-                w.WriteBoolean("timedOut", false);
-                if (_adapter?.Modes is { Count: > 0 })
-                {
-                    w.WriteStringOrNull("currentMode", _currentMode);
-                    if (_currentModeLevel.HasValue) w.WriteNumber("currentModeLevel", _currentModeLevel.Value);
-                }
-            });
+            result = await inlineDelivery.Task;
         }
-        catch (TimeoutException)
-        {
-            // Timeout = command is still running in the background.
-            // Release held user input so the user can interact with
-            // the running command (type a response, send Ctrl+C, etc.).
-            ReleaseHeldUserInput();
-            var partial = _tracker.GetCurrentAiOutputSnapshot();
-            return SerializeResponse(w =>
-            {
-                w.WriteString("output", "");
-                w.WriteNumber("exitCode", 0);
-                w.WriteNull("cwd");
-                w.WriteString("duration", (timeoutMs / 1000.0).ToString("F1"));
-                w.WriteBoolean("timedOut", true);
-                if (!string.IsNullOrEmpty(partial))
-                    w.WriteString("partialOutput", partial);
-            });
-        }
-        catch (InvalidOperationException ex)
+        catch (Exception ex)
         {
             ReleaseHeldUserInput();
             return SerializeResponse(w =>
             {
-                w.WriteString("output", ex.Message);
+                w.WriteString("output", $"finalize failed: {ex.GetType().Name}: {ex.Message}");
                 w.WriteNumber("exitCode", -1);
                 w.WriteNull("cwd");
                 w.WriteString("duration", "0.0");
                 w.WriteBoolean("timedOut", false);
-                w.WriteBoolean("shellExited", true);
             });
         }
+        ReleaseHeldUserInput();
+
+        // Re-evaluate which mode the REPL is now in. The detector
+        // scans the tail of recent terminal output against every
+        // auto_enter mode's detect regex; falls back to the
+        // adapter's default mode otherwise. Result is cached on
+        // the worker so get_status / cached_output can report the
+        // same value without re-scanning.
+        //
+        // Scans the recent-output ring rather than the OSC-C..D
+        // slice because the mode transition is visible in the
+        // NEXT prompt (e.g. CCL drops to `1 > ` after an error),
+        // which arrives AFTER the OSC A that fires Resolve — so
+        // it's never inside cleanedOutput. The ring is updated
+        // unconditionally by FeedOutput and captures the post-A
+        // prompt as soon as its bytes land. Because ConPTY
+        // typically delivers OSC A and the following prompt
+        // bytes in the same chunk, the ring has the new prompt
+        // by the time we read it; a short poll with a fresh
+        // ring snapshot on each tick covers the rare case where
+        // the prompt trails by a few milliseconds.
+        if (_adapter?.Modes is { Count: > 0 } modes)
+        {
+            // Start with an explicit "no match yet" ModeMatch rather
+            // than `default` — records are reference types, so `default`
+            // is null and the compiler (rightly) can't prove the while
+            // loop reassigns it before the post-loop `match.Name`
+            // access. The loop body always runs at least once and
+            // overwrites this value, but flowing through a non-null
+            // sentinel makes the safety invariant explicit.
+            var match = new ModeMatch(Name: null, Level: null);
+            string? defaultModeName = null;
+            foreach (var m in modes)
+            {
+                if (m.Default) { defaultModeName = m.Name; break; }
+            }
+            defaultModeName ??= modes[0].Name;
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(150);
+            while (true)
+            {
+                var snap = _tracker.GetRawRecentBytes();
+                match = ModeDetector.Detect(modes, snap);
+                if (match.Name != null && match.Name != defaultModeName) break;
+                if (DateTime.UtcNow >= deadline) break;
+                try { await Task.Delay(15, ct); }
+                catch (OperationCanceledException) { break; }
+            }
+            _currentMode = match.Name;
+            _currentModeLevel = match.Level;
+        }
+        return SerializeResponse(w =>
+        {
+            w.WriteStringOrNull("output", result.Output);
+            w.WriteNumber("exitCode", result.ExitCode);
+            w.WriteStringOrNull("cwd", result.Cwd);
+            w.WriteStringOrNull("duration", result.Duration);
+            w.WriteBoolean("timedOut", false);
+            // Inline parity with the cached-drain path: when truncation
+            // spilled the full output to disk, surface the path as a
+            // structured field so the proxy / MCP client never has to
+            // parse the preview header to recover it.
+            if (result.SpillFilePath != null)
+                w.WriteString("spillFilePath", result.SpillFilePath);
+            if (_adapter?.Modes is { Count: > 0 })
+            {
+                w.WriteStringOrNull("currentMode", _currentMode);
+                if (_currentModeLevel.HasValue) w.WriteNumber("currentModeLevel", _currentModeLevel.Value);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Shared finalize-once handler. Every primary command completion
+    /// (inline and timed-out / flipped-to-cache) flows through this
+    /// method exactly once per command, so the inline execute_command
+    /// response and the cached wait_for_completion payload can never
+    /// diverge.
+    ///
+    /// Steps (plan §2, §3 steps 3-4, §7):
+    ///   1. Optionally wait shell-specific post-prompt settle time
+    ///      (adapter.output.post_prompt_settle_ms) so trailing bytes
+    ///      that still belong to the command result land in the
+    ///      capture before we slice it. pwsh/powershell emit OSC A
+    ///      from their prompt function after all output has been
+    ///      captured, so we skip the settle for that family.
+    ///   2. Clean the capture's [CommandStart, CommandEnd) window
+    ///      through the slice-reader finalizer (ANSI strip, CRLF
+    ///      normalize, pwsh continuation-prompt drop).
+    ///   3. Strip deterministic input echo against the persisted
+    ///      ptyPayload baseline, for adapters that need it.
+    ///   4. Run truncation / spill creation on the cleaned stream.
+    ///   5. Bake the statusLine using the worker's display context.
+    ///   6. Deliver to the inline caller (if the original awaiting
+    ///      task is still attached) or append to the cache entry
+    ///      list for the next wait_for_completion drain.
+    ///   7. Trigger opportunistic spill-file cleanup, honouring the
+    ///      live-lease set so still-referenced entries survive.
+    ///   8. Dispose the capture so its scratch file is released.
+    /// </summary>
+    private async Task FinalizeSnapshotAsync(CompletedCommandSnapshot snapshot)
+    {
+        try
+        {
+            // Step 1: settle window. pwsh emits OSC A as part of its
+            // prompt function RETURN value, so by the time the worker
+            // sees OSC A all command output has already been captured.
+            // Non-pwsh shells may stream a few trailing bytes (cmd's
+            // PROMPT repaint timing, Format-Table rows still
+            // finishing). Poll the capture's length until it has been
+            // stable for the adapter-declared post_prompt_settle_ms.
+            // The capture accepts FeedOutput appends throughout this
+            // window because the tracker keeps it as _settlingCapture
+            // until DetachSettlingCapture fires below — that's what
+            // lets the poll observe real growth instead of a frozen
+            // length.
+            if (!_isPwshFamily && snapshot.PostPromptSettleMs > 0)
+                await WaitCaptureStable(snapshot.Capture, snapshot.PostPromptSettleMs);
+
+            // Cut the tracker's write path to the capture before we
+            // read its final slice. After this call FeedOutput routes
+            // post-settle bytes to nothing (they're no longer part of
+            // this command's window), so the slice the finalizer
+            // reads next is stable and corresponds exactly to what
+            // the user saw when the prompt returned.
+            _tracker.DetachSettlingCapture(snapshot.Capture);
+
+            // Step 2: clean the window via the slice-reader finalizer
+            // so arbitrarily large captures never need to be assembled
+            // as one string here. Extend the end offset to include any
+            // trailing bytes that arrived between OSC D (CommandEnd)
+            // and OSC A (snapshot emission) — those are still part of
+            // the command's output window (Format-Table trailing rows,
+            // cmd PROMPT repaint tail, etc.) but the tracker only
+            // marked CommandEnd at OSC D. Using the capture's total
+            // length picks them up without mutating the snapshot.
+            //
+            // Cap the extended end at PromptStartOffset (the capture
+            // position where OSC A fired): anything arriving after
+            // OSC A is prompt text (bash `$ `, cmd PROMPT repaint,
+            // zsh `%`) that never belongs in the command's cleaned
+            // output. Without this cap bash's post-prompt settle
+            // would pull the next prompt line into the finalized
+            // result — pwsh is immune because PwshColorizer handles
+            // its prompt separately, but non-pwsh shells stream
+            // prompt chars immediately after OSC A. Fall back to the
+            // capture's total length when PromptStartOffset is
+            // absent (early-exit paths that bypass OSC A).
+            var cutoff = snapshot.PromptStartOffset ?? snapshot.Capture.Length;
+            var effectiveEnd = Math.Min(
+                Math.Max(snapshot.CommandEnd, snapshot.Capture.Length),
+                cutoff);
+            var cleaned = CommandOutputFinalizer.Clean(
+                snapshot.Capture,
+                snapshot.CommandStart,
+                effectiveEnd);
+
+            // Step 3: deterministic echo stripping for adapters that
+            // have no OSC-C marker to anchor the output window start.
+            // fuzzy_byte_match additionally swallows a leading prompt
+            // redraw for linenoise-style REPLs (duckdb etc.) whose echo
+            // opens with "<prompt><input>" rather than just "<input>";
+            // it routes through StripCmdInputEcho so the ANSI-skip and
+            // adapter-prompt matcher apply.
+            if (snapshot.InputEchoStrategy == "deterministic_byte_match")
+            {
+                cleaned = EchoStripper.Strip(
+                    cleaned,
+                    snapshot.PtyPayloadBaseline,
+                    snapshot.InputEchoLineEnding);
+            }
+            else if (snapshot.InputEchoStrategy == "fuzzy_byte_match")
+            {
+                var echoExpected = snapshot.PtyPayloadBaseline;
+                var lineEnding = snapshot.InputEchoLineEnding;
+                if (lineEnding.Length > 0 && echoExpected.EndsWith(lineEnding))
+                    echoExpected = echoExpected[..^lineEnding.Length];
+                var promptRedrawMatcher = BuildPromptRedrawMatcher(_adapter?.Prompt?.Primary);
+                cleaned = StripCmdInputEcho(cleaned, echoExpected, promptRedrawMatcher);
+            }
+
+            // Step 4: truncation / spill creation. Under threshold the
+            // DisplayOutput is `cleaned` verbatim; over threshold the
+            // helper wrote the full cleaned content to the public
+            // spill directory and returned a head+tail preview.
+            var truncation = _truncationHelper.Process(cleaned);
+
+            // Step 5: bake status line using the display context the
+            // tracker captured at registration time, so the cached
+            // entry doesn't need a proxy-side metadata re-join.
+            var statusLine = BuildStatusLine(
+                snapshot.Command,
+                snapshot.ExitCode,
+                snapshot.Duration,
+                snapshot.Cwd,
+                snapshot.ShellFamily,
+                snapshot.DisplayName);
+
+            var result = new CommandResult(
+                Output: truncation.DisplayOutput,
+                ExitCode: snapshot.ExitCode,
+                Cwd: snapshot.Cwd,
+                Command: snapshot.Command,
+                Duration: snapshot.Duration,
+                StatusLine: statusLine,
+                SpillFilePath: truncation.SpillFilePath);
+
+            // Step 6: deliver inline OR cache. Route by the snapshot's
+            // InlineDeliveryId so each command hits its own TCS — a
+            // shared field would let a concurrent execute overwrite
+            // this command's routing slot between registration and
+            // finalize and mis-deliver the result to a different
+            // caller. HandleExecuteAsync inserts the TCS under the id
+            // before calling RegisterCommand and removes it on the
+            // timeout / shell-exit branches; we remove it here on
+            // successful hand-off. A missing id (null on the snapshot,
+            // or a routing entry already removed by the timeout path)
+            // falls through to the cache branch so the next
+            // wait_for_completion drain picks the result up.
+            bool delivered = false;
+            lock (_cacheLock)
+            {
+                if (snapshot.InlineDeliveryId is long inlineId
+                    && _inlineDeliveriesById.TryGetValue(inlineId, out var pending)
+                    && !pending.Task.IsCompleted)
+                {
+                    _inlineDeliveriesById.Remove(inlineId);
+                    delivered = pending.TrySetResult(result);
+                }
+
+                if (!delivered)
+                {
+                    _cachedResults.Add(new CachedCommandResult(result, truncation.SpillFilePath));
+                    if (truncation.SpillFilePath != null)
+                        _liveSpillPaths.Add(truncation.SpillFilePath);
+                }
+            }
+
+            // Step 7: opportunistic age-based cleanup of old spill
+            // files, protecting any path currently referenced by an
+            // undrained cache entry.
+            TriggerSpillCleanup();
+        }
+        catch (Exception ex)
+        {
+            Log($"FinalizeSnapshotAsync error: {ex.GetType().Name}: {ex.Message}");
+
+            // Route the failure through whichever delivery channel is
+            // still attached so the command is not silently lost.
+            // Without this, an inline awaiter would block forever on
+            // its inline-delivery Task (the TCS was never completed)
+            // and a flip-to-cache caller would get `no_cache` from
+            // wait_for_completion because _cachedResults.Add was
+            // inside the try. Both branches converge on the same
+            // finalize-failed payload shape so the proxy sees a
+            // structured error regardless of which path observed the
+            // throw.
+            lock (_cacheLock)
+            {
+                TaskCompletionSource<CommandResult>? pending = null;
+                if (snapshot.InlineDeliveryId is long inlineId
+                    && _inlineDeliveriesById.TryGetValue(inlineId, out var found)
+                    && !found.Task.IsCompleted)
+                {
+                    _inlineDeliveriesById.Remove(inlineId);
+                    pending = found;
+                }
+
+                if (pending != null)
+                {
+                    pending.TrySetException(ex);
+                }
+                else
+                {
+                    var statusLine = BuildStatusLine(
+                        snapshot.Command,
+                        snapshot.ExitCode,
+                        snapshot.Duration,
+                        snapshot.Cwd,
+                        snapshot.ShellFamily,
+                        snapshot.DisplayName);
+                    var fallback = new CommandResult(
+                        Output: $"finalize failed: {ex.GetType().Name}: {ex.Message}",
+                        ExitCode: snapshot.ExitCode,
+                        Cwd: snapshot.Cwd,
+                        Command: snapshot.Command,
+                        Duration: snapshot.Duration,
+                        StatusLine: statusLine,
+                        SpillFilePath: null);
+                    _cachedResults.Add(new CachedCommandResult(fallback, null));
+                }
+            }
+        }
+        finally
+        {
+            // Step 8: release the capture's scratch file. Safe to do
+            // here because every slice we needed has already been read
+            // above.
+            try { snapshot.Capture.Complete(); } catch { /* best effort */ }
+
+            // Step 9: clear the tracker's AI-busy flag AFTER the
+            // result has been delivered inline / appended to cache.
+            // This closes the settle-window race where a fast polling
+            // client could otherwise see {status: standby,
+            // hasCachedOutput: false} between tracker emission and
+            // cache insertion and treat the command as lost. The
+            // generation token guards against clobbering a newer
+            // command that registered while this finalize was still
+            // running.
+            _tracker.ReleaseAiCommand(snapshot.Generation);
+        }
+    }
+
+    /// <summary>
+    /// Wait until the capture's Length has stopped growing for at
+    /// least <paramref name="stableMs"/>, or until a 2×stable ceiling
+    /// elapses. This is ripple's post-prompt settle — moved here from
+    /// the old proxy-side drain_post_output assembly — so the
+    /// finalizer can include cmd / bash trailing bytes that arrive
+    /// just after OSC A but still belong to the command result.
+    /// </summary>
+    private static async Task WaitCaptureStable(CommandOutputCapture capture, int stableMs)
+    {
+        stableMs = Math.Max(1, stableMs);
+        int maxMs = Math.Max(stableMs * 2, stableMs + 200);
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(maxMs);
+
+        long lastLen = capture.Length;
+        var lastChange = DateTime.UtcNow;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            int pollMs = Math.Clamp(stableMs / 2, 5, 30);
+            try { await Task.Delay(pollMs); }
+            catch { break; }
+
+            long current = capture.Length;
+            if (current != lastLen)
+            {
+                lastLen = current;
+                lastChange = DateTime.UtcNow;
+                continue;
+            }
+
+            if ((DateTime.UtcNow - lastChange).TotalMilliseconds >= stableMs)
+                break;
+        }
+    }
+
+    /// <summary>
+    /// True when the worker has at least one finalized cache entry that
+    /// a drain has not yet consumed. Routed through <see cref="Status"/>
+    /// and the <c>hasCachedOutput</c> field on get_status responses so
+    /// the manager's polling contract stays identical to the pre-refactor
+    /// tracker-owned cache.
+    /// </summary>
+    private bool HasCachedOutput
+    {
+        get { lock (_cacheLock) return _cachedResults.Count > 0; }
+    }
+
+    private void TriggerSpillCleanup()
+    {
+        try
+        {
+            _truncationHelper.CleanupOldSpillFiles(path =>
+            {
+                lock (_cacheLock) return _liveSpillPaths.Contains(path);
+            });
+        }
+        catch { /* cleanup is opportunistic */ }
+    }
+
+    /// <summary>
+    /// Build a self-describing status line for a command result, using
+    /// what the worker knows at finalize time: the proxy-supplied
+    /// display name, the adapter's shell family, the command text,
+    /// exit code, duration and resolved cwd. Baking this into the
+    /// CommandResult (rather than formatting at drain time on the
+    /// proxy side) keeps cached results self-contained: a cache
+    /// drain just reads the status line out and prints it, without
+    /// having to re-join metadata from the proxy's ConsoleInfo
+    /// which may have drifted since the command was registered.
+    /// </summary>
+    private static string BuildStatusLine(
+        string? command, int exitCode, string duration, string? cwd,
+        string? shellFamily, string? displayName)
+    {
+        var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
+        var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
+        var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
+        var cmd = CommandTracker.TruncateForStatusLine(command);
+
+        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
+        // worker always reports ExitCode=0 for cmd. Render a neutral
+        // "Finished" line with no success marker so the AI doesn't assume
+        // every cmd command succeeded.
+        if (shellFamily == "cmd")
+            return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+
+        return exitCode == 0
+            ? $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
+            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
     }
 
     /// <summary>
@@ -2726,16 +3218,28 @@ public class ConsoleWorker
 
     private JsonElement HandleGetCachedOutput()
     {
-        var cached = _tracker.ConsumeCachedOutputs();
-        if (cached.Count == 0)
-            return SerializeResponse(w => w.WriteString("status", "no_cache"));
+        // Drain snapshot under _cacheLock, then release spill leases so the
+        // next TriggerSpillCleanup pass can reclaim files for entries that
+        // have now been handed to the proxy. We do the lease release AFTER
+        // serialization so a crash between drain and serialize doesn't
+        // leak the files (they stay in _liveSpillPaths and the cleanup
+        // predicate still honours them).
+        List<CachedCommandResult> snapshot;
+        lock (_cacheLock)
+        {
+            if (_cachedResults.Count == 0)
+                return SerializeResponse(w => w.WriteString("status", "no_cache"));
+            snapshot = new List<CachedCommandResult>(_cachedResults);
+            _cachedResults.Clear();
+        }
 
-        return SerializeResponse(w =>
+        var response = SerializeResponse(w =>
         {
             w.WriteString("status", "ok");
             w.WriteStartArray("results");
-            foreach (var r in cached)
+            foreach (var entry in snapshot)
             {
+                var r = entry.Result;
                 w.WriteStartObject();
                 w.WriteStringOrNull("output", r.Output);
                 w.WriteNumber("exitCode", r.ExitCode);
@@ -2743,10 +3247,180 @@ public class ConsoleWorker
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);
                 w.WriteString("statusLine", r.StatusLine);
+                if (r.SpillFilePath != null)
+                    w.WriteString("spillFilePath", r.SpillFilePath);
                 w.WriteEndObject();
             }
             w.WriteEndArray();
         });
+
+        // Release spill leases — the proxy now owns these paths (the
+        // consumer either reads them inline or deletes them explicitly).
+        //
+        // Deliberately NOT calling TriggerSpillCleanup here: the drain
+        // response we just serialized exposes spillFilePath values that
+        // the caller has not yet had a chance to open, and the age-
+        // based cleanup would happily delete any path older than
+        // MaxFileAgeMinutes (120 min today) the moment its lease is
+        // released. Cached entries that waited more than two hours
+        // before being drained — wait_for_completion on a long-parked
+        // result, proxy reconnecting after a sleep — would surface a
+        // path that no longer exists on disk by the time the caller
+        // tries to read it. Age-based cleanup still runs opportun-
+        // istically on the next FinalizeSnapshotAsync, which is the
+        // natural cadence; by then the caller has had its response and
+        // either read the file or moved on.
+        lock (_cacheLock)
+        {
+            foreach (var entry in snapshot)
+                if (entry.SpillFilePath != null)
+                    _liveSpillPaths.Remove(entry.SpillFilePath);
+        }
+
+        return response;
+    }
+
+    // --- Test-only seams ---
+    //
+    // These hooks let platform-agnostic unit tests exercise the cache /
+    // drain / spill-lease plumbing without spinning up a real PTY. They
+    // are intentionally `internal` so production callers outside the
+    // assembly cannot reach them; the test assembly lives in the same
+    // project and sees them directly. Each hook is a thin wrapper over
+    // the same private state that FinalizeSnapshotAsync and
+    // HandleGetCachedOutput mutate at runtime, so a regression in the
+    // wire contract or lease lifecycle surfaces through the test
+    // alongside the production path.
+
+    /// <summary>
+    /// Seeds a finalized <see cref="CommandResult"/> into the worker's
+    /// cache as if <see cref="FinalizeSnapshotAsync"/> had produced it.
+    /// The spill path (if any) is registered in <c>_liveSpillPaths</c>
+    /// so cleanup-lease tests can observe the drain-releases-lease
+    /// transition. Test-only — the runtime only ever appends to this
+    /// list via the finalize-snapshot path.
+    /// </summary>
+    internal void TestSeedCachedResult(CommandResult result)
+    {
+        lock (_cacheLock)
+        {
+            _cachedResults.Add(new CachedCommandResult(result, result.SpillFilePath));
+            if (result.SpillFilePath != null)
+                _liveSpillPaths.Add(result.SpillFilePath);
+        }
+    }
+
+    /// <summary>
+    /// Invokes the same drain path <see cref="HandleGetCachedOutput"/>
+    /// serves over the pipe, returning the serialized wire JSON for
+    /// cache-contract assertions. Test-only.
+    /// </summary>
+    internal JsonElement TestDrainCachedOutput() => HandleGetCachedOutput();
+
+    /// <summary>
+    /// Snapshot of the live-lease set for cleanup-protection tests.
+    /// Returned as a copy under <c>_cacheLock</c> so the caller can
+    /// observe the set without racing the drain path. Test-only.
+    /// </summary>
+    internal IReadOnlyCollection<string> TestGetLiveSpillPaths()
+    {
+        lock (_cacheLock) return _liveSpillPaths.ToArray();
+    }
+
+    /// <summary>
+    /// Runs the same opportunistic age-based cleanup
+    /// <see cref="FinalizeSnapshotAsync"/> triggers, so tests that
+    /// want to observe deletion after drain can force the sweep
+    /// deterministically instead of waiting for the next finalize.
+    /// Test-only.
+    /// </summary>
+    internal void TestTriggerSpillCleanup() => TriggerSpillCleanup();
+
+    /// <summary>
+    /// Swaps in a custom <see cref="OutputTruncationHelper"/> so tests
+    /// can back the worker with an in-memory filesystem / fake clock.
+    /// Test-only — the production constructor wires the default helper
+    /// and no runtime path touches this setter.
+    /// </summary>
+    internal void TestReplaceTruncationHelper(OutputTruncationHelper replacement)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        _truncationHelper = replacement;
+    }
+
+    /// <summary>
+    /// Drives <see cref="FinalizeSnapshotAsync"/> directly with a caller-
+    /// supplied snapshot so catastrophic-failure-path tests can observe
+    /// how finalize exceptions propagate to the inline TCS or the
+    /// cached-results list. When <paramref name="inlineDelivery"/> is
+    /// non-null the seam allocates an inline-delivery id, registers
+    /// the TCS under it, and rewrites the supplied snapshot to carry
+    /// that id so the finalize-once path's id-based routing resolves
+    /// the TCS exactly the way the production execute path does.
+    /// When <paramref name="inlineDelivery"/> is null the snapshot is
+    /// passed through verbatim and finalize falls through to the
+    /// cache branch. Test-only.
+    /// </summary>
+    internal Task TestRunFinalizeSnapshotAsync(
+        CompletedCommandSnapshot snapshot,
+        TaskCompletionSource<CommandResult>? inlineDelivery)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        CompletedCommandSnapshot snapshotToFinalize = snapshot;
+        if (inlineDelivery != null)
+        {
+            long id;
+            lock (_cacheLock)
+            {
+                id = ++_commandIdSeq;
+                _inlineDeliveriesById[id] = inlineDelivery;
+            }
+            snapshotToFinalize = snapshot with { InlineDeliveryId = id };
+        }
+        return FinalizeSnapshotAsync(snapshotToFinalize);
+    }
+
+    /// <summary>
+    /// Returns the count of cached results under <c>_cacheLock</c> so
+    /// fallback-path tests can assert "finalize exception appended a
+    /// cache entry" without draining the cache (which would clear it).
+    /// Test-only.
+    /// </summary>
+    internal int TestGetCachedResultCount()
+    {
+        lock (_cacheLock) return _cachedResults.Count;
+    }
+
+    /// <summary>
+    /// Allocates a fresh inline-delivery id, parks the caller-supplied
+    /// TCS under it, and returns the id. Used by concurrency tests to
+    /// simulate multiple in-flight execute registrations without
+    /// driving the full pipe / PTY path, so a test can prove that a
+    /// finalize on command A never completes command B's TCS even
+    /// when both entries live in <c>_inlineDeliveriesById</c>
+    /// simultaneously. Test-only.
+    /// </summary>
+    internal long TestRegisterInlineDelivery(TaskCompletionSource<CommandResult> inlineDelivery)
+    {
+        ArgumentNullException.ThrowIfNull(inlineDelivery);
+        lock (_cacheLock)
+        {
+            var id = ++_commandIdSeq;
+            _inlineDeliveriesById[id] = inlineDelivery;
+            return id;
+        }
+    }
+
+    /// <summary>
+    /// Returns the count of inline-delivery entries still parked in
+    /// <c>_inlineDeliveriesById</c>. Concurrency-routing tests assert
+    /// on this to verify that a successful finalize removes exactly
+    /// its own entry and leaves concurrent entries untouched.
+    /// Test-only.
+    /// </summary>
+    internal int TestGetInlineDeliveryCount()
+    {
+        lock (_cacheLock) return _inlineDeliveriesById.Count;
     }
 
     /// <summary>
@@ -2941,13 +3615,14 @@ public class ConsoleWorker
             _stdoutStream.Write(osc, 0, osc.Length);
             _stdoutStream.Flush();
 
-            // Keep the tracker's cached-result status lines in sync with
-            // the proxy's current display name. set_title is the earliest
-            // point at which a freshly launched worker learns its name,
-            // so without this, commands registered before the claim path
+            // Keep the worker's display-name field in sync with the
+            // proxy's current name. set_title is the earliest point at
+            // which a freshly launched worker learns its name, so
+            // without this, commands registered before the claim path
             // runs would bake the wrong identity into their cached
-            // status lines.
-            _tracker.SetDisplayContext(title, _shellFamily);
+            // status lines. BuildStatusLine reads _displayName on
+            // every finalize, so no further propagation is needed.
+            _displayName = title;
         }
         return SerializeResponse(w => w.WriteString("status", "ok"));
     }
@@ -3015,8 +3690,26 @@ public class ConsoleWorker
                 // 5s is enough for a cd on any sane shell; if the shell is
                 // somehow stuck we prefer giving up and returning rather
                 // than holding the start_console response hostage.
-                var resultTask = _tracker.RegisterCommand(cdCmd, timeoutMs: 5000);
+                //
+                // The snapshot from this registration flows through the
+                // normal FinalizeSnapshotAsync handler like every other AI
+                // command — no inline delivery is wired up, so the cd's
+                // cleaned result lands in _cachedResults and the next
+                // wait_for_completion / get_cached_output drains it. That
+                // matches legacy behaviour where the banner's cd kick was
+                // visible to the proxy as a standard completed command.
                 var enter = _adapter?.Input.LineEnding ?? _defaultEnter;
+                var resultTask = _tracker.RegisterCommand(new CommandTracker.CommandRegistration(
+                    CommandText: cdCmd,
+                    PtyPayload: cdCmd + enter,
+                    InputEchoLineEnding: enter,
+                    InputEchoStrategy: _adapter?.Output.InputEchoStrategy,
+                    ShellFamily: _shellFamily,
+                    DisplayName: _displayName,
+                    PostPromptSettleMs: _adapter?.Output.PostPromptSettleMs ?? 150,
+                    TimeoutMs: 5000));
+                if (_adapter?.Output.InputEchoStrategy is "deterministic_byte_match" or "fuzzy_byte_match")
+                    _tracker.SkipCommandStartMarker();
                 var payload = Encoding.UTF8.GetBytes(cdCmd + enter);
                 _pty?.InputStream.Write(payload, 0, payload.Length);
                 _pty?.InputStream.Flush();
@@ -3096,11 +3789,12 @@ public class ConsoleWorker
         if (title != null) Console.Title = title;
 
         // Propagate the proxy-supplied display name (sent in the claim's
-        // `title` field, already in "Fox" / "Reggae" form) and the
-        // worker's own shell family into the tracker so any command
-        // that ends up cached on this console carries a self-contained
-        // status line matching how inline results are rendered.
-        _tracker.SetDisplayContext(title, _shellFamily);
+        // `title` field, already in "Fox" / "Reggae" form) to the
+        // worker's own _displayName field. BuildStatusLine reads it
+        // on every finalize, so any command that ends up cached on
+        // this console carries a self-contained status line matching
+        // how inline results are rendered.
+        _displayName = title;
 
         // New proxy taking ownership — drop whatever is in the
         // recent-output ring. Anything captured before this moment

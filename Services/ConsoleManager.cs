@@ -1010,47 +1010,20 @@ public class ConsoleManager
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
+            var spillPath = response.TryGetProperty("spillFilePath", out var spProp) ? spProp.GetString() : null;
             var displayName2 = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
 
-            // Drain any trailing bytes the shell streamed after OSC PromptStart
-            // (pwsh prompt repaint, Format-Table rows still finishing, etc.).
-            // With the worker's fixed 500ms settle removed, this call
-            // adaptively waits until the post-primary buffer has been stable
-            // for stable_ms, capped at max_ms. Fast commands return in ~100ms,
-            // slow streaming waits as long as needed up to max_ms. Runs on
-            // the second pipe instance since the execute call freed the first.
-            //
-            // Milestone 2g: stable_ms is sourced from the adapter's
-            // output.post_prompt_settle_ms when a YAML adapter is loaded for
-            // the console's shell family, else 100. max_ms is scaled so it
-            // always has at least 200ms of headroom above stable_ms, so
-            // settle windows wider than the old 500ms ceiling (e.g. cmd's
-            // 400ms) still get a chance to complete.
-            try
-            {
-                var info = _consoles.GetValueOrDefault(consolePid);
-                var drainAdapter = info != null
-                    ? AdapterRegistry.Default?.Find(info.ShellFamily)
-                    : null;
-                int stableMs = drainAdapter?.Output.PostPromptSettleMs ?? 100;
-                int maxMs = Math.Max(500, stableMs + 200);
-                var drainResp = await SendPipeRequestAsync(pipeName, w =>
-                {
-                    w.WriteString("type", "drain_post_output");
-                    w.WriteNumber("stable_ms", stableMs);
-                    w.WriteNumber("max_ms", maxMs);
-                }, TimeSpan.FromSeconds(2));
-
-                var delta = drainResp.TryGetProperty("delta", out var dp) ? dp.GetString() : null;
-                if (!string.IsNullOrEmpty(delta))
-                {
-                    output = string.IsNullOrEmpty(output) ? delta : output + "\n" + delta;
-                }
-            }
-            catch
-            {
-                // Best-effort — if drain fails the primary output is still returned.
-            }
+            // Post-prompt settle now happens inside the worker: its
+            // finalize-once path (FinalizeSnapshotAsync) waits for the
+            // capture to be stable for the adapter's
+            // output.post_prompt_settle_ms before reading the final
+            // slice. The worker returns a fully assembled `output`
+            // string here, so the proxy no longer needs a second
+            // round-trip over the pipe to drain trailing bytes. This
+            // guarantees inline `execute_command` and deferred
+            // `wait_for_completion` see identical output — both paths
+            // read the same `CommandResult` that the finalize-once
+            // pipeline built.
 
             // Update LastAiCwd with the result cwd (the cwd the command ended at)
             if (cwdResult != null)
@@ -1067,6 +1040,7 @@ public class ConsoleManager
                 ShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily,
                 Cwd = cwdResult,
                 Notice = routingNotice,
+                SpillFilePath = spillPath,
             };
         }
         catch (TimeoutException)
@@ -1723,6 +1697,7 @@ public class ConsoleManager
                         ShellFamily = consoleInfo?.ShellFamily,
                         Cwd = entry.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                         StatusLine = entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null,
+                        SpillFilePath = entry.TryGetProperty("spillFilePath", out var sp) ? sp.GetString() : null,
                     });
                 }
                 UnmarkPipeBusy(agentId, pid.Value);
@@ -2013,6 +1988,7 @@ public class ConsoleManager
                             ShellFamily = info2?.ShellFamily,
                             Cwd = entry.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                             StatusLine = entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null,
+                            SpillFilePath = entry.TryGetProperty("spillFilePath", out var sp) ? sp.GetString() : null,
                         });
                     }
                     UnmarkPipeBusy(agentId, pid);
@@ -2421,6 +2397,12 @@ public class ConsoleManager
         // drains return this verbatim instead of reformatting with
         // possibly-stale proxy-side ConsoleInfo metadata.
         public string? StatusLine { get; set; }
+        // Absolute path of the public spill file when the finalized
+        // output exceeded the truncation threshold. Populated on
+        // oversized results from both inline and cached delivery
+        // paths so MCP clients can open / grep / archive the full
+        // output without parsing the preview header.
+        public string? SpillFilePath { get; set; }
         // Populated only on TimedOut — the recent-output ring snapshot the
         // worker captured at timeout. Lets the AI diagnose stuck commands
         // (watch mode, interactive prompts) without waiting for

@@ -93,14 +93,25 @@ public class Program
             Tests.PwshColorizerTests.Run();
             Tests.ConsoleManagerTests.Run();
             Tests.ConsoleWorkerTests.RunUnitTests();
+            Tests.ConsoleWorkerTests.RunCacheUnitTests();
             Tests.RegexPromptDetectorTests.Run();
             Tests.BalancedParensCounterTests.Run();
             Tests.ModeDetectorTests.Run();
+            Tests.OutputTruncationHelperTests.Run();
+            Tests.CommandOutputCaptureTests.Run();
+            Tests.CommandOutputFinalizerTests.Run();
             Tests.FileToolsTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {
                 await Tests.ConsoleWorkerTests.Run();
+                // Run the issue #1 spill suite before the multi-shell
+                // block so it is always reachable — RunMultiShell's
+                // per-suite Environment.Exit on failure (currently hit
+                // by pre-existing bash subshell timeout / exit-code
+                // assertions on some boxes) would otherwise abort
+                // --e2e before the spill assertions get to execute.
+                await Tests.SpillIntegrationTests.Run();
                 await Tests.ConsoleWorkerTests.RunMultiShell();
                 await Tests.ConsoleWorkerTests.RunIntegrationScriptGuardTest();
                 var failed = await Tests.AdapterDeclaredTestsRunner.RunAsync(registry);
