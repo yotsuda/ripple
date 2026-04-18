@@ -309,6 +309,134 @@ public class ConsoleWorkerTests
                 $"title-split: ST completes in chunk2 (got: {out2})");
         }
 
+        // AnswerAndStripDsr — DSR (\x1b[6n) scan + strip with a 3-char
+        // partial-prefix buffer for chunks where the 4-byte query
+        // straddles two PTY reads. Each test drives the pure static
+        // helper with a counter action so the "how many replies fired"
+        // check is independent of the PTY plumbing.
+
+        // Fast path: no ESC → no allocation, forward untouched.
+        {
+            var pending = "";
+            int replies = 0;
+            var s = ConsoleWorker.AnswerAndStripDsr("plain text", ref pending, () => replies++);
+            Assert(s == "plain text", "dsr: no-ESC chunk returned untouched");
+            Assert(pending == "" && replies == 0, "dsr: no-ESC chunk leaves no state");
+        }
+
+        // Single complete DSR in one chunk: reply fires, query stripped.
+        {
+            var pending = "";
+            int replies = 0;
+            var s = ConsoleWorker.AnswerAndStripDsr("a\x1b[6nb", ref pending, () => replies++);
+            Assert(s == "ab", $"dsr: single complete DSR stripped (got {s})");
+            Assert(replies == 1, "dsr: single DSR fires one reply");
+            Assert(pending == "", "dsr: single DSR leaves no pending");
+        }
+
+        // Two DSRs in one chunk: two replies, both stripped.
+        {
+            var pending = "";
+            int replies = 0;
+            var s = ConsoleWorker.AnswerAndStripDsr("x\x1b[6ny\x1b[6nz", ref pending, () => replies++);
+            Assert(s == "xyz", $"dsr: two DSRs both stripped (got {s})");
+            Assert(replies == 2, "dsr: two DSRs fire two replies");
+        }
+
+        // Split at boundary 1: "\x1b" | "[6n".
+        {
+            var pending = "";
+            int replies = 0;
+            var s1 = ConsoleWorker.AnswerAndStripDsr("abc\x1b", ref pending, () => replies++);
+            Assert(s1 == "abc", $"dsr-split@1: first chunk stripped to 'abc' (got {s1})");
+            Assert(pending == "\x1b", "dsr-split@1: pending holds ESC");
+            Assert(replies == 0, "dsr-split@1: no reply yet");
+
+            var s2 = ConsoleWorker.AnswerAndStripDsr("[6nxyz", ref pending, () => replies++);
+            Assert(s2 == "xyz", $"dsr-split@1: second chunk completes + strips (got {s2})");
+            Assert(pending == "", "dsr-split@1: pending cleared after completion");
+            Assert(replies == 1, "dsr-split@1: exactly one reply across the boundary");
+        }
+
+        // Split at boundary 2: "\x1b[" | "6n".
+        {
+            var pending = "";
+            int replies = 0;
+            var s1 = ConsoleWorker.AnswerAndStripDsr("pre\x1b[", ref pending, () => replies++);
+            Assert(s1 == "pre", $"dsr-split@2: prefix-stripped (got {s1})");
+            Assert(pending == "\x1b[", "dsr-split@2: pending holds ESC[");
+
+            var s2 = ConsoleWorker.AnswerAndStripDsr("6nrest", ref pending, () => replies++);
+            Assert(s2 == "rest" && pending == "" && replies == 1,
+                $"dsr-split@2: completes + strips (got {s2}, pending={pending}, replies={replies})");
+        }
+
+        // Split at boundary 3: "\x1b[6" | "n".
+        {
+            var pending = "";
+            int replies = 0;
+            var s1 = ConsoleWorker.AnswerAndStripDsr("hello\x1b[6", ref pending, () => replies++);
+            Assert(s1 == "hello", $"dsr-split@3: prefix-stripped (got {s1})");
+            Assert(pending == "\x1b[6", "dsr-split@3: pending holds ESC[6");
+
+            var s2 = ConsoleWorker.AnswerAndStripDsr("nworld", ref pending, () => replies++);
+            Assert(s2 == "world" && pending == "" && replies == 1,
+                $"dsr-split@3: completes + strips (got {s2}, pending={pending}, replies={replies})");
+        }
+
+        // Partial-looking tail that doesn't complete to DSR on the next
+        // chunk: buffered bytes must be flushed back to the output, NOT
+        // silently dropped.
+        {
+            var pending = "";
+            int replies = 0;
+            var s1 = ConsoleWorker.AnswerAndStripDsr("abc\x1b[6", ref pending, () => replies++);
+            Assert(s1 == "abc" && pending == "\x1b[6", "dsr-false-partial: first chunk holds prefix");
+
+            var s2 = ConsoleWorker.AnswerAndStripDsr("XYZ", ref pending, () => replies++);
+            Assert(s2 == "\x1b[6XYZ",
+                $"dsr-false-partial: ESC[6 flushed when X doesn't match n (got {s2})");
+            Assert(pending == "" && replies == 0,
+                "dsr-false-partial: no pending, no reply fired");
+        }
+
+        // ESC mid-chunk that is NOT a DSR prefix — should not be held.
+        // "\x1b[K" (EL) is a legitimate CSI that must flow through.
+        {
+            var pending = "";
+            int replies = 0;
+            var s = ConsoleWorker.AnswerAndStripDsr("a\x1b[Kb", ref pending, () => replies++);
+            Assert(s == "a\x1b[Kb", $"dsr: non-DSR CSI flows through (got {s})");
+            Assert(pending == "" && replies == 0, "dsr: non-DSR CSI leaves no state");
+        }
+
+        // DSR immediately preceded by an unrelated CSI — both must be
+        // distinguished. The scan should find the DSR, fire once, and
+        // leave the other CSI untouched.
+        {
+            var pending = "";
+            int replies = 0;
+            var s = ConsoleWorker.AnswerAndStripDsr("\x1b[Ka\x1b[6nb", ref pending, () => replies++);
+            Assert(s == "\x1b[Kab", $"dsr: CSI + DSR — only DSR stripped (got {s})");
+            Assert(replies == 1, "dsr: exactly one reply for the one DSR");
+        }
+
+        // Three-way split across three chunks: "\x1b" | "[" | "6n".
+        // Realistic pathological case for extremely small PTY reads.
+        {
+            var pending = "";
+            int replies = 0;
+            var s1 = ConsoleWorker.AnswerAndStripDsr("a\x1b", ref pending, () => replies++);
+            Assert(s1 == "a" && pending == "\x1b", "dsr-3way: chunk1");
+
+            var s2 = ConsoleWorker.AnswerAndStripDsr("[", ref pending, () => replies++);
+            Assert(s2 == "" && pending == "\x1b[", "dsr-3way: chunk2 advances prefix");
+
+            var s3 = ConsoleWorker.AnswerAndStripDsr("6nb", ref pending, () => replies++);
+            Assert(s3 == "b" && pending == "" && replies == 1,
+                $"dsr-3way: chunk3 completes (got {s3}, replies={replies})");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

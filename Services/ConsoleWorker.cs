@@ -142,6 +142,13 @@ public class ConsoleWorker
     // not consulted — the cost is per-byte CSI parsing overhead on the read
     // loop, expected <5% on large outputs.
     private VtLiteState _vtState = new(30, 200);
+
+    // Partial DSR prefix held across PTY chunks: up to 3 bytes ("\x1b",
+    // "\x1b[", or "\x1b[6") when the 4-byte DSR query "\x1b[6n" straddles
+    // two reads. Flushed by AnswerAndStripDsr on the call that completes
+    // or invalidates it. See the helper's docstring for why this is
+    // needed even though a substring Contains check handled most DSRs.
+    private string _pendingDsrPrefix = "";
     private bool _ready;
     private volatile int _outputLength;
     // Controls whether PTY output is mirrored to the worker's visible console.
@@ -1835,45 +1842,121 @@ public class ConsoleWorker
     /// demand when a new adapter needs them.
     /// </summary>
     private string AnswerAndStripTerminalQueries(string text)
-    {
-        // CSI 6 n  —  "\x1b[6n" is the only DSR variant PSReadLine uses.
-        // The longer form \x1b[?6n (private-marker DSR) isn't emitted by
-        // any adapter we host, so a plain substring check is enough.
-        const string Dsr = "\x1b[6n";
-        if (!text.Contains(Dsr)) return text;
+        => AnswerAndStripDsr(text, ref _pendingDsrPrefix, WriteDsrReply);
 
-        if (_writer is not null)
+    private void WriteDsrReply()
+    {
+        if (_writer is null) return;
+        try
         {
-            try
+            // Live virtual-terminal tracking: ReadOutputLoop feeds every
+            // PTY chunk into `_vtState` before AnswerAndStripDsr is
+            // called, so its (Row, Col) is authoritative at DSR-reply
+            // time. DSR is 1-indexed; VtLiteState is 0-indexed
+            // internally. Fallback to the legacy static-row +
+            // EstimateCursorCol heuristic only during the brief window
+            // before the first chunk arrives (cursor still at origin,
+            // fallback is closer to what the shell expects during its
+            // own startup sync).
+            int row, col;
+            if (_vtState.Row == 0 && _vtState.Col == 0)
             {
-                // Live virtual-terminal tracking: ReadOutputLoop feeds every
-                // PTY chunk into `_vtState` before calling this method, so
-                // its (Row, Col) is authoritative at DSR-reply time. DSR is
-                // 1-indexed; VtLiteState is 0-indexed internally. Fallback
-                // to the legacy static-row + EstimateCursorCol heuristic
-                // only during the brief window before the first chunk
-                // arrives (cursor still at origin, fallback is closer to
-                // what the shell expects during its own startup sync).
-                int row, col;
-                if (_vtState.Row == 0 && _vtState.Col == 0)
-                {
-                    row = 24;
-                    try { if (Console.WindowHeight > 1) row = Console.WindowHeight; } catch { }
-                    col = EstimateCursorCol();
-                }
-                else
-                {
-                    row = _vtState.Row + 1;
-                    col = _vtState.Col + 1;
-                }
-                var reply = System.Text.Encoding.UTF8.GetBytes($"\x1b[{row};{col}R");
-                _writer.Write(reply, 0, reply.Length);
-                _writer.Flush();
+                row = 24;
+                try { if (Console.WindowHeight > 1) row = Console.WindowHeight; } catch { }
+                col = EstimateCursorCol();
             }
-            catch (IOException) { /* PTY closed — worker is tearing down */ }
+            else
+            {
+                row = _vtState.Row + 1;
+                col = _vtState.Col + 1;
+            }
+            var reply = System.Text.Encoding.UTF8.GetBytes($"\x1b[{row};{col}R");
+            _writer.Write(reply, 0, reply.Length);
+            _writer.Flush();
+        }
+        catch (IOException) { /* PTY closed — worker is tearing down */ }
+    }
+
+    /// <summary>
+    /// Pure DSR (\x1b[6n) scan + strip, boundary-safe across PTY chunks.
+    /// Each complete DSR fires <paramref name="onDsrDetected"/> exactly
+    /// once and is stripped from the returned text. A trailing partial
+    /// DSR prefix (ESC, ESC[, or ESC[6) is moved into
+    /// <paramref name="pendingPrefix"/> so the next call completes it —
+    /// without this, a 4-byte DSR split across two PTY reads would
+    /// leak downstream (into OscParser, the mirror, and the shell's
+    /// output stream a consumer sees) and never produce a reply.
+    /// The partial prefix is also stripped from the returned text so
+    /// the same downstream consumers never see the half-formed query.
+    /// Mirrors the shape of <see cref="ReplaceOscTitle"/> for the same
+    /// kind of chunk-boundary problem.
+    /// </summary>
+    internal static string AnswerAndStripDsr(
+        string input,
+        ref string pendingPrefix,
+        Action? onDsrDetected)
+    {
+        const string Dsr = "\x1b[6n";
+        const int DsrLen = 4;
+
+        string combined;
+        if (pendingPrefix.Length > 0)
+        {
+            combined = pendingPrefix + input;
+            pendingPrefix = "";
+        }
+        else
+        {
+            // Hot path: no pending partial and no ESC in input — zero
+            // allocation, forward untouched. PTY chunks without escape
+            // bytes are the common case on bulk stdout.
+            if (input.IndexOf('\x1b') < 0) return input;
+            combined = input;
         }
 
-        return text.Replace(Dsr, string.Empty);
+        var sb = new StringBuilder(combined.Length);
+        int i = 0;
+        while (true)
+        {
+            int next = combined.IndexOf(Dsr, i, StringComparison.Ordinal);
+            if (next >= 0)
+            {
+                sb.Append(combined, i, next - i);
+                onDsrDetected?.Invoke();
+                i = next + DsrLen;
+                continue;
+            }
+
+            // No more complete DSRs. Check whether the tail is a
+            // partial DSR prefix ("\x1b", "\x1b[", or "\x1b[6") — in
+            // which case buffer it for the next chunk and don't emit
+            // it downstream.
+            int partialStart = -1;
+            int tailMin = combined.Length - (DsrLen - 1);
+            if (tailMin < i) tailMin = i;
+            for (int j = tailMin; j < combined.Length; j++)
+            {
+                if (combined[j] != '\x1b') continue;
+                int remaining = combined.Length - j;
+                bool matches = true;
+                for (int k = 0; k < remaining; k++)
+                {
+                    if (combined[j + k] != Dsr[k]) { matches = false; break; }
+                }
+                if (matches) { partialStart = j; break; }
+            }
+            if (partialStart >= 0)
+            {
+                sb.Append(combined, i, partialStart - i);
+                pendingPrefix = combined.Substring(partialStart);
+            }
+            else
+            {
+                sb.Append(combined, i, combined.Length - i);
+            }
+            break;
+        }
+        return sb.ToString();
     }
 
     /// <summary>
