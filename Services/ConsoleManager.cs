@@ -84,18 +84,44 @@ public class ConsoleManager
 
     private class AgentSessionState
     {
+        // Rolling "most recently touched pid across ALL shells" — kept in
+        // sync with ActivePidsByShell so legacy call-sites that don't have
+        // a shell context (peek default, get_status default) still have a
+        // reasonable single pid to fall back on. Routing no longer reads
+        // this field — execute_command's shell parameter is mandatory and
+        // the per-shell MRU stack below is the authoritative source.
         public int ActivePid { get; set; }
         public readonly HashSet<int> KnownBusyPids = new();
 
-        // Snapshot of the most recently-active console's state, captured
-        // the moment the console stopped being available (shell exited,
-        // pipe broken, window closed). Lets the next execute_command spin
-        // up a fresh same-family console and cd to where the AI was last
-        // working, instead of making the AI verify-and-retry from scratch.
-        // Consumed by PlanExecutionAsync on the following call and then
-        // cleared.
-        public string? LastActiveCwd;
-        public string? LastActiveShellPath;
+        // Per-shell MRU stack of pids, keyed by the resolved shell path
+        // (full path, PathComparison-cased). Index 0 is "the active console
+        // for this shell" — the one a bare execute_command shell=X should
+        // route to — and subsequent entries are MRU fallbacks that fill in
+        // when the top is busy. Pids are moved to index 0 on every use
+        // (touch-on-use), pushed at index 0 on fresh start, and removed
+        // wholesale when the console dies.
+        //
+        // Why per-shell instead of a global single ActivePid: with `shell`
+        // now mandatory on execute_command we always know which shell the
+        // caller wants, and a global active was the bug that let a psql
+        // session's "active" silently swallow a subsequent shell=pwsh call
+        // before — the single-active model couldn't represent "pwsh's
+        // active is A while psql's active is B", so routing collapsed to
+        // whichever was most recent. Splitting by shell lets each shell
+        // keep its own independent MRU without cross-shell interference.
+        public readonly Dictionary<string, List<int>> ActivePidsByShell =
+            new(PathComparer);
+
+        // Per-shell snapshot of the last-observed cwd + shell path for
+        // consoles that have died. Replaces the old single LastActiveCwd/
+        // LastActiveShellPath pair, which could only remember one dead
+        // console across the whole agent. Now each shell independently
+        // remembers its own tail state so `shell=pwsh` after pwsh's active
+        // died can resurrect at the right cwd without the psql side
+        // clobbering the snapshot in between. Consumed by PlanExecutionAsync
+        // on the next execute_command for that shell and cleared after use.
+        public readonly Dictionary<string, (string Cwd, string ShellPath)>
+            LastActiveByShell = new(PathComparer);
 
         // Per-logical-shell cwd continuity (keyed by the shell executable's
         // resolved absolute path). Populated as the AI works across shells;
@@ -145,23 +171,66 @@ public class ConsoleManager
     }
 
     /// <summary>
-    /// If the given pid is the agent's currently-active console, snapshot
-    /// its last-known cwd and shell path into the agent session so the
-    /// next execute_command can seamlessly auto-start a same-family
-    /// replacement at the same cwd. No-op for non-active consoles and for
-    /// consoles not in the tracking table. Call this BEFORE ClearDeadConsole
-    /// so the ConsoleInfo is still readable.
+    /// Move (or push) a pid to the top of its shell's MRU stack. Both the
+    /// per-shell stack and the legacy global ActivePid are updated in one
+    /// shot so the two sources of truth never drift. Call under _lock.
+    /// </summary>
+    private static void TouchActivePid(AgentSessionState state, string shellPath, int pid)
+    {
+        if (!state.ActivePidsByShell.TryGetValue(shellPath, out var stack))
+        {
+            stack = new List<int>();
+            state.ActivePidsByShell[shellPath] = stack;
+        }
+        stack.Remove(pid);
+        stack.Insert(0, pid);
+        state.ActivePid = pid;
+    }
+
+    /// <summary>
+    /// Remove a pid from every per-shell MRU stack and from the legacy
+    /// global ActivePid slot. Called when a console dies (ClearDeadConsole,
+    /// CollectClosedConsoles) so routing can't pick a pid that no longer
+    /// has a process behind it. Call under _lock.
+    /// </summary>
+    private static void RemoveActivePid(AgentSessionState state, int pid)
+    {
+        foreach (var stack in state.ActivePidsByShell.Values)
+            stack.Remove(pid);
+        // Strip any now-empty stacks so LastActiveByShell is the sole
+        // survivor for "this shell is temporarily pid-less but we know
+        // where it was working".
+        foreach (var key in state.ActivePidsByShell
+                     .Where(kv => kv.Value.Count == 0)
+                     .Select(kv => kv.Key)
+                     .ToList())
+        {
+            state.ActivePidsByShell.Remove(key);
+        }
+        if (state.ActivePid == pid)
+            state.ActivePid = 0;
+    }
+
+    /// <summary>
+    /// If the given pid is currently tracked as any shell's active (i.e.
+    /// appears at least once in an ActivePidsByShell stack), snapshot its
+    /// last-known cwd + shell path into LastActiveByShell[shellPath] so the
+    /// next execute_command for that shell can seamlessly auto-start a
+    /// replacement at the same cwd. No-op for consoles not in the tracking
+    /// table. Call this BEFORE ClearDeadConsole so the ConsoleInfo is still
+    /// readable.
     /// </summary>
     private void RememberClosedActive(string agentId, int pid)
     {
         lock (_lock)
         {
             var state = GetOrCreateAgentState(agentId);
-            if (state.ActivePid != pid) return;
             var info = _consoles.GetValueOrDefault(pid);
             if (info == null) return;
-            state.LastActiveCwd = info.LastAiCwd;
-            state.LastActiveShellPath = info.ShellPath;
+            bool wasTracked = state.ActivePidsByShell.Values.Any(s => s.Contains(pid));
+            if (!wasTracked) return;
+            if (info.LastAiCwd != null)
+                state.LastActiveByShell[info.ShellPath] = (info.LastAiCwd, info.ShellPath);
         }
     }
 
@@ -226,7 +295,7 @@ public class ConsoleManager
             var standby = await FindStandbyConsoleAsync(agentId, resolvedShell);
             if (standby != null)
             {
-                lock (_lock) GetOrCreateAgentState(agentId).ActivePid = standby.Value.Pid;
+                lock (_lock) TouchActivePid(GetOrCreateAgentState(agentId), resolvedShell, standby.Value.Pid);
 
                 var reusePipe = _consoles.GetValueOrDefault(standby.Value.Pid)?.PipePath;
 
@@ -300,7 +369,7 @@ public class ConsoleManager
         lock (_lock)
         {
             _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily, resolvedShell);
-            GetOrCreateAgentState(agentId).ActivePid = pid;
+            TouchActivePid(GetOrCreateAgentState(agentId), resolvedShell, pid);
         }
 
         await WaitForPipeReadyAsync(pipeName, TimeSpan.FromSeconds(30));
@@ -414,23 +483,48 @@ public class ConsoleManager
         // last known cwd and run the command there in one shot, instead
         // of a "switched to Foo, please re-execute" warning.
         string? cachedDeadCwd = null;
+        // Snapshot of the requested shell's MRU stack, taken under _lock
+        // so the fallback-walk below sees a stable list even if another
+        // thread close a console mid-plan. Contains the resolvedShell's
+        // pids in MRU order (index 0 = top = current "active for this shell").
+        List<int> mruStack = new();
 
         lock (_lock)
         {
             var state = GetOrCreateAgentState(agentId);
-            initialActivePid = state.ActivePid;
+
+            // Per-shell MRU stack is the authoritative routing source when
+            // the caller named a shell. Fall back to the legacy
+            // global-ActivePid pick only when shell is null — that path
+            // remains only for internal callers that don't know the target
+            // shell; the public execute_command tool already rejects null.
+            if (resolvedShell != null
+                && state.ActivePidsByShell.TryGetValue(resolvedShell, out var trackedStack)
+                && trackedStack.Count > 0)
+            {
+                mruStack = new List<int>(trackedStack);
+                initialActivePid = mruStack[0];
+            }
+            else
+            {
+                initialActivePid = state.ActivePid;
+            }
             consolePid = initialActivePid;
             sourceShellFamily = _consoles.GetValueOrDefault(consolePid)?.ShellFamily;
 
-            if (initialActivePid == 0 && state.LastActiveCwd != null)
+            // Lazy-recovery: if no live pid is tracked for the requested
+            // shell, see whether the shell had a recently-dead console we
+            // can resurrect at the same cwd. LastActiveByShell is
+            // per-shell, so a psql session that died mid-work doesn't
+            // leak its cwd into the next shell=pwsh call the way the old
+            // single LastActiveCwd slot did.
+            if (initialActivePid == 0 && resolvedShell != null
+                && state.LastActiveByShell.TryGetValue(resolvedShell, out var last))
             {
-                cachedDeadCwd = state.LastActiveCwd;
-                resolvedShell ??= state.LastActiveShellPath;
-                if (state.LastActiveShellPath != null)
-                    sourceShellFamily = NormalizeShellFamily(state.LastActiveShellPath);
+                cachedDeadCwd = last.Cwd;
+                sourceShellFamily = NormalizeShellFamily(last.ShellPath);
                 // Consume once so subsequent calls don't keep re-applying.
-                state.LastActiveCwd = null;
-                state.LastActiveShellPath = null;
+                state.LastActiveByShell.Remove(resolvedShell);
             }
 
             // Check if active console matches the requested shell (by full path)
@@ -499,6 +593,35 @@ public class ConsoleManager
             {
                 lock (_lock) resolvedShell = _consoles.GetValueOrDefault(initialActivePid)?.ShellPath;
             }
+
+            // Walk the requested shell's MRU stack (skipping the busy top)
+            // to prefer recently-used siblings over arbitrary standby picks.
+            // This is what makes "A, B, C open; C is active & busy → fall
+            // back to B, not A" deterministic — before the stack existed,
+            // FindStandbyConsoleAsync returned whatever EnumeratePipes
+            // surfaced first, which was effectively random.
+            foreach (var candidate in mruStack.Skip(1))
+            {
+                if (candidate == initialActivePid) continue;
+                if (!IsProcessAlive(candidate)) continue;
+                bool candidateBusy;
+                lock (_lock) candidateBusy = GetOrCreateAgentState(agentId).KnownBusyPids.Contains(candidate);
+                if (candidateBusy) continue;
+                consolePid = candidate;
+                lock (_lock)
+                {
+                    pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
+                    // Touch: the chosen fallback becomes the new top of this
+                    // shell's MRU stack so the next execute_command keeps
+                    // using it rather than retrying the busy top. Cached
+                    // output from the still-busy original top will surface
+                    // via AppendCachedOutputs when it eventually finishes.
+                    var info = _consoles.GetValueOrDefault(consolePid);
+                    if (info != null)
+                        TouchActivePid(GetOrCreateAgentState(agentId), info.ShellPath, consolePid);
+                }
+                break;
+            }
         }
 
         bool isSwitching = false;
@@ -514,7 +637,17 @@ public class ConsoleManager
                 consolePid = standby.Value.Pid;
                 lock (_lock)
                 {
-                    GetOrCreateAgentState(agentId).ActivePid = consolePid;
+                    // Touch the standby in the per-shell MRU stack so it
+                    // becomes the new "active for this shell" — same as if
+                    // we'd freshly launched it — and route it to the top
+                    // for the next execute_command.
+                    string? standbyShell;
+                    var info = _consoles.GetValueOrDefault(consolePid);
+                    standbyShell = info?.ShellPath ?? resolvedShell;
+                    if (standbyShell != null)
+                        TouchActivePid(GetOrCreateAgentState(agentId), standbyShell, consolePid);
+                    else
+                        GetOrCreateAgentState(agentId).ActivePid = consolePid;
                     pipeName = _consoles.GetValueOrDefault(consolePid)?.PipePath ?? GetPipeName(agentId, consolePid);
                 }
             }
@@ -976,8 +1109,7 @@ public class ConsoleManager
             _pidToTitle.Remove(consolePid);
             var state = GetOrCreateAgentState(agentId);
             state.KnownBusyPids.Remove(consolePid);
-            if (state.ActivePid == consolePid)
-                state.ActivePid = 0;
+            RemoveActivePid(state, consolePid);
         }
     }
 
@@ -1075,6 +1207,13 @@ public class ConsoleManager
 
     private static readonly StringComparison PathComparison =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    // Same policy as PathComparison but in IEqualityComparer form for
+    // dictionary keys (ActivePidsByShell, LastActiveByShell, etc. all key
+    // on full shell paths, which must match case-insensitively on Windows
+    // and exactly on POSIX to stay consistent with the rest of this file).
+    private static readonly StringComparer PathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     /// <summary>
     /// True when a console's live cwd differs from the cwd the AI last saw
@@ -1509,17 +1648,16 @@ public class ConsoleManager
                 var info = _consoles[pid];
                 closed.Add((info.DisplayName, info.ShellFamily));
                 var state = GetOrCreateAgentState(agentId);
-                // If this was the AI's active console, snapshot its cwd /
-                // shell path before removing it so the next execute_command
-                // can seamlessly spin up a same-family replacement at the
-                // same working directory. Inlined rather than calling
+                // If this console was tracked as any shell's active (top
+                // of stack or fallback in the MRU list), snapshot its cwd
+                // into LastActiveByShell[info.ShellPath] so the next
+                // execute_command for that shell can auto-start a
+                // replacement at the same cwd. Inlined rather than calling
                 // RememberClosedActive because we're already under _lock.
-                if (state.ActivePid == pid)
-                {
-                    state.LastActiveCwd = info.LastAiCwd;
-                    state.LastActiveShellPath = info.ShellPath;
-                    state.ActivePid = 0;
-                }
+                bool wasTracked = state.ActivePidsByShell.Values.Any(s => s.Contains(pid));
+                if (wasTracked && info.LastAiCwd != null)
+                    state.LastActiveByShell[info.ShellPath] = (info.LastAiCwd, info.ShellPath);
+                RemoveActivePid(state, pid);
                 _consoles.Remove(pid);
                 _pidToTitle.Remove(pid);
                 state.KnownBusyPids.Remove(pid);

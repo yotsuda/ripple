@@ -1171,6 +1171,30 @@ public class CommandTracker
     }
 
     /// <summary>
+    /// Collapse a command into a single line for use in a status line:
+    /// strip leading/trailing whitespace + newlines, take only the first
+    /// remaining line, mark with "..." if any content was dropped (either
+    /// extra lines or the 60-char overflow tail). Returning a guaranteed
+    /// single line keeps the status line "1 line = 1 result" invariant
+    /// even when the user sent a multi-line script.
+    /// </summary>
+    public static string TruncateForStatusLine(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return "";
+
+        var trimmed = command.Trim();
+        var newlineIndex = trimmed.IndexOfAny(['\r', '\n']);
+        var firstLine = newlineIndex >= 0 ? trimmed[..newlineIndex].TrimEnd() : trimmed;
+        var hadExtraLines = firstLine.Length < trimmed.Length;
+
+        if (firstLine.Length > 60)
+            return firstLine[..60] + "...";
+        if (hadExtraLines)
+            return firstLine + "...";
+        return firstLine;
+    }
+
+    /// <summary>
     /// Build a self-describing status line for a command result, using
     /// what the worker knows at Resolve time: the proxy-supplied
     /// display name, the adapter's shell family, the command text,
@@ -1190,8 +1214,7 @@ public class CommandTracker
         var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
         var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
         var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
-        var trimmed = command?.Trim();
-        var cmd = trimmed is { Length: > 60 } ? trimmed[..60] + "..." : trimmed;
+        var cmd = TruncateForStatusLine(command);
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Render a neutral

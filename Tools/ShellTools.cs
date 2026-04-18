@@ -45,19 +45,21 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Execute a command in the shared terminal. The command and its output are visible to the user as they stream. Session state (variables, modules, cwd) persists across calls. If the active console is busy with a user-typed command, ripple auto-routes to a same-family standby (or auto-starts a fresh one) and preserves your last known cwd via a cd preamble — if the source console was moved by the user since your last command, you'll see a one-line routing notice explaining what ripple did. If the active console is idle but the user manually cd'd in it since your last command, the call returns a verify-and-retry warning instead of running. Every response also reports any other consoles' busy / finished / closed state so you stay aware of background activity.")]
+    [Description("Execute a command in the shared terminal. The command and its output are visible to the user as they stream. Session state (variables, modules, cwd) persists across calls. `shell` is REQUIRED — every call must state which shell family / REPL the pipeline targets. If the active console is busy with a user-typed command, ripple auto-routes to a same-family standby (or auto-starts a fresh one) and preserves your last known cwd via a cd preamble — if the source console was moved by the user since your last command, you'll see a one-line routing notice explaining what ripple did. If the active console is idle but the user manually cd'd in it since your last command, the call returns a verify-and-retry warning instead of running. Every response also reports any other consoles' busy / finished / closed state so you stay aware of background activity. IMPORTANT: do NOT invoke powershell/pwsh from the built-in Bash tool (the Dev-env / VS tools / user profile won't be loaded and many commands will fail). If you need PowerShell, start it via start_console (shell=\"pwsh\") and run it through this tool.")]
     public static async Task<string> ExecuteCommand(
         ConsoleManager consoleManager,
         [Description("The pipeline to execute (supports pipes, e.g. 'ls | grep foo')")]
         string pipeline,
-        [Description("Shell type to execute in (bash, pwsh, zsh, or full path). If omitted, uses the current active console. If specified and no matching console exists, one is auto-started.")]
-        string? shell = null,
+        [Description("Shell type to execute in (bash, pwsh, zsh, cmd, python, duckdb, psql, or any registered adapter name / full path). REQUIRED — must be stated explicitly on every call. This closes a silent-failure hole where an AI that just talked to a REPL (psql, duckdb, python) could accidentally send a shell pipeline to that REPL because the active console defaulted there. If no matching console exists for the requested shell, one is auto-started.")]
+        string shell,
         [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — ripple flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
         int timeout_seconds = 30,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(shell))
+            return "✗ `shell` is required. Pass shell=\"pwsh\" / \"bash\" / \"zsh\" / \"cmd\" / or a registered REPL adapter name (python, duckdb, psql, node, ...). Stating the target shell on every execute_command call prevents silent routing into whatever console happened to be active — a REPL you were just talking to could otherwise interpret your next shell pipeline as input.";
         var agentId = agent_id ?? "default";
         var result = await consoleManager.ExecuteCommandAsync(pipeline, timeout_seconds, agentId, shell);
 
@@ -65,7 +67,7 @@ public class ShellTools
         if (result.TimedOut)
         {
             var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
-            var cmd = result.Command?.Trim() is { Length: > 60 } c ? c[..60] + "..." : result.Command?.Trim();
+            var cmd = CommandTracker.TruncateForStatusLine(result.Command);
             var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {cmd}\nUse wait_for_completion tool to wait and retrieve the result.";
             if (!string.IsNullOrEmpty(result.PartialOutput))
                 response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{result.PartialOutput}";
@@ -196,7 +198,7 @@ public class ShellTools
             var elapsedPart = peek.RunningElapsedSeconds.HasValue
                 ? $" ({peek.RunningElapsedSeconds.Value:F1}s elapsed)"
                 : "";
-            var peekCmd = peek.RunningCommand.Trim() is { Length: > 60 } pc ? pc[..60] + "..." : peek.RunningCommand.Trim();
+            var peekCmd = CommandTracker.TruncateForStatusLine(peek.RunningCommand);
             sb.AppendLine($"Running: {peekCmd}{elapsedPart}");
         }
         else if (peek.Busy)
@@ -243,7 +245,7 @@ public class ShellTools
     {
         var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
         var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
-        var cmd = r.Command?.Trim() is { Length: > 60 } c ? c[..60] + "..." : r.Command?.Trim();
+        var cmd = CommandTracker.TruncateForStatusLine(r.Command);
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Showing a success tick
@@ -325,8 +327,9 @@ public class ShellTools
     {
         var shell = b.ShellFamily != null ? $" ({b.ShellFamily})" : "";
         var elapsed = b.ElapsedSeconds.HasValue ? $" ({b.ElapsedSeconds.Value:F0}s)" : "";
-        var raw = string.IsNullOrEmpty(b.RunningCommand) ? "(user command)" : b.RunningCommand.Trim();
-        var cmd = raw.Length > 60 ? raw[..60] + "..." : raw;
+        var cmd = string.IsNullOrEmpty(b.RunningCommand)
+            ? "(user command)"
+            : CommandTracker.TruncateForStatusLine(b.RunningCommand);
         var cwdInfo = !string.IsNullOrEmpty(b.Cwd) ? $" | Location: {b.Cwd}" : "";
         return $"⧗ {b.DisplayName}{shell} | Status: Busy{elapsed} | Pipeline: {cmd}{cwdInfo}";
     }
