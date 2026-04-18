@@ -1,0 +1,172 @@
+schema: 1
+name: sbcl
+version: 0.1.0
+description: >
+  Steel Bank Common Lisp REPL with OSC 633 shell-integration-style
+  command tracking. Third Common Lisp adapter alongside CCL and ABCL —
+  adds a SBCL-specific prompt hook via sb-int:*repl-prompt-fun*.
+  Shares the same main-mode regex ^\? $ as CCL and ABCL by overriding
+  SBCL's default "* " prompt to the literal "? " all three CL
+  adapters agree on — the worker's ModeDetector then stays impl-
+  agnostic regardless of which Lisp is running.
+
+  Strengthens the §18 Q1 / Q4 evidence: three independent CL
+  implementations now share the same `balanced_parens` block with
+  identical reader-macro surface (char literal `#\(`, block comment
+  `#| |#`), which is the concrete justification for eventually
+  factoring a `balanced_parens: { preset: lisp }` registry preset.
+
+  Main mode only. Break-loop (debugger) mode is deferred — SBCL's
+  debugger prompt binds via `sb-debug::*debug-prompt*` (different
+  mechanism than the REPL prompt hook) and the `0] ` / `1] ` / ...
+  level progression would need its own hook + level_capture regex.
+homepage: https://www.sbcl.org/
+license: BSD-2-Clause
+family: repl
+aliases:
+  - steelbank-cl
+  - steel-bank
+
+process:
+  # --noinform suppresses the banner, --no-sysinit / --no-userinit skip
+  # system and user init files so ripple's REPL is reproducible across
+  # boxes, --load runs our integration before dropping to the REPL.
+  # Same pattern CCL uses with slightly different flag spellings.
+  command_template: '"{shell_path}" --noinform --no-sysinit --no-userinit --load {init_invocation}'
+  executable_candidates:
+    - sbcl
+    # Windows installer (MSI from sbcl.org)
+    - 'C:\Program Files\Steel Bank Common Lisp\sbcl.exe'
+    # Linux / macOS standard installs
+    - /usr/bin/sbcl
+    - /usr/local/bin/sbcl
+    - /opt/homebrew/bin/sbcl
+  inherit_environment: true
+  encoding: utf-8
+  # SBCL's interactive reader on Windows treats \r as Enter via ConPTY
+  # cooked mode. Same convention as CCL / Python / Node / Racket.
+  line_ending: "\r"
+
+ready:
+  wait_for_event: prompt_start
+  timeout_ms: 0
+  # SBCL cold start is fast once the core image is loaded; no settle
+  # needed before the first prompt fires.
+  settle_before_inject_ms: 0
+  suppress_mirror_during_inject: false
+  kick_enter_after_ready: false
+  delay_after_inject_ms: 0
+
+init:
+  strategy: shell_integration
+  hook_type: prompt_variable        # sb-int:*repl-prompt-fun* override
+  delivery: launch_command
+  tempfile:
+    prefix: .ripple-integration-
+    extension: .lisp
+  init_invocation_template: '"{tempfile_path}"'
+  script_resource: integration.sbcl.lisp
+
+prompt:
+  strategy: shell_integration
+  shell_integration:
+    protocol: osc633
+    markers:
+      prompt_start: "A"
+      command_finished: "D"
+      property_update: "P"
+    property_updates:
+      cwd_key: Cwd
+
+output:
+  post_prompt_settle_ms: 50
+  strip_ansi: false
+  strip_input_echo: true
+  input_echo_strategy: deterministic_byte_match
+  line_ending: "\n"
+
+input:
+  line_ending: "\r"
+  multiline_detect: balanced_parens
+  balanced_parens:
+    open: ['(', '[', '{']
+    close: [')', ']', '}']
+    string_delims: ['"']
+    escape: '\'
+    line_comment: ';'
+    block_comment: ['#|', '|#']
+    char_literal_prefix: '#\'
+    # Same reader-macro set as CCL / ABCL — no datum_comment_prefix
+    # (Common Lisp uses #+nil for that idiom, handled inside the
+    # reader rather than at ripple's input layer).
+  multiline_delivery: tempfile
+  tempfile:
+    prefix: .ripple-exec-
+    extension: .lisp
+    path_template: "{temp_dir}/.ripple-exec-{pid}-{guid}.lisp"
+    invocation_template: '(ripple-exec-file "{path}")'
+  chunk_delay_ms: 0
+
+modes:
+  # Top-level SBCL REPL. ModeDetector falls back here when no other
+  # mode matches. Default prompt "* " is overridden to "? " by the
+  # integration hook; all three CL adapters share this regex.
+  - name: main
+    default: true
+    primary: '^\? $'
+
+signals:
+  interrupt: "\x03"
+  eof: "\x04"
+
+lifecycle:
+  ready_timeout_ms: 0
+  shutdown:
+    command: "(sb-ext:exit)"
+    grace_ms: 1000
+    force_signal: kill
+
+capabilities:
+  stateful: true
+  interrupt: true
+  meta_commands: false
+  # No `auto_modes` yet — main mode is the only declared mode. When
+  # the debugger hook is added in a follow-up, this flips to true to
+  # match CCL's declaration.
+  auto_modes: false
+  async_output: false
+  # SBCL has no per-expression exit code at the REPL level; errors
+  # drop into the debugger but the REPL stays running with D;0.
+  exit_code: "unreliable"
+  cwd_tracking: true
+  cwd_format: windows_native
+  job_control: false
+  shell_integration: osc633
+  user_busy_detection: none
+
+probe:
+  eval: "(+ 1 1)"
+  expect: '^2$'
+
+tests:
+  - name: "integer arithmetic returns a value"
+    eval: "(* 21 2)"
+    expect: '42'
+
+  - name: "stateful: defparameter persists across commands"
+    setup_sequence:
+      - eval: "(defparameter *ripple-sbcl-test* 'persist-ok)"
+    eval: "*ripple-sbcl-test*"
+    expect: 'PERSIST-OK'
+
+  - name: "reader macro: block comment #| |# ignored"
+    eval: "(+ 1 #| nested |# 2)"
+    expect: '^3$'
+
+  - name: "char literal: #\\( is a character not an open paren"
+    eval: "(char-code #\\()"
+    expect: '40'
+
+  - name: "sbcl implementation version returns a dotted version"
+    eval: "(lisp-implementation-version)"
+    expect: '\d+\.\d+\.\d+'
