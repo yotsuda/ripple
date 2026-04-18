@@ -129,9 +129,26 @@ public class CommandTracker
     private int _terminalCols = 120;
     private int _terminalRows = 30;
 
+    // Live VT-100 interpreter — advanced per FeedOutput, reset on the
+    // same triggers as the ring buffer (first OSC A, every OSC C,
+    // ClearRecentOutput). GetRecentOutputSnapshot returns Render()
+    // directly so peek_console no longer pays the cost of re-parsing the
+    // 4 KB ring through VtLite on every call. Fed from cleaned (OSC-
+    // stripped) output; ConsoleWorker keeps a separate _vtState fed
+    // from the raw PTY chunk for DSR-reply cursor tracking on Unix.
+    private VtLiteState _vtState = new(30, 120);
+
     public void SetTerminalSize(int cols, int rows)
     {
-        lock (_lock) { _terminalCols = cols; _terminalRows = rows; }
+        lock (_lock)
+        {
+            _terminalCols = cols;
+            _terminalRows = rows;
+            // Re-create the VT interpreter with the new geometry. Grid
+            // cells are fixed-size; existing cursor coordinates would be
+            // invalid after a resize anyway, and the shell repaints.
+            _vtState = new VtLiteState(rows, cols);
+        }
     }
 
     public bool Busy => _isAiCommand || _userCommandBusy || _userBusyByPolling;
@@ -478,6 +495,7 @@ public class CommandTracker
         lock (_lock)
         {
             AppendRecent(text);
+            _vtState.Feed(text.AsSpan());
 
             if (_isAiCommand)
             {
@@ -510,6 +528,10 @@ public class CommandTracker
     {
         _recentPos = 0;
         _recentLen = 0;
+        // Keep the VT interpreter in lockstep with the ring so
+        // peek_console after a clear doesn't leak state from before
+        // the OSC A / OSC C boundary.
+        _vtState = new VtLiteState(_terminalRows, _terminalCols);
     }
 
     /// <summary>
@@ -598,27 +620,7 @@ public class CommandTracker
     /// </summary>
     public string GetRecentOutputSnapshot()
     {
-        string raw;
-        lock (_lock)
-        {
-            if (_recentLen == 0) return "";
-            if (_recentLen < RecentOutputCapacity)
-            {
-                raw = new string(_recentBuf, 0, _recentLen);
-            }
-            else
-            {
-                // Wrapped: valid data starts at _recentPos and wraps around.
-                var tmp = new char[RecentOutputCapacity];
-                var firstPart = RecentOutputCapacity - _recentPos;
-                Array.Copy(_recentBuf, _recentPos, tmp, 0, firstPart);
-                Array.Copy(_recentBuf, 0, tmp, firstPart, _recentPos);
-                raw = new string(tmp);
-            }
-        }
-        int cols, rows;
-        lock (_lock) { cols = _terminalCols; rows = _terminalRows; }
-        return VtLiteState.VtLite(raw, rows, cols);
+        lock (_lock) return _vtState.Render();
     }
 
     /// <summary>
