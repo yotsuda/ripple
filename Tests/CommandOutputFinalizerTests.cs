@@ -50,6 +50,25 @@ public static class CommandOutputFinalizerTests
             cap.Dispose();
         }
 
+        // OSC strip: BEL-terminated and ST-terminated OSC sequences are
+        // each removed, and real content between them is preserved. The
+        // old two-branch pattern let the BEL branch eat past an earlier
+        // ST terminator and take user text with it — regression guard
+        // for that shape.
+        {
+            var cap = new CommandOutputCapture();
+            // Input: ST-terminated OSC, real text, BEL-terminated OSC, real text.
+            cap.Append("\x1b]0;title-one\x1b\\keep-me\x1b]0;title-two\x07tail\r\n");
+            var result = CommandOutputFinalizer.Clean(cap, 0, cap.Length);
+
+            Assert(!result.Contains('\x1b'), "osc-mixed: ESC bytes stripped");
+            Assert(!result.Contains("title-one"), "osc-mixed: ST-terminated OSC body removed");
+            Assert(!result.Contains("title-two"), "osc-mixed: BEL-terminated OSC body removed");
+            Assert(result.Contains("keep-me"), "osc-mixed: real text between OSCs preserved");
+            Assert(result.Contains("tail"), "osc-mixed: trailing text preserved");
+            cap.Dispose();
+        }
+
         // Empty window: clean of a zero-length slice returns "".
         {
             var cap = new CommandOutputCapture();

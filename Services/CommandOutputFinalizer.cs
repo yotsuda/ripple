@@ -32,8 +32,12 @@ internal static class CommandOutputFinalizer
     //
     // Alternatives covered:
     //   \x1b[...letter       — CSI sequences (cursor, erase, SGR "m" preserved)
-    //   \x1b]...\x07         — OSC with BEL terminator
-    //   \x1b]...\x1b\        — OSC with ST terminator
+    //   \x1b]...(\x07|\x1b\) — OSC, non-greedy to the first BEL or ST so an
+    //                          OSC never swallows characters past a prior
+    //                          terminator (two separate BEL- vs. ST-terminated
+    //                          branches would let the BEL branch eat through
+    //                          an earlier ST-terminated OSC and the real
+    //                          content between them).
     //   \x1b[()][0-9A-B]     — Character set designation (G0/G1)
     //   \x1b[=>]             — DECKPAM / DECKPNM keypad mode (PSReadLine emits
     //                          these around prompt redraws; leaving them through
@@ -41,7 +45,7 @@ internal static class CommandOutputFinalizer
     //                          '=' or '>' look like a stray char at the start
     //                          or end of captured output).
     private static readonly Regex AnsiRegex = new(
-        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][^\x07]*\x07|\x1b\][^\x1b]*\x1b\\|\x1b[()][0-9A-B]|\x1b[=>]",
+        @"\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b[()][0-9A-B]|\x1b[=>]",
         RegexOptions.Compiled);
 
     /// <summary>
