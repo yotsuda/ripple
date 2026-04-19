@@ -81,14 +81,32 @@ public class CommandTracker
     // tracked.
     private CommandOutputCapture? _capture;
 
-    // Snapshot of _vtState taken at OSC C (CommandExecuted). Carries the
-    // screen state that was visible when the command started running so
+    // Snapshot of the worker's session-wide VtLiteState taken at OSC C
+    // by ConsoleWorker.SetCapturedBaselineForCurrentCommand. Carries
+    // the screen state that was visible when the command started so
     // CommandOutputRenderer can initialise itself with the correct
     // baseline — necessary for ConPTY repaint bursts to be detected
-    // as idempotent overwrites instead of fresh content. Null until OSC
-    // C fires for the current AI command; cleared on RegisterCommand
-    // and on snapshot release.
+    // as idempotent overwrites instead of fresh content. Sourced from
+    // ConsoleWorker._vtState (always-on, fed raw bytes, NOT reset at
+    // OSC C) and not the tracker's own _vtState (which resets per
+    // command for peek_console scoping). Null until set; cleared on
+    // RegisterCommand.
     private VtLiteSnapshot? _capturedBaselineSnapshot;
+
+    /// <summary>
+    /// Set by ConsoleWorker at the moment OSC C fires for the current
+    /// AI command. The snapshot must come from the worker's
+    /// session-wide VtLiteState so it captures the full visible
+    /// viewport (the tracker's own VtLiteState is reset at every OSC C
+    /// and would only contain the most recent slice).
+    /// </summary>
+    public void SetCapturedBaseline(VtLiteSnapshot snapshot)
+    {
+        lock (_lock)
+        {
+            if (_isAiCommand) _capturedBaselineSnapshot = snapshot;
+        }
+    }
 
     // Capture handed off to the worker's finalize-once path but still
     // accepting PTY bytes that arrive AFTER OSC A has fired. Non-pwsh
@@ -482,18 +500,7 @@ public class CommandTracker
             // runningCommand metadata field, so peek callers never lose
             // context about what's running.
             if (evt.Type == OscParser.OscEventType.CommandExecuted)
-            {
-                // Snapshot the live VtLiteState BEFORE the reset so the
-                // finalizer's CommandOutputRenderer can be initialised
-                // with the screen state that was visible when this
-                // command started running. The snapshot survives the
-                // reset (it's an independent deep copy) and is
-                // attached to the CompletedCommandSnapshot in
-                // BuildAndReleaseSnapshot.
-                if (_isAiCommand)
-                    _capturedBaselineSnapshot = _vtState.Snapshot();
                 ResetRecentBuffer();
-            }
 
             // Mark the shell as "ready" on the first PromptStart. Until then,
             // ignore user-command busy transitions — the initial OSC B that

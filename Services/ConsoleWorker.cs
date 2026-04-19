@@ -2290,6 +2290,17 @@ public class ConsoleWorker
                             _ready = true;
                             _readyEvent.Set();
                         }
+                        // Snapshot the session-wide _vtState BEFORE the
+                        // tracker handles OSC C — the tracker's own
+                        // VtLiteState resets at OSC C, which would erase
+                        // the screen state we want to ship to the
+                        // CommandOutputRenderer as its baseline. The
+                        // worker's _vtState accumulates across commands
+                        // and matches what ConPTY's screen buffer
+                        // contains, so its snapshot is what makes the
+                        // post-alt-screen repaint detector work.
+                        if (evt.Type == OscParser.OscEventType.CommandExecuted)
+                            _tracker.SetCapturedBaseline(_vtState.Snapshot());
                         _tracker.HandleEvent(evt);
                         if (_ready && evt.Type == OscParser.OscEventType.CommandInputStart)
                             _mirrorVisible = true;
