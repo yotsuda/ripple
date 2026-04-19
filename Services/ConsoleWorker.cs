@@ -3238,7 +3238,8 @@ public class ConsoleWorker
             var cleaned = CommandOutputFinalizer.Clean(
                 snapshot.Capture,
                 snapshot.CommandStart,
-                effectiveEnd);
+                effectiveEnd,
+                snapshot.VtBaseline);
 
             // Step 3: deterministic echo stripping for adapters that
             // have no OSC-C marker to anchor the output window start.

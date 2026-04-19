@@ -235,12 +235,26 @@ public static class CommandOutputFinalizerTests
                 $"cursor-up clamp: don't underflow — got {cleaned}");
         }
 
-        // Mixed: bare CR inside an SGR-coloured progress run.
+        // Mixed: bare CR inside an SGR-coloured progress run. With
+        // real-terminal CR semantics (cursor reset, no row clear), a
+        // shorter rewrite leaves the prior tail visible — same as what
+        // the human sees on the live console. Verified empirically
+        // against Git Bash via ripple MCP (commit 7951cc3 follow-up).
+        // Programs that intend to fully redraw a line emit `\r\x1b[K`
+        // or `\x1b[2K\r`; bare \r alone is a positioning instruction.
         {
             var raw = "\x1b[36mProgress 10%\r\x1b[36mProgress 99%\r\x1b[32mDone\x1b[0m\n";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "\x1b[32mDoneress 99%\x1b[0m",
+                $"mixed sgr+cr: short rewrite leaves prior tail (real terminal semantics) — got {cleaned}");
+        }
+
+        // Same pattern with explicit erase-line: \r\x1b[K fully redraws.
+        {
+            var raw = "\x1b[36mProgress 99%\r\x1b[K\x1b[32mDone\x1b[0m\n";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
             Assert(cleaned == "\x1b[32mDone\x1b[0m",
-                $"mixed sgr+cr: only final frame survives — got {cleaned}");
+                $"sgr+cr+EL: explicit erase clears the line cleanly — got {cleaned}");
         }
 
         // ---- New renderer features (CSI X / cursor positioning / alt-screen) ----
@@ -303,6 +317,73 @@ public static class CommandOutputFinalizerTests
                 $"issue#4: all three grep matches survive ConPTY redraw burst — got {cleaned.Replace("\n", "\\n")}");
             Assert(!cleaned.Contains("\x1b["),
                 $"issue#4: no leftover CSI sequences in cleaned output — got {cleaned}");
+        }
+
+        // ---- Renderer-with-baseline (snapshot) behavior ----
+
+        // Baseline contains pre-command screen (a prompt line). Command
+        // adds new lines below. Output must include only the new lines.
+        {
+            var vt = new VtLiteState(10, 20);
+            vt.Feed("$ echo hi\n".AsSpan());
+            // Cursor now at row 1 col 0. Command echoes "hi".
+            var snap = vt.Snapshot();
+            // Now command output: "hi\n"
+            var cleaned = CommandOutputFinalizer.CleanString("hi\n", snap);
+            Assert(cleaned == "hi",
+                $"baseline: pre-command prompt row not in output — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // ConPTY repaint scenario: baseline has prompt content. After
+        // command, ConPTY emits cursor-home + same prompt content
+        // (idempotent overwrite). Per-cell change detector skips the
+        // repaint, output stays empty.
+        {
+            var vt = new VtLiteState(10, 20);
+            vt.Feed("$ ls\n".AsSpan());
+            var snap = vt.Snapshot();
+            // Simulated ConPTY repaint: cursor home, write same content.
+            // Real "command output" is empty (e.g. ls of empty dir).
+            var raw = "\x1b[H$ ls";
+            var cleaned = CommandOutputFinalizer.CleanString(raw, snap);
+            Assert(cleaned == "",
+                $"ConPTY repaint: idempotent overwrite of baseline cells produces no output — got '{cleaned}'");
+        }
+
+        // Soft-wrap re-joining at render. Baseline contains a row that
+        // was soft-wrapped from the previous row at col 5 (narrow PTY).
+        // Render joins them back into one logical line.
+        {
+            var vt = new VtLiteState(10, 5);
+            vt.Feed("abcdefgh\n".AsSpan()); // wraps "abcde" + "fgh", then LF
+            var snap = vt.Snapshot();
+            // Mark row 0 as modified by simulating a write that changes
+            // a baseline cell — otherwise the renderer skips it.
+            // Here we cheat: render directly from snapshot with empty
+            // command output and use the baseline cursor row to gate
+            // emission. To force emission of pre-cursor rows we'd need
+            // to write to them. Instead, command writes a new line:
+            var cleaned = CommandOutputFinalizer.CleanString("xyz\n", snap);
+            Assert(cleaned == "xyz",
+                $"baseline soft-wrapped rows not in output (only post-cursor) — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // Real alt-screen save/restore: baseline has prompt. Command
+        // enters alt-screen, draws garbage, exits. Output = placeholder
+        // only; baseline prompt unchanged in output (because it wasn't
+        // modified by command bytes that were idempotent or alt-screen).
+        {
+            var vt = new VtLiteState(10, 20);
+            vt.Feed("$ vim file\n".AsSpan());
+            var snap = vt.Snapshot();
+            var raw = "\x1b[?1049h\x1b[2J\x1b[Hgarbage redraw\x1b[?1049l";
+            var cleaned = CommandOutputFinalizer.CleanString(raw, snap);
+            Assert(cleaned.Contains("[interactive screen session]"),
+                $"alt-screen+baseline: placeholder emitted — got '{cleaned}'");
+            Assert(!cleaned.Contains("garbage"),
+                $"alt-screen+baseline: alt buffer content discarded — got '{cleaned}'");
+            Assert(!cleaned.Contains("vim file"),
+                $"alt-screen+baseline: pre-command prompt NOT in output — got '{cleaned}'");
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");

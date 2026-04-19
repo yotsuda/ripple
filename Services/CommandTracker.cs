@@ -81,6 +81,15 @@ public class CommandTracker
     // tracked.
     private CommandOutputCapture? _capture;
 
+    // Snapshot of _vtState taken at OSC C (CommandExecuted). Carries the
+    // screen state that was visible when the command started running so
+    // CommandOutputRenderer can initialise itself with the correct
+    // baseline — necessary for ConPTY repaint bursts to be detected
+    // as idempotent overwrites instead of fresh content. Null until OSC
+    // C fires for the current AI command; cleared on RegisterCommand
+    // and on snapshot release.
+    private VtLiteSnapshot? _capturedBaselineSnapshot;
+
     // Capture handed off to the worker's finalize-once path but still
     // accepting PTY bytes that arrive AFTER OSC A has fired. Non-pwsh
     // shells can emit trailing rows (Format-Table tails, cmd PROMPT
@@ -306,6 +315,7 @@ public class CommandTracker
             // new command. See ReleaseAiCommand for the token check.
             _commandGeneration++;
             _promptStartOffset = null;
+            _capturedBaselineSnapshot = null;
             _capture = new CommandOutputCapture();
             _exitCode = 0;
             _cwd = null;
@@ -472,7 +482,18 @@ public class CommandTracker
             // runningCommand metadata field, so peek callers never lose
             // context about what's running.
             if (evt.Type == OscParser.OscEventType.CommandExecuted)
+            {
+                // Snapshot the live VtLiteState BEFORE the reset so the
+                // finalizer's CommandOutputRenderer can be initialised
+                // with the screen state that was visible when this
+                // command started running. The snapshot survives the
+                // reset (it's an independent deep copy) and is
+                // attached to the CompletedCommandSnapshot in
+                // BuildAndReleaseSnapshot.
+                if (_isAiCommand)
+                    _capturedBaselineSnapshot = _vtState.Snapshot();
                 ResetRecentBuffer();
+            }
 
             // Mark the shell as "ready" on the first PromptStart. Until then,
             // ignore user-command busy transitions — the initial OSC B that
@@ -771,7 +792,8 @@ public class CommandTracker
             PtyPayloadBaseline: _registeredPtyPayload,
             PromptStartOffset: _promptStartOffset,
             Generation: _commandGeneration,
-            InlineDeliveryId: _registeredInlineDeliveryId);
+            InlineDeliveryId: _registeredInlineDeliveryId,
+            VtBaseline: _capturedBaselineSnapshot);
 
         // Hand the inline caller (if still attached) the snapshot
         // directly; the worker's shared finalize-once path consumes

@@ -37,6 +37,18 @@ public sealed class VtLiteState
     private readonly char[][] _alternate;
     private bool _useAlternate;
 
+    // Per-row "this row was started by auto-wrap from the previous row"
+    // flag, parallel to the grid arrays. CommandOutputRenderer uses this
+    // at extraction time to re-join soft-wrapped logical lines so an AI
+    // consumer never sees a single `git log --oneline` entry split across
+    // multiple short rows just because the PTY was narrow. Set by
+    // WriteChar's auto-wrap path; cleared when an explicit cursor move
+    // (LineFeed, CR is irrelevant since CR doesn't change row,
+    // ReverseIndex, CUP, EL/ED) overwrites the row content. Scrolling
+    // shifts flags in lockstep with grid rows.
+    private readonly bool[] _primarySoftWrap;
+    private readonly bool[] _alternateSoftWrap;
+
     // Cursor position per buffer.
     private int _pRow, _pCol;
     private int _aRow, _aCol;
@@ -48,6 +60,16 @@ public sealed class VtLiteState
     private int _scrollTop;
     private int _scrollBottom;
 
+    // Active SGR (color/attribute) state, accumulated as a string of the
+    // ESC[<params>m sequences seen since the most recent full reset
+    // (\e[0m, \e[m, or \e[m with no params). Snapshot()'d into the
+    // baseline so a CommandOutputRenderer initialised from a mid-session
+    // snapshot starts with the right SGR carry-over (`echo $RED hello`
+    // patterns where `$RED` was set by an earlier command, not the
+    // current one). No attribute parsing — for our purposes raw bytes
+    // are the right unit since the renderer just emits them back.
+    private readonly StringBuilder _activeSgr = new();
+
     // Streaming chunk-boundary buffer for incomplete escape sequences.
     // Bounded so a malformed unterminated OSC payload cannot grow without
     // limit; on overflow the tail is dropped and the cursor stays sane.
@@ -55,6 +77,7 @@ public sealed class VtLiteState
     private readonly StringBuilder _pending = new();
 
     private char[][] Grid => _useAlternate ? _alternate : _primary;
+    private bool[] SoftWrap => _useAlternate ? _alternateSoftWrap : _primarySoftWrap;
     public int Row
     {
         get => _useAlternate ? _aRow : _pRow;
@@ -69,12 +92,32 @@ public sealed class VtLiteState
     /// <summary>True while the alternate screen buffer is active (\e[?1049h).</summary>
     public bool IsAlternateBuffer => _useAlternate;
 
+    /// <summary>
+    /// True if the row at <paramref name="row"/> in the active buffer was
+    /// started by auto-wrap from the previous row (i.e. it's logically a
+    /// continuation, not an independent line).
+    /// </summary>
+    public bool IsRowSoftWrapped(int row)
+    {
+        if (row < 0 || row >= ViewRows) return false;
+        return SoftWrap[row];
+    }
+
+    /// <summary>
+    /// Active SGR sequence — a concatenation of the ESC[<paramref name="..."/>m
+    /// bytes seen since the most recent reset. Empty when defaults are
+    /// in effect.
+    /// </summary>
+    public string ActiveSgr => _activeSgr.ToString();
+
     public VtLiteState(int rows, int cols)
     {
         ViewRows = Math.Max(1, rows);
         ViewCols = Math.Max(1, cols);
         _primary = CreateGrid(ViewRows, ViewCols);
         _alternate = CreateGrid(ViewRows, ViewCols);
+        _primarySoftWrap = new bool[ViewRows];
+        _alternateSoftWrap = new bool[ViewRows];
         _scrollTop = 0;
         _scrollBottom = ViewRows - 1;
     }
@@ -100,6 +143,10 @@ public sealed class VtLiteState
                 ScrollUp(1);
             else if (Row < ViewRows - 1)
                 Row++;
+            // Mark target row as soft-wrap continuation. Done after the
+            // row advance so we mark the row we're about to write into,
+            // not the one we left.
+            SoftWrap[Row] = true;
         }
         Grid[Row][Col] = c;
         Col++;
@@ -111,6 +158,8 @@ public sealed class VtLiteState
             ScrollUp(1);
         else if (Row < ViewRows - 1)
             Row++;
+        // Hard newline — destination row is NOT a wrap continuation.
+        SoftWrap[Row] = false;
     }
 
     public void ReverseIndex()
@@ -123,25 +172,37 @@ public sealed class VtLiteState
 
     private void ScrollUp(int n)
     {
+        var sw = SoftWrap;
         for (int i = 0; i < n; i++)
         {
             var top = Grid[_scrollTop];
+            bool topSw = sw[_scrollTop];
             for (int r = _scrollTop; r < _scrollBottom; r++)
+            {
                 Grid[r] = Grid[r + 1];
+                sw[r] = sw[r + 1];
+            }
             Array.Fill(top, ' ');
             Grid[_scrollBottom] = top;
+            sw[_scrollBottom] = false;
+            _ = topSw; // discarded — the scrolled-out row's flag dies with it
         }
     }
 
     private void ScrollDown(int n)
     {
+        var sw = SoftWrap;
         for (int i = 0; i < n; i++)
         {
             var bot = Grid[_scrollBottom];
             for (int r = _scrollBottom; r > _scrollTop; r--)
+            {
                 Grid[r] = Grid[r - 1];
+                sw[r] = sw[r - 1];
+            }
             Array.Fill(bot, ' ');
             Grid[_scrollTop] = bot;
+            sw[_scrollTop] = false;
         }
     }
 
@@ -184,6 +245,7 @@ public sealed class VtLiteState
         SaveCursor();
         _useAlternate = true;
         ClearGrid(_alternate);
+        Array.Clear(_alternateSoftWrap);
         _aRow = 0;
         _aCol = 0;
         _scrollTop = 0;
@@ -207,6 +269,7 @@ public sealed class VtLiteState
     public void EraseLine(int mode)
     {
         var row = Grid[Row];
+        var sw = SoftWrap;
         if (mode == 0) // cursor to end
         {
             for (int c = Col; c < ViewCols; c++) row[c] = ' ';
@@ -218,24 +281,35 @@ public sealed class VtLiteState
         else if (mode == 2) // whole line
         {
             Array.Fill(row, ' ');
+            sw[Row] = false; // wholly cleared row is no longer a wrap continuation
         }
     }
 
     public void EraseDisplay(int mode)
     {
+        var sw = SoftWrap;
         if (mode == 0)
         {
             EraseLine(0);
-            for (int r = Row + 1; r < ViewRows; r++) Array.Fill(Grid[r], ' ');
+            for (int r = Row + 1; r < ViewRows; r++)
+            {
+                Array.Fill(Grid[r], ' ');
+                sw[r] = false;
+            }
         }
         else if (mode == 1)
         {
-            for (int r = 0; r < Row; r++) Array.Fill(Grid[r], ' ');
+            for (int r = 0; r < Row; r++)
+            {
+                Array.Fill(Grid[r], ' ');
+                sw[r] = false;
+            }
             EraseLine(1);
         }
         else if (mode == 2)
         {
             ClearGrid(Grid);
+            Array.Clear(sw);
             Row = 0;
             Col = 0;
         }
@@ -595,7 +669,9 @@ public sealed class VtLiteState
             case 'r': // DECSTBM — scroll region
                 state.SetScrollRegion(GetParam(paramsSpan, 0, 1), GetParam(paramsSpan, 1, state.ViewRows));
                 break;
-            case 'm': // SGR — colors/attrs, no-op
+            case 'm': // SGR — colors/attrs; tracked for snapshot baseline
+                state.RecordSgr(paramsSpan);
+                break;
             case 'n': // device status report
             case 'c': // device attributes
                 break;
@@ -604,4 +680,151 @@ public sealed class VtLiteState
                 break;
         }
     }
+
+    /// <summary>
+    /// Update the active SGR carry-over. <paramref name="paramsSpan"/> is
+    /// the SGR sequence's parameter list (the bytes between <c>\e[</c>
+    /// and the trailing <c>m</c>).
+    ///
+    /// Reset detection: an empty parameter list (<c>\e[m</c>), a single
+    /// "0" (<c>\e[0m</c>), or a leading "0;" within a compound sequence
+    /// (<c>\e[0;1;31m</c> = reset then bold-red) clears the carry-over.
+    /// Non-reset sequences are appended verbatim. The accumulated string
+    /// is what <see cref="Snapshot"/> ships to the renderer so a command
+    /// running with pre-existing color state (typed inside a
+    /// <c>$RED ... $RESET</c> region) starts rendering with the right
+    /// SGR prefix on its first cell.
+    /// </summary>
+    public void RecordSgr(ReadOnlySpan<char> paramsSpan)
+    {
+        // \e[m  → reset.
+        if (paramsSpan.IsEmpty)
+        {
+            _activeSgr.Clear();
+            return;
+        }
+
+        // Leading "0" with no other token, or "0" followed by ";", is a
+        // reset that may be followed by additional non-reset attrs to
+        // re-establish.
+        bool startsWithReset = paramsSpan[0] == '0'
+            && (paramsSpan.Length == 1 || paramsSpan[1] == ';');
+        if (startsWithReset)
+        {
+            _activeSgr.Clear();
+            if (paramsSpan.Length == 1) return;
+            // Skip the leading "0;" — the remainder is the post-reset state.
+            var rest = paramsSpan.Slice(2);
+            if (rest.IsEmpty) return;
+            _activeSgr.Append("\x1b[").Append(rest).Append('m');
+            return;
+        }
+
+        _activeSgr.Append("\x1b[").Append(paramsSpan).Append('m');
+    }
+
+    /// <summary>
+    /// Capture a deep-copy snapshot of the current screen state. The
+    /// snapshot is independent of further mutations on this
+    /// <see cref="VtLiteState"/> — feed-side bytes and snapshot-side
+    /// reads can interleave safely.
+    ///
+    /// Used by the worker's command-finalize path: at OSC C the worker
+    /// snapshots the live VtLiteState so <see cref="CommandOutputRenderer"/>
+    /// can be initialised with the screen state that was visible when
+    /// the command started running. This makes ConPTY's post-alt-screen
+    /// repaint bursts (which target viewport cells with their pre-existing
+    /// values) idempotent overwrites instead of fresh content the
+    /// renderer has to invent context for.
+    /// </summary>
+    public VtLiteSnapshot Snapshot()
+    {
+        return new VtLiteSnapshot(
+            ViewRows,
+            ViewCols,
+            DeepCopyGrid(_primary),
+            (bool[])_primarySoftWrap.Clone(),
+            DeepCopyGrid(_alternate),
+            (bool[])_alternateSoftWrap.Clone(),
+            _useAlternate,
+            _pRow, _pCol,
+            _aRow, _aCol,
+            _savedRow, _savedCol,
+            _scrollTop, _scrollBottom,
+            _activeSgr.ToString());
+    }
+
+    private static char[][] DeepCopyGrid(char[][] src)
+    {
+        var dst = new char[src.Length][];
+        for (int r = 0; r < src.Length; r++) dst[r] = (char[])src[r].Clone();
+        return dst;
+    }
+}
+
+/// <summary>
+/// Immutable, deep-copy snapshot of a <see cref="VtLiteState"/> screen.
+/// Owned by <see cref="CommandOutputRenderer"/> as its initial state
+/// baseline so screen-redraw bursts emitted by ConPTY after alt-screen
+/// exit (or as part of any other refresh sequence) can be absorbed
+/// without corrupting the renderer's row list — every cell ConPTY
+/// repaints already has its expected value here.
+///
+/// Field naming mirrors <see cref="VtLiteState"/>'s internal field names
+/// so the renderer can map state 1:1 without translation.
+/// </summary>
+public sealed class VtLiteSnapshot
+{
+    public int Rows { get; }
+    public int Cols { get; }
+    public char[][] PrimaryGrid { get; }
+    public bool[] PrimarySoftWrap { get; }
+    public char[][] AlternateGrid { get; }
+    public bool[] AlternateSoftWrap { get; }
+    public bool UseAlternate { get; }
+    public int PRow { get; }
+    public int PCol { get; }
+    public int ARow { get; }
+    public int ACol { get; }
+    public int SavedRow { get; }
+    public int SavedCol { get; }
+    public int ScrollTop { get; }
+    public int ScrollBottom { get; }
+    public string ActiveSgr { get; }
+
+    public VtLiteSnapshot(
+        int rows, int cols,
+        char[][] primaryGrid, bool[] primarySoftWrap,
+        char[][] alternateGrid, bool[] alternateSoftWrap,
+        bool useAlternate,
+        int pRow, int pCol, int aRow, int aCol,
+        int savedRow, int savedCol,
+        int scrollTop, int scrollBottom,
+        string activeSgr)
+    {
+        Rows = rows;
+        Cols = cols;
+        PrimaryGrid = primaryGrid;
+        PrimarySoftWrap = primarySoftWrap;
+        AlternateGrid = alternateGrid;
+        AlternateSoftWrap = alternateSoftWrap;
+        UseAlternate = useAlternate;
+        PRow = pRow; PCol = pCol;
+        ARow = aRow; ACol = aCol;
+        SavedRow = savedRow; SavedCol = savedCol;
+        ScrollTop = scrollTop; ScrollBottom = scrollBottom;
+        ActiveSgr = activeSgr ?? "";
+    }
+
+    /// <summary>Active grid at snapshot time (alt or primary).</summary>
+    public char[][] ActiveGrid => UseAlternate ? AlternateGrid : PrimaryGrid;
+
+    /// <summary>Active soft-wrap flags at snapshot time.</summary>
+    public bool[] ActiveSoftWrap => UseAlternate ? AlternateSoftWrap : PrimarySoftWrap;
+
+    /// <summary>Active cursor row at snapshot time.</summary>
+    public int Row => UseAlternate ? ARow : PRow;
+
+    /// <summary>Active cursor column at snapshot time.</summary>
+    public int Col => UseAlternate ? ACol : PCol;
 }

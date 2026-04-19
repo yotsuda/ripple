@@ -166,4 +166,14 @@ public sealed record CompletedCommandSnapshot(
     string PtyPayloadBaseline,
     long? PromptStartOffset,
     long Generation,
-    long? InlineDeliveryId = null);
+    long? InlineDeliveryId = null,
+    // Deep-copy snapshot of the live VtLiteState screen taken at OSC C
+    // (CommandExecuted). Passed to CommandOutputRenderer so the renderer
+    // can be initialised with the screen state visible when the command
+    // started — makes ConPTY's post-alt-screen and post-prompt repaint
+    // bursts idempotent overwrites of cells that already hold the
+    // baseline values, instead of fresh content the renderer would
+    // otherwise treat as command output. Null when no baseline was
+    // captured (e.g. early-exit paths that bypass OSC C, or test
+    // harnesses that build snapshots directly).
+    VtLiteSnapshot? VtBaseline = null);

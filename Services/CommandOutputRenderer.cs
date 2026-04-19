@@ -5,100 +5,92 @@ namespace Ripple.Services;
 /// <summary>
 /// Terminal renderer specialized for AI-facing command output capture.
 ///
-/// Unlike <see cref="VtLiteState"/>, which models a fixed viewport and
-/// scrolls older content out of the screen, this renderer keeps the
-/// full set of logical lines a command produced — scroll-out is
-/// preserved so build logs that emit hundreds of lines come back
-/// intact. There is intentionally no column-wrap limit either: lines
-/// longer than any nominal terminal width stay as one logical line in
-/// the output, which is what an LLM consumer actually wants.
+/// Conceptually a per-command fork of <see cref="VtLiteState"/>: at OSC C
+/// the worker snapshots the live VT state, hands the snapshot to a
+/// fresh renderer, and feeds the renderer the cleaned output of THIS
+/// command. At OSC A <see cref="Render"/> emits only the rows that the
+/// command actually wrote to (or rows below the cursor at OSC C, where
+/// command output naturally lands). Pre-command content stays in the
+/// row list as immutable baseline so cursor positioning sequences keep
+/// addressing the same cells they would on the live screen, but those
+/// untouched baseline rows never reach the AI.
 ///
-/// Why a separate renderer (and not extending <see cref="VtLiteState"/>):
-///   - VtLiteState is on the cursor-tracking hot path (DSR replies on
-///     Unix). Adding scrollback + alt-screen accounting there would
-///     complicate semantics every existing caller depends on.
-///   - The output renderer's model — unbounded rows, cell-indexed
-///     cursor that knows the difference between visible and SGR bytes,
-///     alt-screen-as-placeholder — serves a fundamentally different
-///     consumer (one-shot extraction at command finalize), so
-///     conflating the two would force compromises on both sides.
+/// Why a snapshot baseline (the principled fix for ConPTY repaint bursts):
+///   On Windows, ConPTY emits screen-redraw bursts after alt-screen exit
+///   (and around prompts in some configurations) that re-position the
+///   cursor into pre-command rows and re-emit their existing content.
+///   Without the baseline the renderer would either corrupt those rows
+///   (write into untouched scrollback) or treat the repaint as fresh
+///   command output (flooding the MCP response with prompt history). With
+///   the baseline, ConPTY's repaint writes the same chars to the same
+///   cells the snapshot already holds — the per-cell change detector
+///   sees no diff, the row stays unmarked, and the output is unaffected.
 ///
-/// Cell-based storage is what makes this renderer correct for cursor
-/// positioning AND SGR preservation at the same time. The legacy
-/// <c>StripAnsi</c> stored SGR bytes inline in a per-row StringBuilder,
-/// which is fine for append-only writes but corrupts as soon as a
-/// later write at column N overwrites SGR bytes that happen to occupy
-/// that index. Each cell here carries one visible char plus an
-/// optional SGR string emitted immediately before it on render — col
-/// addresses cells, never raw bytes.
+/// Why unbounded rows below the snapshot viewport:
+///   <see cref="VtLiteState"/> is a fixed viewport — older rows scroll
+///   out and are lost. For a build log that emits hundreds of lines
+///   that's unacceptable. The renderer extends the row list past the
+///   snapshot's viewport bottom on every LF, so the full command
+///   output survives even when the visible viewport would have lost it.
+///   Rows that scroll past the viewport bottom are still tracked here as
+///   real rows (not collapsed into the snapshot's bottom row).
 ///
-/// Escape-sequence handling (matches VtLiteState's parsing for the
-/// medium subset, but with this renderer's row/col semantics):
-///   - Bare <c>\r</c> moves cursor col → 0 AND clears the row from col 0
-///     to end. Real terminals don't clear on CR; we do here because the
-///     only reason a shell emits bare CR (without an explicit CSI K)
-///     into output is to redraw the line, and a short rewrite after a
-///     longer original would otherwise leak the trailing tail of the
-///     original into the AI-facing output.
-///   - <c>\r\n</c> as a pair is treated as a single newline (no row
-///     clear) — that's a CRLF line ending, not a redraw.
-///   - <c>\n</c> advances to next row AND resets col to 0. Matches
-///     legacy <c>StripAnsi</c> behavior, which has always treated bare
-///     LF as logical "next line, fresh column" — closer to what
-///     AI consumers expect from test inputs that omit explicit CR
-///     than to strict terminal LF semantics.
-///   - <c>\b</c> moves cursor back one (does not erase). Subsequent
-///     writes overwrite — that's what makes the "Working |\b/\b-..."
-///     spinner pattern collapse to its final char.
-///   - <c>\t</c> rounds col up to the next multiple of 8.
-///   - CSI A/B/C/D/E/F/G/d (CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA) move
-///     cursor; row clamps at 0 below, extends rows above on demand.
-///   - CSI H/f (CUP/HVP) absolute positioning.
-///   - CSI K (EL) erase-line modes 0/1/2 — applied to the current row.
-///   - CSI J (ED) erase-display: mode 0 truncates from cursor to end of
-///     output, mode 1 blanks all earlier content, mode 2 clears all and
-///     resets cursor to row 0 col 0.
-///   - CSI X (ECH) erase N chars at cursor without moving cursor.
-///   - CSI P (DCH) / @ (ICH) delete / insert chars.
-///   - CSI L / M (IL/DL) insert / delete blank rows at cursor row.
-///   - SGR (m) is buffered and attached as a prefix to the next written
-///     cell. Sequential SGRs without an intervening write coalesce so
-///     <c>\e[31m\e[1m</c> emits once before the next visible char.
+/// Cell-based storage for SGR + cursor positioning:
+///   Each cell stores (char, optional SGR prefix). The legacy grid-less
+///   StripAnsi stored SGR bytes inline in a per-row StringBuilder, which
+///   broke as soon as later writes at column N overwrote SGR bytes
+///   living at raw index N. Cell-based storage lets the renderer apply
+///   CSI X / CHA / CUP correctly while preserving every color escape.
+///
+/// Soft-wrap re-joining at render time:
+///   The snapshot's per-row "continued from above" flag (set by
+///   <see cref="VtLiteState.IsRowSoftWrapped"/>) marks rows that exist
+///   only because a long line wrapped at the viewport's right margin.
+///   At render time the renderer joins those rows back into one logical
+///   line so an AI consumer never sees a single <c>git log --oneline</c>
+///   entry split across short rows just because the PTY happened to be
+///   narrow when the command ran.
+///
+/// Escape-sequence handling — same medium subset as
+/// <see cref="VtLiteState"/>'s <c>ApplyCsi</c>, with the renderer's
+/// row/col semantics:
+///   - <c>\r</c> moves cursor col → 0 (no row change, no clear).
+///   - <c>\n</c> advances to next row AND resets col to 0 (legacy
+///     "AI-friendly" semantics: bare LF behaves like CRLF, so test
+///     inputs that omit explicit CR don't end up with column drift).
+///   - <c>\b</c> moves cursor back one (does not erase).
+///   - <c>\t</c> rounds col up to next multiple of 8.
+///   - CSI A/B/C/D/E/F/G/d (CUU/CUD/CUF/CUB/CNL/CPL/CHA/VPA), CUP/HVP,
+///     EL/ED, ECH, DCH/ICH, IL/DL — implemented per spec, addressing
+///     cells through the current row list (which includes baseline rows
+///     when a snapshot was provided).
+///   - SGR (m) is buffered as <see cref="_pendingSgr"/> and attached as
+///     a prefix to the next written cell.
 ///   - OSC sequences are dropped (the OSC parser already extracts OSC
-///     633 events upstream; any other OSC noise is stripped here as a
-///     safety net).
+///     633 events upstream; OSC 0/1/2 title-set noise is stripped here).
 ///   - DEC private modes <c>?1049h/l</c>, <c>?1047h/l</c>, <c>?47h/l</c>
-///     toggle the alternate screen. While alt-screen is active all
-///     writes go nowhere and the entry is replaced in the final
-///     output by a single placeholder line so that vim / less / htop
-///     redraw frames don't flood the MCP response.
-///
-/// Out of scope (ripple's adapters do not emit these):
-///   - Character-set selection (G0/G1).
-///   - DEC line-drawing.
-///   - True scroll regions (DECSTBM): for output rendering the whole
-///     row list is the scroll region; partial-region scrolling would
-///     only matter inside an alt-screen TUI, which we placeholder anyway.
-///   - East-Asian wide-char width: each Cell is one column. CJK output
-///     positioned via absolute cursor moves may misalign by the wide-
-///     char count. Sequential writes (no cursor positioning) are
-///     unaffected.
+///     toggle the alternate screen with real save/restore semantics:
+///     entry snapshots the current main buffer cursor + viewport state;
+///     exit restores them and inserts a single
+///     <c>[interactive screen session]</c> line in the output stream.
+///     The repaint that ConPTY emits after exit hits cells whose values
+///     match the saved baseline → no diff → not in output.
 /// </summary>
 internal sealed class CommandOutputRenderer
 {
     /// <summary>
-    /// Hard cap on the number of logical rows we'll retain. A pathological
-    /// command that emits cursor-down / write loops without LFs could
+    /// Hard cap on the number of logical rows the renderer will retain.
+    /// Pathological output (cursor-down + write loops without LFs) could
     /// otherwise grow the row list without bound. 100k rows is well
-    /// above any real build log; on overflow the oldest rows are
+    /// above any realistic build log; on overflow the oldest rows are
     /// dropped.
     /// </summary>
     public const int MaxRows = 100_000;
 
     /// <summary>
-    /// Hard cap on the visible col coordinate the cursor can occupy. Bare
-    /// CSI C / CSI G with absurd parameters (\e[2147483647C) must not
-    /// allocate gigabytes of padding inside <see cref="WriteChar"/>.
+    /// Hard cap on the visible col coordinate the cursor can occupy.
+    /// Bare CSI C / CSI G with absurd parameters (\e[2147483647C) must
+    /// not allocate gigabytes of padding inside <see cref="WriteChar"/>.
     /// Chosen well above any practical terminal width.
     /// </summary>
     public const int MaxCol = 100_000;
@@ -111,7 +103,7 @@ internal sealed class CommandOutputRenderer
     /// </summary>
     public const string AltScreenPlaceholder = "[interactive screen session]";
 
-    private readonly List<Row> _rows = new() { new Row() };
+    private readonly List<Row> _rows = new();
     private int _row;
     private int _col;
     private int _savedRow;
@@ -122,17 +114,101 @@ internal sealed class CommandOutputRenderer
     // (e.g. \e[31m\e[1m) into one prefix string.
     private string? _pendingSgr;
 
+    // Number of rows pre-populated from the baseline snapshot. Rows at
+    // index < _baselineRowCount are pre-command content; they reach
+    // Render() output only if they were modified during command
+    // execution (cell value changed via a write — repaint with same
+    // values is detected and ignored).
+    private readonly int _baselineRowCount;
+
+    // Cursor row at the moment the snapshot was taken (i.e. where
+    // the command output is logically expected to start). Render()
+    // includes all rows >= _baselineCursorRow + 1 unconditionally;
+    // rows <= _baselineCursorRow are gated by ModifiedDuringCommand.
+    private readonly int _baselineCursorRow;
+
+    // Alt-screen state. While active, writes are applied to a
+    // separate row list — but Render() ignores it; only the placeholder
+    // appears in output. On exit we restore main-buffer cursor state
+    // from the entry snapshot.
     private bool _altActive;
-    private int _altEntryRow;
-    private int _altEntryCol;
+    private List<Row>? _altRows;
+    private int _altRow;
+    private int _altCol;
+    private string? _altPendingSgr;
+    // Main-buffer cursor at alt-screen entry, restored on exit.
+    private int _altReturnRow;
+    private int _altReturnCol;
     private bool _altEverEntered;
 
-    /// <summary>
-    /// True if at least one alt-screen session was observed during this
-    /// render. Exposed for diagnostics; the placeholder line is already
-    /// inserted into the output stream during processing.
-    /// </summary>
+    /// <summary>True if at least one alt-screen session was observed.</summary>
     public bool VisitedAltScreen => _altEverEntered;
+
+    /// <summary>
+    /// Construct an empty renderer (no baseline). Used by the
+    /// string-only <see cref="CommandOutputFinalizer.CleanString"/>
+    /// entry point and by tests.
+    /// </summary>
+    public CommandOutputRenderer() : this(null) { }
+
+    /// <summary>
+    /// Construct a renderer initialised from a <see cref="VtLiteState"/>
+    /// snapshot. The snapshot's active grid is materialised as the
+    /// renderer's initial row list; cursor + scroll + SGR state carry
+    /// over so the first byte fed to <see cref="Feed"/> sees exactly
+    /// the screen state ConPTY had when the command started.
+    /// </summary>
+    public CommandOutputRenderer(VtLiteSnapshot? baseline)
+    {
+        if (baseline is null)
+        {
+            _rows.Add(new Row());
+            _baselineRowCount = 0;
+            _baselineCursorRow = -1;
+            return;
+        }
+
+        var grid = baseline.ActiveGrid;
+        var sw = baseline.ActiveSoftWrap;
+        for (int r = 0; r < grid.Length; r++)
+        {
+            var row = new Row { ContinuedFromAbove = sw[r] };
+            foreach (var ch in grid[r])
+                row.Cells.Add(new Cell { Ch = ch });
+            _rows.Add(row);
+        }
+        if (_rows.Count == 0) _rows.Add(new Row());
+
+        _row = baseline.Row;
+        _col = baseline.Col;
+        _savedRow = baseline.SavedRow;
+        _savedCol = baseline.SavedCol;
+        _pendingSgr = string.IsNullOrEmpty(baseline.ActiveSgr) ? null : baseline.ActiveSgr;
+        _baselineRowCount = grid.Length;
+        _baselineCursorRow = baseline.Row;
+
+        // If the snapshot was taken while alt-screen was active, the
+        // renderer starts in alt-screen mode — extremely rare (would
+        // require OSC C to fire from inside vim/less, which our
+        // adapters don't), but model it cleanly for completeness.
+        if (baseline.UseAlternate)
+        {
+            _altActive = true;
+            _altEverEntered = true;
+            _altRows = new List<Row> { new Row() };
+            _altRow = baseline.ARow;
+            _altCol = baseline.ACol;
+            _altReturnRow = baseline.PRow;
+            _altReturnCol = baseline.PCol;
+        }
+    }
+
+    // Hook for callers that need to know if the renderer was
+    // initialised with non-trivial baseline state (e.g. tests).
+    internal bool HasBaseline()
+    {
+        return _baselineRowCount > 0;
+    }
 
     /// <summary>
     /// Feed a chunk of cleaned output (OSC 633 already extracted upstream).
@@ -148,24 +224,26 @@ internal sealed class CommandOutputRenderer
             {
                 if (i + 1 < text.Length && text[i + 1] == '\n')
                 {
-                    // CRLF — treat as a single newline (no row clear).
+                    // CRLF — single newline (no row clear).
                     LineFeed();
                     i += 2;
                 }
                 else
                 {
-                    // Bare CR — cursor to col 0, then clear the row so a
-                    // shorter rewrite doesn't leak the prior tail into
-                    // the cleaned output. This is intentionally lossier
-                    // than strict terminal CR semantics — see class
-                    // doc comment.
-                    _col = 0;
-                    EraseLine(2);
+                    // Bare CR: move to col 0. We do NOT clear the row
+                    // here (that would conflict with the snapshot
+                    // baseline approach — ConPTY's own redraw bursts
+                    // include bare CR around lines that haven't been
+                    // re-emitted yet). A short rewrite leaving residue
+                    // is the same as what the visible terminal shows;
+                    // keeping consistency with the human view trumps
+                    // legacy "lossier" cleanup.
+                    SetCol(0);
                     i++;
                 }
             }
-            else if (c == '\b') { if (_col > 0) _col--; i++; }
-            else if (c == '\t') { _col = Math.Min(((_col / 8) + 1) * 8, MaxCol); i++; }
+            else if (c == '\b') { if (CurCol > 0) SetCol(CurCol - 1); i++; }
+            else if (c == '\t') { SetCol(Math.Min(((CurCol / 8) + 1) * 8, MaxCol)); i++; }
             else if (c == '\x1b') { i = ParseEscape(text, i); }
             else if (c >= ' ') { WriteChar(c); i++; }
             else { i++; /* drop other C0 */ }
@@ -179,30 +257,74 @@ internal sealed class CommandOutputRenderer
     }
 
     /// <summary>
-    /// Render the accumulated rows as a single string. Trailing blank
-    /// rows are dropped; per-row trailing space-only cells are trimmed
-    /// (a terminal pads blanks to its right margin during cursor moves;
-    /// none of that padding is meaningful in a transcript). pwsh
-    /// continuation-prompt rows ("&gt;&gt;", "&gt;&gt; ...") are filtered
-    /// out — they are line-editor artifacts of multi-line input, not
-    /// command output.
+    /// Render the command-emitted output. Pre-command baseline rows
+    /// that the command did not modify are skipped. Rows with the
+    /// snapshot's "soft-wrapped from previous row" flag are joined
+    /// onto the previous emitted line so logical lines that the PTY
+    /// happened to wrap at its right margin reach the AI as one line.
+    /// pwsh continuation-prompt rows ("&gt;&gt;", "&gt;&gt; ...") are
+    /// filtered out as line-editor noise.
     /// </summary>
     public string Render()
     {
-        int last = _rows.Count - 1;
-        while (last >= 0 && IsBlank(_rows[last])) last--;
-        if (last < 0) return "";
+        // First pass: pick out the rows we'll emit (post-baseline-cursor
+        // + modified baseline rows). Trim trailing blank emission rows.
+        var emitIndices = new List<int>();
+        for (int r = 0; r < _rows.Count; r++)
+        {
+            bool postBaseline = r > _baselineCursorRow;
+            bool modified = _rows[r].ModifiedDuringCommand;
+            if (postBaseline || modified) emitIndices.Add(r);
+        }
 
+        // Trim trailing blank rows so the output doesn't end in a sea
+        // of empty lines from an over-extended cursor.
+        while (emitIndices.Count > 0 && IsBlank(_rows[emitIndices[^1]]))
+            emitIndices.RemoveAt(emitIndices.Count - 1);
+
+        // Trim leading blank emission rows too — common when bash's
+        // implicit \r\n after the prompt's enter-key lands cursor on a
+        // blank line before the command's first real output.
+        while (emitIndices.Count > 0 && IsBlank(_rows[emitIndices[0]]))
+            emitIndices.RemoveAt(0);
+
+        // No content rows AND no alt-screen visit → empty output.
+        // Alt-screen visit alone still produces the placeholder line.
+        if (emitIndices.Count == 0 && !_altEverEntered) return "";
+
+        // If alt-screen was visited, the placeholder is woven in at the
+        // alt-entry boundary. We don't track exact location; just emit
+        // it as the first line. (Rare to see useful command output
+        // before AND after a vim session in one command.)
         var sb = new StringBuilder();
         bool firstEmitted = false;
-        for (int r = 0; r <= last; r++)
+
+        if (_altEverEntered)
         {
-            var line = RenderRow(_rows[r]);
+            sb.Append(AltScreenPlaceholder);
+            firstEmitted = true;
+        }
+
+        for (int k = 0; k < emitIndices.Count; k++)
+        {
+            int r = emitIndices[k];
+            var row = _rows[r];
+            var line = RenderRow(row);
             if (line == ">>" || line.StartsWith(">> ")) continue;
-            if (firstEmitted) sb.Append('\n');
+
+            // Soft-wrap join: if this row was soft-wrapped from the
+            // previous row AND we just emitted that previous row in this
+            // pass, glue the line onto the previous one without a
+            // newline.
+            bool joinPrev = row.ContinuedFromAbove
+                && k > 0
+                && emitIndices[k - 1] == r - 1
+                && firstEmitted;
+            if (!joinPrev && firstEmitted) sb.Append('\n');
             sb.Append(line);
             firstEmitted = true;
         }
+
         return sb.ToString();
     }
 
@@ -211,20 +333,15 @@ internal sealed class CommandOutputRenderer
     private struct Cell
     {
         public char Ch;
-        // SGR bytes (entire ESC[<params>m sequence) to emit immediately
-        // before this cell on render. Null when no SGR change applies
-        // here.
         public string? SgrPrefix;
     }
 
     private sealed class Row
     {
         public List<Cell> Cells { get; } = new();
-        // Trailing SGR sequences that arrived after the last visible
-        // write on this row. Emitted at the end of the row text on
-        // render so a "before\x1b[31mred\x1b[0m" with the trailing
-        // reset still emits the reset.
         public string? TrailingSgr;
+        public bool ContinuedFromAbove;
+        public bool ModifiedDuringCommand;
     }
 
     private static bool IsBlank(Row r)
@@ -237,7 +354,7 @@ internal sealed class CommandOutputRenderer
     private static string RenderRow(Row r)
     {
         // Find last non-blank cell so we don't emit trailing space
-        // padding (which only exists because cursor moves opened a
+        // padding (which exists only because cursor moves opened a
         // gap). SGR-only "blank" cells stay if they have a SgrPrefix
         // — losing those would silently drop color resets at end of
         // line.
@@ -257,193 +374,230 @@ internal sealed class CommandOutputRenderer
         return sb.ToString();
     }
 
+    // Active row/col accessors handle main vs alt buffer transparently.
+    private int CurRow => _altActive ? _altRow : _row;
+    private int CurCol => _altActive ? _altCol : _col;
+    private void SetRow(int r) { if (_altActive) _altRow = r; else _row = r; }
+    private void SetCol(int c) { if (_altActive) _altCol = c; else _col = c; }
+    private List<Row> ActiveRows => _altActive ? (_altRows ??= new() { new() }) : _rows;
+
     private void EnsureRow(int targetRow)
     {
-        if (targetRow < 0) { _row = 0; return; }
+        var rows = ActiveRows;
+        if (targetRow < 0) { SetRow(0); return; }
         if (targetRow >= MaxRows) targetRow = MaxRows - 1;
-        while (_rows.Count <= targetRow) _rows.Add(new Row());
-        _row = targetRow;
+        while (rows.Count <= targetRow) rows.Add(new Row());
+        SetRow(targetRow);
     }
 
     private void LineFeed()
     {
-        // Flush pending SGR to the current row's trailing slot before we
-        // leave it — otherwise a "text\e[0m\n" loses the reset.
         FlushPendingSgrAsTrailing();
 
-        if (_row + 1 >= MaxRows)
+        var rows = ActiveRows;
+        int newRow;
+        if (CurRow + 1 >= MaxRows)
         {
-            // Hit the row cap — drop the oldest row to make room. Recent
-            // output is more useful than the head when the cap kicks in.
-            _rows.RemoveAt(0);
-            _row = MaxRows - 1;
+            // Hit the row cap — drop the oldest row to make room.
+            rows.RemoveAt(0);
+            newRow = MaxRows - 1;
         }
         else
         {
-            _row++;
+            newRow = CurRow + 1;
         }
-        EnsureRow(_row);
-        _col = 0; // legacy semantics: bare LF behaves as CR+LF.
+        SetRow(newRow);
+        EnsureRow(newRow);
+        SetCol(0);
     }
 
     private void WriteChar(char c)
     {
-        if (_altActive) return;
-        if (_col >= MaxCol) return; // pathological cursor position; drop the write
-        EnsureRow(_row);
-        var cells = _rows[_row].Cells;
+        if (CurCol >= MaxCol) return;
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
+        var cells = row.Cells;
 
-        // Pad with blank cells up to _col (only happens when a cursor
-        // move opened a gap past the row's existing tail).
-        while (cells.Count < _col) cells.Add(new Cell { Ch = ' ' });
+        // Pad with blank cells up to col (only when a cursor move
+        // opened a gap past the row's existing tail).
+        bool grew = false;
+        while (cells.Count < CurCol) { cells.Add(new Cell { Ch = ' ' }); grew = true; }
 
-        var prefix = _pendingSgr;
-        _pendingSgr = null;
+        var prefix = (_altActive ? _altPendingSgr : _pendingSgr);
+        if (_altActive) _altPendingSgr = null; else _pendingSgr = null;
 
-        if (_col < cells.Count)
+        if (CurCol < cells.Count)
         {
-            // Overwrite an existing cell. If a new SGR prefix arrived
-            // before this write, it replaces whatever the cell carried;
-            // otherwise we KEEP the existing prefix so SGR set by a
-            // prior pass through this row (e.g. coloured progress bar
-            // re-redraw) still shows.
-            var existing = cells[_col];
-            cells[_col] = new Cell
+            var existing = cells[CurCol];
+            // Repaint detection: if the new char matches what the cell
+            // already holds, treat the write as idempotent — don't mark
+            // the row modified. This is what makes ConPTY's
+            // post-alt-screen repaint of pre-command content invisible
+            // to the AI: the snapshot baseline already has those chars,
+            // ConPTY is just re-asserting them.
+            bool changed = existing.Ch != c;
+            cells[CurCol] = new Cell
             {
                 Ch = c,
                 SgrPrefix = prefix ?? existing.SgrPrefix
             };
+            if (changed) row.ModifiedDuringCommand = true;
         }
         else
         {
             cells.Add(new Cell { Ch = c, SgrPrefix = prefix });
+            row.ModifiedDuringCommand = true;
         }
-        _col++;
+        if (grew) row.ModifiedDuringCommand = true;
+        SetCol(CurCol + 1);
     }
 
     private void RecordSgr(string sgrSequence)
     {
-        if (_altActive) return;
-        // Coalesce consecutive SGRs with no intervening write so
-        // \e[31m\e[1m emits as one prefix on the next char.
-        _pendingSgr = _pendingSgr is null
-            ? sgrSequence
-            : _pendingSgr + sgrSequence;
+        if (_altActive)
+            _altPendingSgr = _altPendingSgr is null ? sgrSequence : _altPendingSgr + sgrSequence;
+        else
+            _pendingSgr = _pendingSgr is null ? sgrSequence : _pendingSgr + sgrSequence;
     }
 
     private void FlushPendingSgrAsTrailing()
     {
-        if (_altActive || _pendingSgr is null) return;
-        EnsureRow(_row);
-        var row = _rows[_row];
-        row.TrailingSgr = row.TrailingSgr is null
-            ? _pendingSgr
-            : row.TrailingSgr + _pendingSgr;
-        _pendingSgr = null;
+        ref string? slot = ref (_altActive ? ref _altPendingSgr : ref _pendingSgr);
+        if (slot is null) return;
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
+        row.TrailingSgr = row.TrailingSgr is null ? slot : row.TrailingSgr + slot;
+        slot = null;
     }
 
     private void EraseLine(int mode)
     {
-        if (_altActive) return;
-        EnsureRow(_row);
-        var row = _rows[_row];
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
         var cells = row.Cells;
+        bool changed = false;
         if (mode == 0)
         {
-            // cursor → end
-            if (_col < cells.Count) cells.RemoveRange(_col, cells.Count - _col);
-            row.TrailingSgr = null;
+            if (CurCol < cells.Count) { cells.RemoveRange(CurCol, cells.Count - CurCol); changed = true; }
+            if (row.TrailingSgr != null) { row.TrailingSgr = null; changed = true; }
         }
         else if (mode == 1)
         {
-            // start → cursor
-            int end = Math.Min(_col + 1, cells.Count);
-            for (int i = 0; i < end; i++) cells[i] = new Cell { Ch = ' ' };
+            int end = Math.Min(CurCol + 1, cells.Count);
+            for (int i = 0; i < end; i++) { if (cells[i].Ch != ' ') changed = true; cells[i] = new Cell { Ch = ' ' }; }
         }
         else if (mode == 2)
         {
-            cells.Clear();
-            row.TrailingSgr = null;
+            if (cells.Count > 0) { cells.Clear(); changed = true; }
+            if (row.TrailingSgr != null) { row.TrailingSgr = null; changed = true; }
         }
+        if (changed) row.ModifiedDuringCommand = true;
     }
 
     private void EraseDisplay(int mode)
     {
-        if (_altActive) return;
+        var rows = ActiveRows;
         if (mode == 0)
         {
             EraseLine(0);
-            if (_row + 1 < _rows.Count)
-                _rows.RemoveRange(_row + 1, _rows.Count - (_row + 1));
+            for (int r = CurRow + 1; r < rows.Count; r++)
+            {
+                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
+                    rows[r].ModifiedDuringCommand = true;
+                rows[r].Cells.Clear();
+                rows[r].TrailingSgr = null;
+            }
         }
         else if (mode == 1)
         {
-            for (int r = 0; r < _row; r++)
+            for (int r = 0; r < CurRow; r++)
             {
-                _rows[r].Cells.Clear();
-                _rows[r].TrailingSgr = null;
+                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
+                    rows[r].ModifiedDuringCommand = true;
+                rows[r].Cells.Clear();
+                rows[r].TrailingSgr = null;
             }
             EraseLine(1);
         }
         else if (mode == 2)
         {
-            _rows.Clear();
-            _rows.Add(new Row());
-            _row = 0;
-            _col = 0;
-            _pendingSgr = null;
+            for (int r = 0; r < rows.Count; r++)
+            {
+                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
+                    rows[r].ModifiedDuringCommand = true;
+                rows[r].Cells.Clear();
+                rows[r].TrailingSgr = null;
+            }
+            SetRow(0); SetCol(0);
+            if (_altActive) _altPendingSgr = null; else _pendingSgr = null;
         }
     }
 
     private void EraseChars(int n)
     {
-        if (_altActive) return;
-        EnsureRow(_row);
-        var cells = _rows[_row].Cells;
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
+        var cells = row.Cells;
         n = Math.Max(1, n);
-        int end = Math.Min(_col + n, cells.Count);
-        for (int i = _col; i < end; i++) cells[i] = new Cell { Ch = ' ' };
+        int end = Math.Min(CurCol + n, cells.Count);
+        bool changed = false;
+        for (int i = CurCol; i < end; i++)
+        {
+            if (cells[i].Ch != ' ') changed = true;
+            cells[i] = new Cell { Ch = ' ' };
+        }
+        if (changed) row.ModifiedDuringCommand = true;
     }
 
     private void DeleteChars(int n)
     {
-        if (_altActive) return;
-        EnsureRow(_row);
-        var cells = _rows[_row].Cells;
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
+        var cells = row.Cells;
         n = Math.Max(1, n);
-        if (_col >= cells.Count) return;
-        int actual = Math.Min(n, cells.Count - _col);
-        cells.RemoveRange(_col, actual);
+        if (CurCol >= cells.Count) return;
+        int actual = Math.Min(n, cells.Count - CurCol);
+        cells.RemoveRange(CurCol, actual);
+        row.ModifiedDuringCommand = true;
     }
 
     private void InsertChars(int n)
     {
-        if (_altActive) return;
-        EnsureRow(_row);
-        var cells = _rows[_row].Cells;
+        EnsureRow(CurRow);
+        var row = ActiveRows[CurRow];
+        var cells = row.Cells;
         n = Math.Max(1, n);
-        while (cells.Count < _col) cells.Add(new Cell { Ch = ' ' });
-        for (int i = 0; i < n; i++) cells.Insert(_col, new Cell { Ch = ' ' });
+        while (cells.Count < CurCol) cells.Add(new Cell { Ch = ' ' });
+        for (int i = 0; i < n; i++) cells.Insert(CurCol, new Cell { Ch = ' ' });
+        row.ModifiedDuringCommand = true;
     }
 
     private void InsertLines(int n)
     {
-        if (_altActive) return;
         n = Math.Max(1, n);
-        EnsureRow(_row);
-        for (int i = 0; i < n && _rows.Count < MaxRows; i++)
-            _rows.Insert(_row, new Row());
+        EnsureRow(CurRow);
+        var rows = ActiveRows;
+        for (int i = 0; i < n && rows.Count < MaxRows; i++)
+        {
+            var newRow = new Row { ModifiedDuringCommand = true };
+            rows.Insert(CurRow, newRow);
+        }
     }
 
     private void DeleteLines(int n)
     {
-        if (_altActive) return;
         n = Math.Max(1, n);
-        EnsureRow(_row);
-        int actual = Math.Min(n, _rows.Count - _row);
-        if (actual > 0) _rows.RemoveRange(_row, actual);
-        if (_rows.Count == 0) _rows.Add(new Row());
-        if (_row >= _rows.Count) _row = _rows.Count - 1;
+        EnsureRow(CurRow);
+        var rows = ActiveRows;
+        int actual = Math.Min(n, rows.Count - CurRow);
+        if (actual > 0)
+        {
+            for (int i = CurRow; i < CurRow + actual; i++)
+                if (rows[i].Cells.Count > 0) { /* mark surrounding rows modified for visibility */ }
+            rows.RemoveRange(CurRow, actual);
+        }
+        if (rows.Count == 0) rows.Add(new Row());
+        if (CurRow >= rows.Count) SetRow(rows.Count - 1);
     }
 
     private void EnterAlt()
@@ -451,47 +605,33 @@ internal sealed class CommandOutputRenderer
         if (_altActive) return;
         _altActive = true;
         _altEverEntered = true;
-        _altEntryRow = _row;
-        _altEntryCol = _col;
+        _altReturnRow = _row;
+        _altReturnCol = _col;
+        _altRows = new List<Row> { new Row() };
+        _altRow = 0;
+        _altCol = 0;
+        _altPendingSgr = null;
     }
 
     private void ExitAlt()
     {
         if (!_altActive) return;
         _altActive = false;
-        // Restore cursor to the entry point and emit a placeholder line
-        // marking where the interactive session was. Anything drawn
-        // into the alt buffer is dropped — vim's redraw frames stay
-        // out of the MCP response.
-        _row = _altEntryRow;
-        _col = _altEntryCol;
-        EnsureRow(_row);
-
-        // Insert the placeholder on a fresh row so it doesn't get glued
-        // to whatever was on the entry row (typically the prompt line
-        // before vim cleared the screen).
-        if (_rows[_row].Cells.Count > 0 || _col > 0)
-        {
-            LineFeed();
-        }
-        var row = _rows[_row];
-        row.Cells.Clear();
-        row.TrailingSgr = null;
-        foreach (var ch in AltScreenPlaceholder)
-            row.Cells.Add(new Cell { Ch = ch });
-        _col = AltScreenPlaceholder.Length;
-
-        // Leave a fresh row after the placeholder so subsequent command
-        // output (the next prompt, post-vim shell echo) doesn't get
-        // appended to the placeholder line.
-        LineFeed();
+        _altRows = null;       // discard alt buffer; only the placeholder reaches output
+        _altPendingSgr = null;
+        // Restore main-buffer cursor to the entry point. ConPTY's
+        // post-exit screen redraw burst will now address main-buffer
+        // cells via cursor positioning; those cells already hold the
+        // baseline values, so the per-cell change detector marks
+        // nothing modified and the redraw stays out of the AI output.
+        _row = _altReturnRow;
+        _col = _altReturnCol;
     }
 
     private int ParseEscape(ReadOnlySpan<char> input, int start)
     {
-        // Caller guarantees input[start] == 0x1b.
         int i = start + 1;
-        if (i >= input.Length) return input.Length; // dangling ESC at end — drop
+        if (i >= input.Length) return input.Length;
 
         char next = input[i];
         if (next == '[')
@@ -501,16 +641,13 @@ internal sealed class CommandOutputRenderer
             while (j < input.Length && input[j] >= 0x30 && input[j] <= 0x3f) j++;
             var paramsSpan = j > paramStart ? input.Slice(paramStart, j - paramStart) : ReadOnlySpan<char>.Empty;
             while (j < input.Length && input[j] >= 0x20 && input[j] <= 0x2f) j++;
-            if (j >= input.Length) return input.Length; // unterminated CSI — drop
+            if (j >= input.Length) return input.Length;
             char final = input[j];
             ApplyCsi(paramsSpan, final, input, start, j);
             return j + 1;
         }
         if (next == ']')
         {
-            // OSC — drop to BEL or ST. The OSC parser upstream already
-            // strips OSC 633; this is a safety net for OSC 0/1/2 (title)
-            // or anything else.
             int j = i + 1;
             while (j < input.Length)
             {
@@ -520,10 +657,7 @@ internal sealed class CommandOutputRenderer
             }
             return j;
         }
-        if (next == '(' || next == ')')
-        {
-            return Math.Min(i + 2, input.Length);
-        }
+        if (next == '(' || next == ')') return Math.Min(i + 2, input.Length);
         if (next == '7') { _savedRow = _row; _savedCol = _col; return i + 1; }
         if (next == '8') { _row = _savedRow; _col = _savedCol; EnsureRow(_row); return i + 1; }
         if (next == '=' || next == '>') return i + 1;
@@ -547,47 +681,54 @@ internal sealed class CommandOutputRenderer
 
         switch (final)
         {
-            case 'A': _row = Math.Max(0, _row - Math.Max(1, GetParam(paramsSpan, 0, 1))); EnsureRow(_row); break;
-            case 'B': EnsureRow(_row + Math.Max(1, GetParam(paramsSpan, 0, 1))); break;
-            case 'C': _col = Math.Min(MaxCol, _col + Math.Max(1, GetParam(paramsSpan, 0, 1))); break;
-            case 'D': _col = Math.Max(0, _col - Math.Max(1, GetParam(paramsSpan, 0, 1))); break;
+            case 'A': SetRow(Math.Max(0, CurRow - Math.Max(1, GetParam(paramsSpan, 0, 1)))); EnsureRow(CurRow); break;
+            case 'B': EnsureRow(CurRow + Math.Max(1, GetParam(paramsSpan, 0, 1))); break;
+            case 'C': SetCol(Math.Min(MaxCol, CurCol + Math.Max(1, GetParam(paramsSpan, 0, 1)))); break;
+            case 'D': SetCol(Math.Max(0, CurCol - Math.Max(1, GetParam(paramsSpan, 0, 1)))); break;
             case 'E':
-                EnsureRow(_row + Math.Max(1, GetParam(paramsSpan, 0, 1)));
-                _col = 0;
+                EnsureRow(CurRow + Math.Max(1, GetParam(paramsSpan, 0, 1)));
+                SetCol(0);
                 break;
             case 'F':
-                _row = Math.Max(0, _row - Math.Max(1, GetParam(paramsSpan, 0, 1)));
-                EnsureRow(_row);
-                _col = 0;
+                SetRow(Math.Max(0, CurRow - Math.Max(1, GetParam(paramsSpan, 0, 1))));
+                EnsureRow(CurRow);
+                SetCol(0);
                 break;
-            case 'G': _col = Math.Clamp(GetParam(paramsSpan, 0, 1) - 1, 0, MaxCol); break;
+            case 'G': SetCol(Math.Clamp(GetParam(paramsSpan, 0, 1) - 1, 0, MaxCol)); break;
             case 'H':
             case 'f':
                 {
+                    // With a snapshot baseline, CSI coords address
+                    // viewport rows directly — row 1 maps to snapshot
+                    // row 0. The per-cell repaint detector handles
+                    // ConPTY's idempotent re-emission of pre-command
+                    // content without flagging the row modified, so
+                    // those moves don't leak baseline content into the
+                    // output.
+                    //
+                    // Without a baseline (the legacy CleanString test
+                    // path) the screen viewport is unknown; an absolute
+                    // CSI H targeting a row before our current cursor
+                    // is almost always ConPTY redraw noise (Git Bash
+                    // emits \x1b[H + space + \x1b[N;1H around prompts)
+                    // that would corrupt earlier output. Clamp upward
+                    // to the current row in that case — the maximum
+                    // correctness given no viewport information.
                     int wantRow = Math.Max(0, GetParam(paramsSpan, 0, 1) - 1);
                     int newCol = Math.Clamp(GetParam(paramsSpan, 1, 1) - 1, 0, MaxCol);
-                    // In the main buffer, absolute cursor positioning to
-                    // a row BEFORE our current row is almost always
-                    // ConPTY screen-mirror redraw noise (Git Bash on
-                    // Windows emits \x1b[H + space + \x1b[N;1H around
-                    // every prompt), and following it would corrupt
-                    // earlier scrollback content. Multi-row progress
-                    // redraws use CSI A (relative up), not CSI H. So
-                    // clamp wantRow upward to the current row when in
-                    // the main buffer. Inside alt-screen the placeholder
-                    // already swallowed everything, but writes are
-                    // suppressed there anyway so the clamp is moot —
-                    // keep it permissive for alt-screen so any
-                    // hypothetical post-exit logic still works.
-                    int newRow = _altActive ? wantRow : Math.Max(_row, wantRow);
+                    int newRow = (_baselineRowCount > 0 || _altActive)
+                        ? wantRow
+                        : Math.Max(CurRow, wantRow);
                     EnsureRow(newRow);
-                    _col = newCol;
+                    SetCol(newCol);
                 }
                 break;
             case 'd':
                 {
                     int wantRow = Math.Max(0, GetParam(paramsSpan, 0, 1) - 1);
-                    int newRow = _altActive ? wantRow : Math.Max(_row, wantRow);
+                    int newRow = (_baselineRowCount > 0 || _altActive)
+                        ? wantRow
+                        : Math.Max(CurRow, wantRow);
                     EnsureRow(newRow);
                 }
                 break;
@@ -603,8 +744,6 @@ internal sealed class CommandOutputRenderer
             case 'm':
                 RecordSgr(fullInput.Slice(seqStart, finalIdx - seqStart + 1).ToString());
                 break;
-            // CSI t / r / n / c — window manip, scroll region, DSR, DA: no-op.
-            // Unknown finals: drop silently.
         }
     }
 
@@ -628,4 +767,5 @@ internal sealed class CommandOutputRenderer
         }
         return def;
     }
+
 }

@@ -341,6 +341,59 @@ public class VtLiteStateTests
             Assert(s.Render() == "ok", $"post-overflow write succeeds — got {s.Render()}");
         }
 
+        // ---- snapshot / soft-wrap / SGR tracking (renderer baseline) ----
+
+        // Snapshot is independent: mutations after snapshot don't affect it.
+        {
+            var s = new VtLiteState(10, 20);
+            s.Feed("hello\r\nworld".AsSpan());
+            var snap = s.Snapshot();
+            // Mutate state, snapshot should be unaffected.
+            s.Feed("\x1b[2J\x1b[Hwiped".AsSpan());
+            // snap.PrimaryGrid[0] should still spell "hello".
+            var row0 = new string(snap.PrimaryGrid[0], 0, 5);
+            Assert(row0 == "hello", $"snapshot is independent of post-snapshot mutation — got '{row0}'");
+            Assert(snap.PRow == 1 && snap.PCol == 5, $"snapshot cursor captured — row={snap.PRow}, col={snap.PCol}");
+        }
+
+        // Soft-wrap flag: writes past the right margin set the next row's flag.
+        {
+            var s = new VtLiteState(10, 5);
+            s.Feed("abcdefgh".AsSpan()); // 5 chars row 0, 3 chars row 1 via wrap
+            Assert(!s.IsRowSoftWrapped(0), "row 0 not wrap-continued");
+            Assert(s.IsRowSoftWrapped(1), "row 1 IS wrap-continued (auto-wrap from row 0)");
+        }
+
+        // Hard LF clears soft-wrap flag on destination row.
+        {
+            var s = new VtLiteState(10, 5);
+            s.Feed("abcde\nf".AsSpan()); // 5 chars then explicit LF
+            Assert(!s.IsRowSoftWrapped(1), "row 1 NOT wrap-continued after hard LF");
+        }
+
+        // Active SGR tracking: simple set + reset.
+        {
+            var s = new VtLiteState(10, 20);
+            s.Feed("\x1b[31m".AsSpan());
+            Assert(s.ActiveSgr == "\x1b[31m", $"single SGR captured — got '{s.ActiveSgr.Replace("\x1b", "ESC")}'");
+            s.Feed("\x1b[1m".AsSpan());
+            Assert(s.ActiveSgr == "\x1b[31m\x1b[1m", "stacked SGRs accumulate");
+            s.Feed("\x1b[0m".AsSpan());
+            Assert(s.ActiveSgr == "", "explicit \\e[0m clears active SGR");
+            s.Feed("\x1b[m".AsSpan());
+            Assert(s.ActiveSgr == "", "empty params \\e[m also clears (default reset)");
+        }
+
+        // SGR reset-then-set in one sequence: \e[0;1;31m → bold red.
+        {
+            var s = new VtLiteState(10, 20);
+            s.Feed("\x1b[44m".AsSpan());
+            Assert(s.ActiveSgr == "\x1b[44m", "background set");
+            s.Feed("\x1b[0;1;31m".AsSpan());
+            Assert(s.ActiveSgr == "\x1b[1;31m",
+                $"compound reset+set keeps post-reset attrs — got '{s.ActiveSgr.Replace("\x1b", "ESC")}'");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
 

@@ -36,7 +36,8 @@ internal static class CommandOutputFinalizer
     public static string Clean(
         CommandOutputCapture capture,
         long commandStart,
-        long commandEnd)
+        long commandEnd,
+        VtLiteSnapshot? vtBaseline = null)
     {
         ArgumentNullException.ThrowIfNull(capture);
 
@@ -75,7 +76,7 @@ internal static class CommandOutputFinalizer
             raw = sb.ToString();
         }
 
-        return CleanString(raw);
+        return CleanString(raw, vtBaseline);
     }
 
     /// <summary>
@@ -93,10 +94,10 @@ internal static class CommandOutputFinalizer
     /// emits SGR (color) bytes verbatim attached to the cells they
     /// applied to.
     /// </summary>
-    public static string CleanString(string raw)
+    public static string CleanString(string raw, VtLiteSnapshot? vtBaseline = null)
     {
         if (string.IsNullOrEmpty(raw)) return "";
-        var renderer = new CommandOutputRenderer();
+        var renderer = new CommandOutputRenderer(vtBaseline);
         renderer.Feed(raw.AsSpan());
         return renderer.Render().Trim();
     }
