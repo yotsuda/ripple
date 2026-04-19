@@ -1,0 +1,172 @@
+name: Release
+
+# Triggered only by tag pushes matching v*. The release environment's
+# deployment_branch_policy further restricts execution to tag refs
+# matching v*; subscribed environment reviewers must approve before
+# the publish job runs.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Concurrency: serialize releases so a quick double-tag doesn't race
+# two npm publish jobs against each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # gh release create
+  id-token: write       # OIDC for Azure + npm provenance
+
+jobs:
+  release:
+    name: Build, sign, and publish
+    runs-on: windows-latest
+    environment: release   # gates: required reviewers + tag-only deploy policy + NPM_TOKEN secret scope
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags + history for changelog/notes extraction
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Restore the AOT compiler workload + project deps so the publish
+      # step pulls only from the local nuget cache (no network surprise).
+      - name: dotnet restore
+        run: dotnet restore ripple.csproj -r win-x64
+
+      # NativeAOT publish — produces dist\ripple.exe identical (modulo
+      # signature) to what Build.ps1 produces locally.
+      - name: dotnet publish (NativeAOT, win-x64)
+        run: dotnet publish ripple.csproj -c Release -r win-x64 -o dist --no-restore
+
+      # Tests run against the framework-dependent build under
+      # bin/Release; --tests in NativeAOT mode is unsupported, so this
+      # is a sanity gate using the regular dotnet build.
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          dotnet build -c Release --nologo
+          .\bin\Release\net9.0\ripple.exe --test
+          if ($LASTEXITCODE -ne 0) { throw "ripple --test failed (exit $LASTEXITCODE)" }
+
+      - name: Verify tag matches csproj version
+        shell: pwsh
+        run: |
+          $tagVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $csprojVersion = ([xml](Get-Content ripple.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          $npmVersion = (Get-Content npm/package.json | ConvertFrom-Json).version
+          "Tag:     $tagVersion"
+          "csproj:  $csprojVersion"
+          "package: $npmVersion"
+          if ($tagVersion -ne $csprojVersion) { throw "Tag $tagVersion does not match csproj <Version> $csprojVersion" }
+          if ($tagVersion -ne $npmVersion)    { throw "Tag $tagVersion does not match npm package version $npmVersion" }
+
+      # OIDC login to Azure — no client secret. The federated credential
+      # on the gha-ripple-signing app trusts repo:yotsuda/ripple:environment:release.
+      - name: Azure OIDC login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # AzureSignTool fetches the signing cert from Azure Key Vault and
+      # signs in-process. Uses the action's bundled Azure auth from the
+      # azure/login step above (the Az CLI / Az PowerShell context that
+      # azure/login establishes is consumed transparently).
+      - name: Install AzureSignTool
+        shell: pwsh
+        run: dotnet tool install --global AzureSignTool
+
+      # Sign dist\ripple.exe with the cert in Key Vault.
+      # `--azure-key-vault-managed-identity` would use the IMDS-backed
+      # ManagedIdentityCredential, which is wrong for our OIDC
+      # federated credential. Instead, fetch a Key Vault access token
+      # via the Azure CLI session that azure/login established, then
+      # hand it to AzureSignTool with --azure-key-vault-accesstoken.
+      # The token never leaves this step's PowerShell process.
+      - name: Sign dist\ripple.exe with Azure Key Vault
+        shell: pwsh
+        env:
+          AZURE_KV_URL: ${{ vars.KEY_VAULT_URL }}
+          AZURE_KV_CERT: ${{ vars.SIGNING_CERT_NAME }}
+        run: |
+          $tokenObj = az account get-access-token --resource https://vault.azure.net | ConvertFrom-Json
+          if (-not $tokenObj.accessToken) { throw "Failed to acquire Key Vault access token" }
+          AzureSignTool sign `
+            --azure-key-vault-url $env:AZURE_KV_URL `
+            --azure-key-vault-certificate $env:AZURE_KV_CERT `
+            --azure-key-vault-accesstoken $tokenObj.accessToken `
+            --file-digest sha256 `
+            --timestamp-rfc3161 'http://timestamp.digicert.com' `
+            --description 'ripple - declarative shell adapter framework' `
+            --description-url 'https://github.com/yotsuda/ripple' `
+            'dist\ripple.exe'
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed (exit $LASTEXITCODE)" }
+          # Verify the signature landed.
+          $sig = Get-AuthenticodeSignature 'dist\ripple.exe'
+          if ($sig.Status -ne 'Valid') { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+          "Signed: $($sig.SignerCertificate.Subject) | thumb=$($sig.SignerCertificate.Thumbprint)"
+
+      # Mirror to npm/dist so the npm publish step packages the signed
+      # binary, matching Build.ps1's local layout.
+      - name: Mirror signed binary to npm/dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path npm\dist | Out-Null
+          Copy-Item dist\ripple.exe npm\dist\ripple.exe -Force
+          $size = [Math]::Round((Get-Item npm\dist\ripple.exe).Length / 1MB, 2)
+          "Mirrored to npm\dist\ripple.exe ($size MB)"
+
+      # Publish with provenance. --provenance + id-token: write +
+      # GitHub-hosted runner = npm records the SLSA build attestation
+      # linking @ytsuda/ripple@VERSION to this exact workflow run.
+      - name: npm publish (with provenance)
+        shell: pwsh
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public --provenance
+          if ($LASTEXITCODE -ne 0) { throw "npm publish failed (exit $LASTEXITCODE)" }
+
+      # Extract the section for this version from CHANGELOG.md so the
+      # GitHub Release body matches exactly what's in the repo.
+      - name: Extract changelog entry
+        id: changelog
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $lines = Get-Content CHANGELOG.md
+          $startPattern = "^##\s+\[$([regex]::Escape($version))\]"
+          $startIdx = ($lines | Select-String -Pattern $startPattern | Select-Object -First 1).LineNumber
+          if (-not $startIdx) { throw "No CHANGELOG section for v$version" }
+          # Find the next "## [" heading; section ends one line above.
+          $endMatch = $lines | Select-Object -Skip $startIdx | Select-String -Pattern '^##\s+\[' | Select-Object -First 1
+          $endIdx = if ($endMatch) { $startIdx + $endMatch.LineNumber - 1 } else { $lines.Count }
+          $section = $lines[($startIdx)..($endIdx - 1)] -join "`n"
+          $section | Set-Content release-notes.md -NoNewline
+          "Extracted $($endIdx - $startIdx) lines for v$version"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} `
+            --title "ripple ${{ github.ref_name }}" `
+            --notes-file release-notes.md `
+            --verify-tag `
+            dist\ripple.exe
