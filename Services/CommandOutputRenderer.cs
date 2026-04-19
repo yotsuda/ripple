@@ -363,17 +363,31 @@ internal sealed class CommandOutputRenderer
         // are command-emitted by definition — always include.
         if (r.BaselineCells == null) return true;
 
-        // Trailing blank cells in the snapshot grid (the row was
-        // shorter than ViewCols) trim to a shorter logical length.
-        // Compare on visible chars: lengths can differ if the command
-        // legitimately wrote past the baseline's tail or shortened it
-        // via DCH.
-        if (r.Cells.Count != r.BaselineCells.Length) return true;
-        for (int i = 0; i < r.Cells.Count; i++)
+        // Compare on the LOGICAL content of each row, ignoring trailing
+        // whitespace. ConPTY's repaint pattern after alt-screen exit
+        // (and after most prompt redraws) is "write content + \e[K to
+        // blank the rest of the line". \e[K removes trailing cells in
+        // our model, while the baseline grid is space-padded out to
+        // ViewCols. A naive length compare would always say "differs"
+        // and the repaint would never register as idempotent. Logical
+        // equivalence — same visible chars when trailing spaces are
+        // ignored — is what makes the per-cell repaint detector
+        // actually do its job.
+        int curLast = LastNonBlankIndex(r.Cells);
+        int baseLast = LastNonBlankIndex(r.BaselineCells);
+        if (curLast != baseLast) return true;
+        for (int i = 0; i <= curLast; i++)
         {
             if (r.Cells[i].Ch != r.BaselineCells[i].Ch) return true;
         }
         return false;
+    }
+
+    private static int LastNonBlankIndex(IReadOnlyList<Cell> cells)
+    {
+        int last = cells.Count - 1;
+        while (last >= 0 && cells[last].Ch == ' ') last--;
+        return last;
     }
 
     private static string RenderRow(Row r)
