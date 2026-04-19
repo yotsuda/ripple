@@ -114,18 +114,10 @@ internal sealed class CommandOutputRenderer
     // (e.g. \e[31m\e[1m) into one prefix string.
     private string? _pendingSgr;
 
-    // Number of rows pre-populated from the baseline snapshot. Rows at
-    // index < _baselineRowCount are pre-command content; they reach
-    // Render() output only if they were modified during command
-    // execution (cell value changed via a write — repaint with same
-    // values is detected and ignored).
+    // Number of rows pre-populated from the baseline snapshot. Used
+    // by the no-baseline CUP-clamp fallback (CleanString tests) to
+    // know whether absolute cursor positioning can be trusted.
     private readonly int _baselineRowCount;
-
-    // Cursor row at the moment the snapshot was taken (i.e. where
-    // the command output is logically expected to start). Render()
-    // includes all rows >= _baselineCursorRow + 1 unconditionally;
-    // rows <= _baselineCursorRow are gated by ModifiedDuringCommand.
-    private readonly int _baselineCursorRow;
 
     // Alt-screen state. While active, writes are applied to a
     // separate row list — but Render() ignores it; only the placeholder
@@ -164,7 +156,6 @@ internal sealed class CommandOutputRenderer
         {
             _rows.Add(new Row());
             _baselineRowCount = 0;
-            _baselineCursorRow = -1;
             return;
         }
 
@@ -175,6 +166,9 @@ internal sealed class CommandOutputRenderer
             var row = new Row { ContinuedFromAbove = sw[r] };
             foreach (var ch in grid[r])
                 row.Cells.Add(new Cell { Ch = ch });
+            // Freeze a copy of the cells as the baseline for the
+            // per-cell diff at Render time.
+            row.BaselineCells = row.Cells.ToArray();
             _rows.Add(row);
         }
         if (_rows.Count == 0) _rows.Add(new Row());
@@ -185,7 +179,6 @@ internal sealed class CommandOutputRenderer
         _savedCol = baseline.SavedCol;
         _pendingSgr = string.IsNullOrEmpty(baseline.ActiveSgr) ? null : baseline.ActiveSgr;
         _baselineRowCount = grid.Length;
-        _baselineCursorRow = baseline.Row;
 
         // If the snapshot was taken while alt-screen was active, the
         // renderer starts in alt-screen mode — extremely rare (would
@@ -267,14 +260,17 @@ internal sealed class CommandOutputRenderer
     /// </summary>
     public string Render()
     {
-        // First pass: pick out the rows we'll emit (post-baseline-cursor
-        // + modified baseline rows). Trim trailing blank emission rows.
+        // First pass: pick out rows whose visible content differs from
+        // their baseline (or rows that have no baseline — those are
+        // command-emitted by definition). The diff compares only cell
+        // chars, ignoring SgrPrefix: ConPTY's repaint frequently
+        // re-asserts SGR around content that was uncolored in our
+        // snapshot, and treating that as "modified" would defeat the
+        // whole point of the baseline approach.
         var emitIndices = new List<int>();
         for (int r = 0; r < _rows.Count; r++)
         {
-            bool postBaseline = r > _baselineCursorRow;
-            bool modified = _rows[r].ModifiedDuringCommand;
-            if (postBaseline || modified) emitIndices.Add(r);
+            if (RowDiffersFromBaseline(_rows[r])) emitIndices.Add(r);
         }
 
         // Trim trailing blank rows so the output doesn't end in a sea
@@ -341,7 +337,17 @@ internal sealed class CommandOutputRenderer
         public List<Cell> Cells { get; } = new();
         public string? TrailingSgr;
         public bool ContinuedFromAbove;
-        public bool ModifiedDuringCommand;
+
+        // Snapshot of cells at the moment this row was initialised
+        // from the VtLiteState baseline. Null for rows added by command
+        // output (those are command-emitted by definition and always
+        // appear in Render output). Used to detect ConPTY's
+        // post-alt-screen / post-prompt repaint pattern (\e[H\e[K +
+        // re-emit) as an idempotent restoration of pre-command content:
+        // EraseLine removes cells, the subsequent writes re-add them
+        // with the same chars, and at Render the per-cell diff against
+        // BaselineCells comes back equal — the row is skipped.
+        public Cell[]? BaselineCells;
     }
 
     private static bool IsBlank(Row r)
@@ -349,6 +355,25 @@ internal sealed class CommandOutputRenderer
         foreach (var cell in r.Cells)
             if (cell.Ch != ' ') return false;
         return r.TrailingSgr == null;
+    }
+
+    private static bool RowDiffersFromBaseline(Row r)
+    {
+        // Rows added during command execution (no baseline snapshot)
+        // are command-emitted by definition — always include.
+        if (r.BaselineCells == null) return true;
+
+        // Trailing blank cells in the snapshot grid (the row was
+        // shorter than ViewCols) trim to a shorter logical length.
+        // Compare on visible chars: lengths can differ if the command
+        // legitimately wrote past the baseline's tail or shortened it
+        // via DCH.
+        if (r.Cells.Count != r.BaselineCells.Length) return true;
+        for (int i = 0; i < r.Cells.Count; i++)
+        {
+            if (r.Cells[i].Ch != r.BaselineCells[i].Ch) return true;
+        }
+        return false;
     }
 
     private static string RenderRow(Row r)
@@ -429,26 +454,17 @@ internal sealed class CommandOutputRenderer
         if (CurCol < cells.Count)
         {
             var existing = cells[CurCol];
-            // Repaint detection: if the new char matches what the cell
-            // already holds, treat the write as idempotent — don't mark
-            // the row modified. This is what makes ConPTY's
-            // post-alt-screen repaint of pre-command content invisible
-            // to the AI: the snapshot baseline already has those chars,
-            // ConPTY is just re-asserting them.
-            bool changed = existing.Ch != c;
             cells[CurCol] = new Cell
             {
                 Ch = c,
                 SgrPrefix = prefix ?? existing.SgrPrefix
             };
-            if (changed) row.ModifiedDuringCommand = true;
         }
         else
         {
             cells.Add(new Cell { Ch = c, SgrPrefix = prefix });
-            row.ModifiedDuringCommand = true;
         }
-        if (grew) row.ModifiedDuringCommand = true;
+        _ = grew;
         SetCol(CurCol + 1);
     }
 
@@ -475,23 +491,21 @@ internal sealed class CommandOutputRenderer
         EnsureRow(CurRow);
         var row = ActiveRows[CurRow];
         var cells = row.Cells;
-        bool changed = false;
         if (mode == 0)
         {
-            if (CurCol < cells.Count) { cells.RemoveRange(CurCol, cells.Count - CurCol); changed = true; }
-            if (row.TrailingSgr != null) { row.TrailingSgr = null; changed = true; }
+            if (CurCol < cells.Count) cells.RemoveRange(CurCol, cells.Count - CurCol);
+            row.TrailingSgr = null;
         }
         else if (mode == 1)
         {
             int end = Math.Min(CurCol + 1, cells.Count);
-            for (int i = 0; i < end; i++) { if (cells[i].Ch != ' ') changed = true; cells[i] = new Cell { Ch = ' ' }; }
+            for (int i = 0; i < end; i++) cells[i] = new Cell { Ch = ' ' };
         }
         else if (mode == 2)
         {
-            if (cells.Count > 0) { cells.Clear(); changed = true; }
-            if (row.TrailingSgr != null) { row.TrailingSgr = null; changed = true; }
+            cells.Clear();
+            row.TrailingSgr = null;
         }
-        if (changed) row.ModifiedDuringCommand = true;
     }
 
     private void EraseDisplay(int mode)
@@ -502,8 +516,6 @@ internal sealed class CommandOutputRenderer
             EraseLine(0);
             for (int r = CurRow + 1; r < rows.Count; r++)
             {
-                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
-                    rows[r].ModifiedDuringCommand = true;
                 rows[r].Cells.Clear();
                 rows[r].TrailingSgr = null;
             }
@@ -512,8 +524,6 @@ internal sealed class CommandOutputRenderer
         {
             for (int r = 0; r < CurRow; r++)
             {
-                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
-                    rows[r].ModifiedDuringCommand = true;
                 rows[r].Cells.Clear();
                 rows[r].TrailingSgr = null;
             }
@@ -523,8 +533,6 @@ internal sealed class CommandOutputRenderer
         {
             for (int r = 0; r < rows.Count; r++)
             {
-                if (rows[r].Cells.Count > 0 || rows[r].TrailingSgr != null)
-                    rows[r].ModifiedDuringCommand = true;
                 rows[r].Cells.Clear();
                 rows[r].TrailingSgr = null;
             }
@@ -536,40 +544,29 @@ internal sealed class CommandOutputRenderer
     private void EraseChars(int n)
     {
         EnsureRow(CurRow);
-        var row = ActiveRows[CurRow];
-        var cells = row.Cells;
+        var cells = ActiveRows[CurRow].Cells;
         n = Math.Max(1, n);
         int end = Math.Min(CurCol + n, cells.Count);
-        bool changed = false;
-        for (int i = CurCol; i < end; i++)
-        {
-            if (cells[i].Ch != ' ') changed = true;
-            cells[i] = new Cell { Ch = ' ' };
-        }
-        if (changed) row.ModifiedDuringCommand = true;
+        for (int i = CurCol; i < end; i++) cells[i] = new Cell { Ch = ' ' };
     }
 
     private void DeleteChars(int n)
     {
         EnsureRow(CurRow);
-        var row = ActiveRows[CurRow];
-        var cells = row.Cells;
+        var cells = ActiveRows[CurRow].Cells;
         n = Math.Max(1, n);
         if (CurCol >= cells.Count) return;
         int actual = Math.Min(n, cells.Count - CurCol);
         cells.RemoveRange(CurCol, actual);
-        row.ModifiedDuringCommand = true;
     }
 
     private void InsertChars(int n)
     {
         EnsureRow(CurRow);
-        var row = ActiveRows[CurRow];
-        var cells = row.Cells;
+        var cells = ActiveRows[CurRow].Cells;
         n = Math.Max(1, n);
         while (cells.Count < CurCol) cells.Add(new Cell { Ch = ' ' });
         for (int i = 0; i < n; i++) cells.Insert(CurCol, new Cell { Ch = ' ' });
-        row.ModifiedDuringCommand = true;
     }
 
     private void InsertLines(int n)
@@ -578,10 +575,7 @@ internal sealed class CommandOutputRenderer
         EnsureRow(CurRow);
         var rows = ActiveRows;
         for (int i = 0; i < n && rows.Count < MaxRows; i++)
-        {
-            var newRow = new Row { ModifiedDuringCommand = true };
-            rows.Insert(CurRow, newRow);
-        }
+            rows.Insert(CurRow, new Row());
     }
 
     private void DeleteLines(int n)
