@@ -273,6 +273,14 @@ internal sealed class CommandOutputRenderer
     /// </summary>
     public string Render()
     {
+        // Flush any SGR pending at end-of-input to the current row's
+        // TrailingSgr — without this, an end-of-output reset like
+        // `'HELLO'\r\n\e[m` loses the \e[m and downstream consumers see
+        // "color stuck on" state. The flush is safe because there's no
+        // subsequent WriteChar that would have consumed the pending
+        // SGR as a cell prefix.
+        FlushPendingSgrAsTrailing();
+
         // First pass: pick out rows whose visible content differs from
         // their baseline (or rows that have no baseline — those are
         // command-emitted by definition). The diff compares only cell
@@ -444,8 +452,15 @@ internal sealed class CommandOutputRenderer
 
     private void LineFeed()
     {
-        FlushPendingSgrAsTrailing();
-
+        // Note: deliberately NOT flushing _pendingSgr here. SGR set
+        // immediately before a CRLF is usually meant to color the FIRST
+        // cell of the next line (Node.js `> "x".toUpperCase()\n`
+        // pattern: REPL writes \e[32m before \r\n, then 'X' in the
+        // subsequent line is what gets colored). Keeping _pendingSgr
+        // alive across LineFeed lets the next WriteChar attach it as
+        // its SgrPrefix — exactly where the user intended. End-of-input
+        // SGR resets that never reach a WriteChar are flushed by
+        // FlushTrailingSgrAtEnd called from Render().
         var rows = ActiveRows;
         int newRow;
         if (CurRow + 1 >= MaxRows)
@@ -516,8 +531,19 @@ internal sealed class CommandOutputRenderer
     {
         ref string? slot = ref (_altActive ? ref _altPendingSgr : ref _pendingSgr);
         if (slot is null) return;
-        EnsureRow(CurRow);
-        var row = ActiveRows[CurRow];
+        var rows = ActiveRows;
+        // Attach to the last row that has visible content rather than
+        // to the current cursor row — when an end-of-input SGR follows
+        // a trailing CRLF (`text\e[m\r\n` then end), the cursor is on
+        // a fresh empty row, but the SGR semantically belongs after
+        // the previous visible text. Anchoring on the last non-empty
+        // row keeps the SGR inline with the content it's meant to
+        // wrap and avoids emitting a phantom blank line just to hold
+        // the trailing escape.
+        int target = rows.Count - 1;
+        while (target > 0 && rows[target].Cells.Count == 0 && rows[target].TrailingSgr is null)
+            target--;
+        var row = rows[target];
         row.TrailingSgr = row.TrailingSgr is null ? slot : row.TrailingSgr + slot;
         slot = null;
     }
