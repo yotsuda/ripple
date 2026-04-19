@@ -2,6 +2,90 @@
 
 All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Live virtual-terminal cursor tracking lands. ripple now keeps an
+authoritative VT-100 interpreter advanced from every PTY chunk and
+answers DSR (`\x1b[6n`) cursor-position queries from real state
+instead of the static "near the bottom of the screen" + prompt-
+heuristic column it shipped with. Closes the long-standing Unix
+drift where PSReadLine's up-arrow history recall painted over the
+active prompt, and bash readline wrapped long input lines into the
+wrong column, after a few AI commands' worth of output had
+scrolled past. The peek_console snapshot path is rewired to share
+the same authoritative state, and the Feed hot path is allocation-
+free so live tracking runs on every platform — not just Unix.
+
+### Added
+- **`Services/VtLiteState.cs`** — the VT-100 interpreter formerly
+  embedded in `CommandTracker` is now a public class with a
+  streaming `Feed(ReadOnlySpan<char>)` entry point. A 16 KB
+  pending-escape buffer stitches CSI / OSC sequences split across
+  PTY reads (`ParseEscape` returns -1 on incomplete; `Feed`
+  buffers the tail and flushes on the next call). The static
+  `VtLite(...)` one-shot helper is preserved for compatibility.
+- **CSI catalog growth.** `ECH` (`\e[nX`), `DCH` (`\e[nP`), `ICH`
+  (`\e[n@`), `IL` (`\e[nL`), `DL` (`\e[nM`) handlers added —
+  readline / PSReadLine emit these for in-line editing and they
+  were previously dropped to the silent-default branch, leaving
+  the rendered grid divergent from the live screen.
+- **`ConsoleWorker.AnswerAndStripDsr`** — pure static helper
+  modelled on `ReplaceOscTitle` that carries up to 3 partial DSR
+  prefix bytes (`\x1b`, `\x1b[`, or `\x1b[6`) across PTY reads via
+  a `ref string pendingPrefix`. Fires the reply callback once per
+  detected DSR (was one reply per chunk regardless of count) and
+  strips the partial prefix from output so it never leaks
+  downstream into `OscParser` / mirror / AI-visible bytes.
+- **34 `VtLiteStateTests` asserts** including a "split at every
+  byte boundary agrees with whole-feed final state" property test,
+  alt-screen save/restore preservation of the primary cursor, SGR
+  no-shift verification (the regression the prior byte-counter
+  estimator hit), bracketed-paste passthrough, and pending-buffer
+  overflow safety. Plus 29 new `ConsoleWorker Unit Tests` asserts
+  covering all three DSR split boundaries, three-way splits,
+  false-partial flush, and non-DSR CSI passthrough.
+- **1 MiB Feed throughput bench** prints at the end of `--test`
+  (informational, not a pass/fail). Baseline on a Win11 AOT
+  release: 1.00 MiB in 5.7 ms (174 MiB/s) — the memo's `<5%`
+  overhead bar is cleared with three orders of magnitude of
+  headroom.
+
+### Changed
+- **DSR reply on Unix uses live cursor state.** The reply now
+  reads `_vtState.Row+1`/`Col+1` instead of static row +
+  `EstimateCursorCol`, with the heuristic retained only as a
+  fallback for the brief pre-first-chunk window during shell
+  startup. Windows path is dormant in practice — ConPTY
+  intercepts DSR before ripple sees it.
+- **`peek_console` snapshot routes through live state.**
+  `CommandTracker.GetRecentOutputSnapshot` returns
+  `_vtState.Render()` directly instead of re-parsing the 4 KB
+  recent-output ring through a fresh `VtLite()` on every call.
+  The tracker keeps its own `VtLiteState` fed from `FeedOutput`,
+  reset on the same triggers as the ring (first OSC A, every OSC
+  C, `ClearRecentOutput`, terminal resize). The raw ring buffer
+  is retained for `GetRawRecentBytes()` — `ModeDetector` reads
+  bytes pre-VT-reshape and can't use the rendered snapshot.
+- **Allocation-minimal `Feed` hot path.** `Feed`, `ParseEscape`,
+  and `ApplyCsi` now operate on `ReadOnlySpan<char>` directly —
+  no `new string(input)` per chunk; `paramsStr.Split(';')`
+  replaced with a zero-alloc `GetParam` helper that scans the
+  span. Pending merges use a 512-char `stackalloc` buffer with
+  `ArrayPool<char>` fallback for larger merges. With allocation
+  pressure removed, live tracking runs on every platform; the
+  earlier `!OperatingSystem.IsWindows()` gate (added when GC
+  pressure caused intermittent deno adapter-test flakes) was
+  deleted.
+
+### Fixed
+- **Cross-chunk DSR queries no longer leak downstream.** The old
+  `text.Contains("\x1b[6n")` substring check missed DSR queries
+  whose 4 bytes straddled two PTY reads. The partial ESC bytes
+  flowed into the parser / mirror / output stream while the shell
+  sat indefinitely waiting for a reply that never fired. The new
+  `AnswerAndStripDsr` buffers the partial prefix, completes it on
+  the next chunk, replies once, and strips the bytes from output.
+
 ## [0.8.0] - 2026-04-16
 
 First round of **debugger adapters** plus three new REPL adapters and
