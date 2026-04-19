@@ -184,6 +184,13 @@ public class PromptSpec
     public string? Primary { get; set; }                         // regex for marker / regex strategies
     public string? PrimaryRegex { get; set; }
     public string? Continuation { get; set; }
+    // Bytes written to the PTY when `Continuation` matches during an AI command.
+    // Forces the REPL out of its incomplete-statement state back to the primary
+    // prompt so the existing primary-regex path can resolve the execute_command.
+    // Without this, the continuation prompt is an absorbing state — no primary
+    // match ever arrives, the tracker stays busy forever, and send_input's
+    // Busy-gate lets raw bytes pile up on the continuation line.
+    public string? ContinuationEscape { get; set; }
     public string Anchor { get; set; } = "line_start";
     public List<GroupCapture>? GroupCaptures { get; set; }
 }

@@ -238,6 +238,10 @@ prompt:
   # continuation: '^\u0001RIPPLE\u0001\.\.\. $'
   # group_captures:
   #   - { name: counter, group: 1, type: int, role: monotonic_counter }
+  # -- OR for regex strategy:
+  # primary: '^> $'
+  # continuation: '^>> $'
+  # continuation_escape: "@\r"
 ```
 
 **OSC 633 event contract (shell_integration strategy):**
@@ -264,6 +268,26 @@ REPL adapters:
 - `monotonic_counter` — IPython `In [N]:`, iex `iex(N)>`
 - `nesting_level` — SBCL debug level `N]`
 - `mode_indicator` — irb nesting depth
+
+**Regex strategy continuation escape (optional).** `prompt.continuation` +
+`prompt.continuation_escape` together form a best-effort escape hatch for
+regex-strategy REPLs that can land in an absorbing continuation state (for
+example Lua's `>> ` when an AI command ships an unclosed `if … then`).
+
+- `continuation` — regex matching the continuation prompt line.
+- `continuation_escape` — literal bytes to write to the PTY on a match,
+  chosen so the REPL emits a syntax error and returns to its primary
+  prompt. The primary detector then picks that prompt up and the
+  execute_command resolves through the normal path — the captured
+  output carries the REPL's own error message explaining what went
+  wrong, so the AI can see what happened.
+
+Both fields must be set to activate the escape; declaring only one is
+treated as a misconfiguration and ignored (with a worker log warning).
+Each adapter chooses an escape that is guaranteed invalid in its host
+language — Lua uses `@\r`, other REPLs pick their own. Adapters that do
+not declare these fields keep their previous behaviour (the execute's
+user timeout is the only recovery).
 
 ---
 

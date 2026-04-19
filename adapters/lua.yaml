@@ -57,10 +57,20 @@ init:
 
 prompt:
   # Lua's primary prompt is `> ` at line start. Continuation is `>> `
-  # but ripple sends statements as single lines so the continuation
-  # case doesn't arise for adapter-driven commands.
+  # and arises whenever an AI command ships syntactically incomplete
+  # source (bare `if true then`, unclosed function, etc). Without a
+  # continuation escape the tracker waits forever for a `> ` that
+  # never comes — stuck-busy state that also defeats send_input's
+  # idle-console guard. On a continuation match ConsoleWorker writes
+  # `continuation_escape` to the PTY; Lua reports a syntax error near
+  # the unexpected symbol and returns to `> `, which the primary
+  # detector picks up and resolves the AI command normally — the
+  # captured output carries Lua's own error line so the AI can see
+  # that its input was incomplete.
   strategy: regex
   primary: '^> $'
+  continuation: '^>> $'
+  continuation_escape: "@\r"
 
 output:
   post_prompt_settle_ms: 50

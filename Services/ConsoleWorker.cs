@@ -120,6 +120,15 @@ public class ConsoleWorker
     /// <see cref="CommandTracker"/> sees one coherent stream.
     /// </summary>
     private readonly RegexPromptDetector? _regexPromptDetector;
+    // Continuation-prompt detector for regex-strategy REPLs that stall in an
+    // incomplete-statement state (`>> ` in Lua, etc). Scanned alongside the
+    // primary detector; on match during an AI command we write the adapter's
+    // continuation_escape bytes to the PTY so the REPL errors back to its
+    // primary prompt and the existing primary path resolves the command. Null
+    // for adapters that don't declare a continuation pattern.
+    private readonly RegexPromptDetector? _regexContinuationDetector;
+    private readonly string? _regexContinuationEscape;
+    private bool _regexContinuationEscapeSent;
     private bool _regexFirstPromptSeen;
     private readonly CommandTracker _tracker = new();
     private bool _ready;
@@ -260,6 +269,23 @@ public class ConsoleWorker
             else
             {
                 Log("WARNING: prompt.strategy == regex but no prompt.primary / prompt.primary_regex set");
+            }
+
+            // Optional continuation-prompt detector. Paired with
+            // continuation_escape so we can force the REPL out of an
+            // absorbing `>> ` state back to its primary prompt and let
+            // the primary path resolve the AI command cleanly.
+            var contPattern = _adapter.Prompt.Continuation;
+            var contEscape = _adapter.Prompt.ContinuationEscape;
+            if (!string.IsNullOrEmpty(contPattern) && !string.IsNullOrEmpty(contEscape))
+            {
+                _regexContinuationDetector = new RegexPromptDetector(contPattern);
+                _regexContinuationEscape = contEscape;
+                Log($"Regex continuation detector active: pattern={contPattern}, escape={EscapeForLog(contEscape)}");
+            }
+            else if (!string.IsNullOrEmpty(contPattern) || !string.IsNullOrEmpty(contEscape))
+            {
+                Log("WARNING: prompt.continuation and prompt.continuation_escape must both be set; ignoring partial config");
             }
         }
 
@@ -1966,6 +1992,54 @@ public class ConsoleWorker
                     // in TextOffset order so the tracker downstream sees
                     // one coherent stream regardless of which strategy
                     // fired.
+                    // Re-arm the continuation-escape flag between AI
+                    // commands. Using RunningCommand (which mirrors
+                    // the tracker's _isAiCommand) matches the guard
+                    // condition below, so reset and escape share one
+                    // semantic of "there is an AI command in flight".
+                    // If a primary match resolves the current command
+                    // later in this same chunk, the event is processed
+                    // downstream and RunningCommand only goes null
+                    // from the next chunk — soon enough, since no
+                    // legitimate continuation match can arrive between
+                    // resolve and the next RegisterCommand.
+                    if (_tracker.RunningCommand == null) _regexContinuationEscapeSent = false;
+
+                    // Continuation scan runs BEFORE the primary scan so
+                    // the escape is issued as early in the chunk as
+                    // possible. The continuation detector's output is
+                    // intentionally *not* merged into the event stream:
+                    // Lua's syntax error + return to `> ` that follows
+                    // the escape produces a real primary match on a
+                    // later chunk, which is what we want the tracker
+                    // to see.
+                    if (_regexContinuationDetector != null
+                        && _regexContinuationEscape != null
+                        && _tracker.RunningCommand != null
+                        && !_regexContinuationEscapeSent)
+                    {
+                        var contOffsets = _regexContinuationDetector.Scan(result.Cleaned);
+                        if (contOffsets.Count > 0)
+                        {
+                            Log($"Continuation prompt detected during AI command; writing escape {EscapeForLog(_regexContinuationEscape)}");
+                            _regexContinuationEscapeSent = true;
+                            // Sync write — we're on the dedicated read
+                            // thread, not an async context, so reuse the
+                            // same pattern other sync writes in this
+                            // file use (InputStream.Write + Flush).
+                            try
+                            {
+                                var escBytes = Encoding.UTF8.GetBytes(_regexContinuationEscape);
+                                _pty!.InputStream.Write(escBytes, 0, escBytes.Length);
+                                _pty.InputStream.Flush();
+                            }
+                            catch (Exception ex)
+                            {
+                                Log($"Failed to write continuation escape: {ex.Message}");
+                            }
+                        }
+                    }
+
                     if (_regexPromptDetector != null)
                     {
                         // RegexPromptDetector is CSI-aware: it strips
