@@ -153,9 +153,11 @@ jobs:
 
       # AzureSignTool is a cross-platform .NET tool; Authenticode
       # signing works from Linux as long as we have the Key Vault
-      # access token. If this step ever starts failing, fall back to
-      # a dedicated windows-latest signing job that uploads a signed
-      # artifact for this job to consume.
+      # access token. The invocation is `azuresigntool` (lowercase) —
+      # v7+ installs the binary under that name, and Linux's
+      # case-sensitive filesystem won't resolve `AzureSignTool`.
+      # Windows runners happen to be case-insensitive but the
+      # lowercase form is portable.
       - name: Sign Windows binary via Azure Key Vault
         env:
           AZURE_KV_URL: ${{ vars.KEY_VAULT_URL }}
@@ -166,7 +168,7 @@ jobs:
           set -euo pipefail
           token=$(az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv)
           [[ -n "$token" ]] || { echo "Failed to acquire Key Vault access token" >&2; exit 1; }
-          AzureSignTool sign \
+          azuresigntool sign \
             --azure-key-vault-url "$AZURE_KV_URL" \
             --azure-key-vault-certificate "$AZURE_KV_CERT" \
             --azure-key-vault-accesstoken "$token" \
