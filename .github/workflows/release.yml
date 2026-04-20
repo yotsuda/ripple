@@ -246,14 +246,26 @@ jobs:
           fi
           wc -l release-notes.md
 
+      # GitHub release asset `name` must be unique per release, and
+      # the `#label` syntax on gh release create sets the display
+      # label — NOT the underlying filename. Both linux-x64 and
+      # darwin-arm64 binaries are literally named `ripple` on disk,
+      # so uploading both collides (HTTP 404 / "asset under the same
+      # name already exists"). Copy to uniquely-named files before
+      # upload so the on-disk name is the canonical release asset
+      # name.
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp npm/platforms/win32-x64/bin/ripple.exe "release-assets/ripple-${{ github.ref_name }}-win32-x64.exe"
+          cp npm/platforms/linux-x64/bin/ripple     "release-assets/ripple-${{ github.ref_name }}-linux-x64"
+          cp npm/platforms/darwin-arm64/bin/ripple  "release-assets/ripple-${{ github.ref_name }}-darwin-arm64"
           gh release create '${{ github.ref_name }}' \
             --title "ripple ${{ github.ref_name }}" \
             --notes-file release-notes.md \
             --verify-tag \
-            'npm/platforms/win32-x64/bin/ripple.exe#ripple-${{ github.ref_name }}-win32-x64.exe' \
-            'npm/platforms/linux-x64/bin/ripple#ripple-${{ github.ref_name }}-linux-x64' \
-            'npm/platforms/darwin-arm64/bin/ripple#ripple-${{ github.ref_name }}-darwin-arm64'
+            release-assets/*
