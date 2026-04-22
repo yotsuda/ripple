@@ -2588,8 +2588,18 @@ public class ConsoleWorker
         sb.AppendLine($"$__rp_bytes = [System.Convert]::FromBase64String('{payloadBase64}')");
         sb.AppendLine("$__rp_out.Write($__rp_bytes, 0, $__rp_bytes.Length)");
         sb.AppendLine("$__rp_out.Flush()");
-        // and finally the real command body, normalized to LF line endings
+        // and the real command body, normalized to LF line endings
         sb.AppendLine(command.Replace("\r\n", "\n"));
+        // Stash $? and $LASTEXITCODE into globals the prompt fn in
+        // integration.ps1 reads with priority. Necessary because the
+        // outer wrapper is `Import-Module PSReadLine; . '<tmp>';
+        // Remove-Item '<tmp>'` — by the time the prompt fn runs,
+        // Remove-Item has already reset $? to its own (successful)
+        // result, destroying the signal the user's pipeline left behind.
+        // Capturing here, inside the tempfile's scope, preserves the
+        // pipeline's real outcome for the exit-code resolver.
+        sb.AppendLine("$global:__rp_ai_pipeline_ok = $?");
+        sb.AppendLine("$global:__rp_ai_pipeline_lec = $global:LASTEXITCODE");
         return sb.ToString();
     }
 

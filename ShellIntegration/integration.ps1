@@ -30,8 +30,48 @@ function global:__rp_osc_str([string]$code) {
 # marker fires BEFORE the command writes anything to the console.
 $global:__rp_original_prompt = $function:prompt
 $global:__rp_last_history_id = 0
+# Snapshot of $LASTEXITCODE at the moment PreCommandLookupAction fires
+# (i.e. just before the user / AI pipeline actually runs). The prompt fn
+# compares the post-command value against this to decide whether
+# $LASTEXITCODE reflects THIS pipeline's native exit or is residue from
+# a prior native invocation. Without this, a pure-PowerShell pipeline
+# (no native exe) would inherit whatever $LASTEXITCODE happened to be
+# left from an earlier `cmd /c "exit 7"` and ripple would report the
+# innocent pipeline as Failed (exit 7) — observed and reproduced.
+$global:__rp_lec_at_cmd_start = $null
+# Multi-line AI pipelines run inside a dot-sourced tempfile wrapped by
+# `Import-Module PSReadLine; . 'tempfile'; Remove-Item '...'`. The prompt
+# fn's naive $? would reflect Remove-Item (always true), not the user
+# pipeline inside the tempfile. ConsoleWorker.BuildMultiLineTempfileBody
+# now stashes the tempfile's own $? / $LASTEXITCODE into these globals
+# as its final two statements; the prompt fn reads them with priority,
+# then clears, so subsequent single-line commands fall through to plain
+# $?-based detection.
+$global:__rp_ai_pipeline_ok = $null
+$global:__rp_ai_pipeline_lec = $null
 
 function global:prompt {
+    # CRITICAL: $? must be captured on the very first line — any statement
+    # below (including simple assignments) can reset it. $? is the
+    # canonical "did the last pipeline succeed" indicator in PowerShell:
+    # true for successful cmdlets / successful natives (exit 0) /
+    # successful statements, false for cmdlet errors / native non-zero
+    # exit / thrown exceptions. Using $? as the prime signal — with
+    # $LASTEXITCODE only consulted when $? is false AND the value was
+    # updated by this pipeline — eliminates the "stale $LASTEXITCODE
+    # from a prior native bleeds into every subsequent innocent
+    # pipeline" bug.
+    $ok = $?
+    $lec = $global:LASTEXITCODE
+    $lecAtStart = $global:__rp_lec_at_cmd_start
+    $aiOk = $global:__rp_ai_pipeline_ok
+    $aiLec = $global:__rp_ai_pipeline_lec
+
+    # Consume the multi-line AI stash immediately so the next command
+    # (which may be user-typed or single-line AI) sees clean slots.
+    $global:__rp_ai_pipeline_ok = $null
+    $global:__rp_ai_pipeline_lec = $null
+
     $prefix = ""
 
     # Detect if a command was executed since last prompt
@@ -42,9 +82,35 @@ function global:prompt {
         # CommandFinished with exit code. OSC C is emitted from
         # PreCommandLookupAction before the command runs, so by the time
         # we're in the prompt function it has already fired.
-        $ec = if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 }
+        #
+        # Exit code resolution, in order:
+        #   (1) Multi-line AI stash is set → use it verbatim. The
+        #       tempfile's own last statement captured $? / $LASTEXITCODE
+        #       before Remove-Item ran and reset them.
+        #   (2) $ok is true → pipeline succeeded → 0.
+        #   (3) $ok is false AND $LASTEXITCODE was updated by this
+        #       pipeline AND the value is non-zero → use it (native exe
+        #       really did fail with that code).
+        #   (4) $ok is false otherwise → generic failure → 1. Using 1
+        #       rather than leaking a stale $LASTEXITCODE keeps the AI's
+        #       mental model honest: "the pipeline failed, exit code not
+        #       meaningful as a native exit".
+        if ($null -ne $aiOk) {
+            $ec = if ($aiOk) { 0 }
+                  elseif ($null -ne $aiLec -and $aiLec -ne 0) { $aiLec }
+                  else { 1 }
+        } else {
+            $lecChanged = $lec -ne $lecAtStart
+            $ec = if ($ok) { 0 }
+                  elseif ($lecChanged -and $null -ne $lec -and $lec -ne 0) { $lec }
+                  else { 1 }
+        }
         $prefix += (__rp_osc_str "D;$ec")
     }
+
+    # Clear the pre-command snapshot so the next command starts fresh.
+    # PreCommandLookupAction sets it again when the next pipeline begins.
+    $global:__rp_lec_at_cmd_start = $null
 
     # Report cwd
     $prefix += (__rp_osc_str "P;Cwd=$($PWD.Path)")
@@ -76,6 +142,13 @@ $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
     param($commandName, $eventArgs)
     if ($global:__rp_pending_user_command) {
         $global:__rp_pending_user_command = $false
+        # Snapshot $LASTEXITCODE so the prompt fn can distinguish "this
+        # pipeline ran a native exe and that's where the value came from"
+        # from "this pipeline was pure PowerShell and $LASTEXITCODE is
+        # residue from an earlier native run". Without the snapshot, a
+        # cmd.exe exit 7 followed by a pure-PS pipeline would be reported
+        # as exit 7.
+        $global:__rp_lec_at_cmd_start = $global:LASTEXITCODE
         [Console]::Write((__rp_osc_str "C"))
     }
 }

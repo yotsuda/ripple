@@ -118,14 +118,37 @@ tests:
       double 21
     expect: '^42$'
   - name: error_surfaces_nonzero_exit
-    # PowerShell cmdlet errors (Get-Item /nope) only set $? and write
-    # to the error stream; they do NOT update $LASTEXITCODE, so
-    # ripple's OSC D;0 path reports exit 0 even on failure. Use a
-    # native command instead so the non-zero exit actually propagates
-    # via the integration's prompt-function read of $LASTEXITCODE.
+    # Native non-zero exit propagates verbatim: $? is false AND
+    # $LASTEXITCODE was updated BY THIS pipeline (the snapshot taken at
+    # PreCommandLookupAction differs from the post-pipeline value), so
+    # integration.ps1's exit-code resolver emits exit 7.
     eval: "cmd /c exit 7"
     expect_exit_code: 7
     expect_error: true
+  - name: cmdlet_error_surfaces_exit_1
+    # PowerShell cmdlet errors set $? to false and write to the error
+    # stream but do NOT update $LASTEXITCODE. Pre-fix the prompt fn read
+    # stale $LASTEXITCODE and reported exit 0 (or worse: the last native
+    # exe's exit from minutes ago). Post-fix, $? is the prime signal:
+    # $? false + $LASTEXITCODE unchanged → generic failure exit 1, which
+    # is the honest "pipeline failed, no meaningful native exit code"
+    # signal.
+    eval: Get-Item C:\does-not-exist-rpl1
+    expect_exit_code: 1
+    expect_error: true
+  - name: lastexitcode_does_not_leak_after_native
+    # Regression: stale $LASTEXITCODE from a prior native invocation
+    # must NOT bleed into a subsequent pure-PowerShell pipeline. The
+    # setup leaves $LASTEXITCODE=7; the eval is a pure PS expression
+    # that never touches a native exe. Pre-fix the prompt fn blindly
+    # read $LASTEXITCODE and reported exit 7 for the innocent 2+3 →
+    # Failed. Post-fix the PreCommandLookupAction snapshot shows
+    # $LASTEXITCODE is unchanged this pipeline, so the resolver defers
+    # to $? (true) and emits exit 0.
+    setup: cmd /c exit 7
+    eval: "2 + 3"
+    expect: '^5$'
+    expect_exit_code: 0
   - name: cwd_change_tracked
     setup: "Set-Location $env:TEMP"
     eval: "$PWD.Path"
