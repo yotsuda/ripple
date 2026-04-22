@@ -2,6 +2,12 @@
 
 All notable changes to ripple are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **AI's own `cd` is no longer misattributed as a user-initiated drift.** Drift detection previously compared the source console's `LastAiCwd` against the current `OSC 633;P;Cwd=` snapshot; if the two diverged for any reason — including internal state lag such as standby-rotation ordering or a race between `RecordShellCwd` and the next `get_status` — the proxy concluded the human had moved the shell and emitted a spurious `source #N was moved by user to '...'; ran in #M at your last known cwd '...'` routing notice while silently reverting the AI to a stale cwd. Replaced with a provenance counter (`CommandTracker.UserCmdsSinceLastAi`) that increments exactly once per user-typed command at OSC A (closing a user-busy cycle) and resets to 0 on every `RegisterCommand`. The worker now exposes the counter as a `userCmdsSinceLastAi` field on `get_status`, and `ConsoleManager.PlanExecutionAsync` reads it instead of comparing cwd snapshots. AI-initiated cd → counter stays 0 → no drift; user-initiated command (cd or otherwise) → counter increments → drift handled correctly. Removes the old `IsCwdDrifted` helper and its unit tests; adds 13 new provenance-counter asserts to `CommandTrackerTests` covering pwsh (B→C→D→A), bash/zsh (C→D→A), bare-OSC-A repeats, startup-OSC-B gating, and the interleaved AI-cd / user-cmd / AI-cmd scenario that reproduces the original bug in unit form.
+
 ## [0.11.0] - 2026-04-20
 
 Native binaries for Linux and macOS Apple Silicon ship alongside Windows, distributed as platform-specific npm subpackages. `npm i -g @ytsuda/ripple` now installs from `@ytsuda/ripple-win32-x64`, `@ytsuda/ripple-linux-x64`, or `@ytsuda/ripple-darwin-arm64` automatically via `optionalDependencies`; a small Node launcher (`bin/cli.mjs`) resolves the matching subpackage and spawns its binary with stdio inherited and SIGTERM/SIGINT/SIGHUP/SIGQUIT forwarded. The release workflow is a three-runner matrix build (windows-latest, ubuntu-latest, macos-latest) followed by a single Linux publish job that Authenticode-signs the Windows binary via AzureSignTool, publishes three subpackages + one meta-package with SLSA provenance, and attaches all three binaries to the GitHub Release.

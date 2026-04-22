@@ -159,6 +159,26 @@ public class CommandTracker
     private string? _lastKnownCwd;
     public string? LastKnownCwd { get { lock (_lock) return _lastKnownCwd; } }
 
+    // Provenance counter: number of user-typed commands that have completed
+    // since the last AI RegisterCommand. The proxy's drift detector reads
+    // this via get_status to decide whether the shell's live cwd still
+    // reflects AI's intended state (counter == 0) or may have been moved by
+    // the human (counter > 0). Incremented exactly once per user command at
+    // OSC A (PromptStart) when it closes a user-busy cycle, and reset to 0
+    // on every RegisterCommand. Replaces the old "compare LastAiCwd vs live
+    // cwd snapshot" heuristic, which misattributed internal state lag
+    // (standby rotation, race between RecordShellCwd and the next
+    // get_status) as user-initiated drift.
+    private int _userCmdsSinceLastAi;
+
+    /// <summary>
+    /// Number of user-typed commands completed since the last
+    /// <see cref="RegisterCommand"/>. Used by the proxy to decide whether
+    /// the live cwd can be trusted as AI's intended state. Reset to 0 on
+    /// each RegisterCommand.
+    /// </summary>
+    public int UserCmdsSinceLastAi { get { lock (_lock) return _userCmdsSinceLastAi; } }
+
     // Terminal dimensions for VT-medium viewport. Set by ConsoleWorker
     // at PTY creation and on each resize.
     private int _terminalCols = 120;
@@ -328,6 +348,11 @@ public class CommandTracker
             // (already-faulted) reference.
             task = _tcs.Task;
             _isAiCommand = true;
+            // A fresh AI command resets the provenance counter: anything
+            // the human did before this point is no longer a source of
+            // "potential drift" from the AI's perspective — AI is about
+            // to define a new "last known" state via this command.
+            _userCmdsSinceLastAi = 0;
             // Bump the generation so any in-flight ReleaseAiCommand
             // from a previous command's finalize will no-op against the
             // new command. See ReleaseAiCommand for the token check.
@@ -534,6 +559,17 @@ public class CommandTracker
                         _userCommandBusy = true;
                         break;
                     case OscParser.OscEventType.PromptStart:
+                        // Closing a user-busy cycle = one completed user
+                        // command. Increment the provenance counter so the
+                        // proxy's drift detector (ConsoleManager.PlanExecutionAsync)
+                        // can see, on the next AI call's get_status, that the
+                        // human has touched the terminal since the last AI
+                        // command and the live cwd is therefore not
+                        // necessarily AI's intended state. Gate on
+                        // _userCommandBusy so a bare OSC A (shell startup,
+                        // back-to-back prompt repaint) doesn't inflate the
+                        // count without an actual command cycle.
+                        if (_userCommandBusy) _userCmdsSinceLastAi++;
                         _userCommandBusy = false;
                         break;
                 }

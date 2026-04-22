@@ -544,6 +544,12 @@ public class ConsoleManager
         // If busy, treat it like the active console is unavailable → trigger switch.
         string? sourceCwd = cachedDeadCwd;
         bool activeBusy = false;
+        // Provenance-based drift signal from the worker. Value > 0 means the
+        // human has run one or more commands in the source console since AI's
+        // last RegisterCommand — the live cwd can no longer be trusted as
+        // AI's intended state even if it matches LastAiCwd, and any cd
+        // preamble should target AI's last known cwd instead.
+        int sourceUserCmds = 0;
         if (initialActivePid != 0 && IsProcessAlive(initialActivePid))
         {
             string? sourcePipe;
@@ -555,6 +561,8 @@ public class ConsoleManager
                     var statusResp = await SendPipeRequestAsync(sourcePipe,
                         w => w.WriteString("type", "get_status"), TimeSpan.FromSeconds(3));
                     sourceCwd = statusResp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
+                    if (statusResp.TryGetProperty("userCmdsSinceLastAi", out var uc) && uc.ValueKind == JsonValueKind.Number)
+                        sourceUserCmds = uc.GetInt32();
                     var statusStr = statusResp.TryGetProperty("status", out var stProp) ? stProp.GetString() : null;
                     // "completed" = the worker has one or more cached results from
                     // earlier flipped commands that haven't been drained yet. Routing
@@ -744,7 +752,17 @@ public class ConsoleManager
             if (initialActivePid != 0)
                 lock (_lock) sourceLastAiCwd = _consoles.GetValueOrDefault(initialActivePid)?.LastAiCwd;
 
-            bool sourceDrifted = IsCwdDrifted(sourceLastAiCwd, sourceCwd);
+            // Provenance-first drift detection: the worker's
+            // userCmdsSinceLastAi counter tells us whether the human has
+            // completed any user-typed commands in this console since AI's
+            // last RegisterCommand. A non-zero count means the live cwd is
+            // owned by the user session and should be treated as drifted
+            // regardless of whether it happens to match sourceLastAiCwd.
+            // This replaces the old `sourceCwd != sourceLastAiCwd` heuristic,
+            // which false-positived when internal state lagged (e.g., a
+            // standby-rotation path left LastAiCwd stale even though the
+            // AI had just cd'd and the live cwd correctly reflected that).
+            bool sourceDrifted = sourceUserCmds > 0 && sourceLastAiCwd != null;
 
             // preambleCwd is what the new console will be cd'd to before
             // the AI command runs. When source has drifted we restore the
@@ -837,8 +855,16 @@ public class ConsoleManager
         }
         else
         {
-            // Same console — check if user manually cd'd since the last AI command
-            var currentCwd = await QueryConsoleCwdAsync(pipeName);
+            // Same console — check if user manually ran commands since the
+            // last AI command. We rely on the worker's userCmdsSinceLastAi
+            // counter (provenance-based) rather than comparing cwd snapshots
+            // (heuristic-based): the counter fires on OSC A closing a user
+            // command cycle, so AI's own cd — which runs inside AI's
+            // RegisterCommand scope — never contributes, eliminating the
+            // false positive where AI state lag (standby rotation, race
+            // between RecordShellCwd and the next get_status) was
+            // misattributed as "user moved cwd".
+            var (currentCwd, currentUserCmds) = await QueryConsoleStatusAsync(pipeName);
             string? lastAiCwd;
             ConsoleInfo? consoleInfo;
             lock (_lock)
@@ -847,17 +873,24 @@ public class ConsoleManager
                 lastAiCwd = consoleInfo?.LastAiCwd;
             }
 
-            if (IsCwdDrifted(lastAiCwd, currentCwd))
+            if (currentUserCmds > 0)
             {
-                RecordShellCwd(consolePid, currentCwd);
+                // Refresh LastAiCwd to the live cwd so the subsequent
+                // re-executed command doesn't hit the same warning. The
+                // human is now the source of truth for where the shell is.
+                if (currentCwd != null)
+                    RecordShellCwd(consolePid, currentCwd);
                 var displayName = consoleInfo?.DisplayName ?? $"#{consolePid}";
+                var cwdText = currentCwd != null && lastAiCwd != null && !currentCwd.Equals(lastAiCwd, PathComparison)
+                    ? $"cwd is now '{currentCwd}' (was '{lastAiCwd}')"
+                    : $"cwd is '{currentCwd ?? lastAiCwd ?? "unknown"}'";
                 return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                     EarlyResult: new ExecuteResult
                     {
                         Pid = consolePid,
                         Switched = true,
                         DisplayName = displayName,
-                        Output = $"Console {displayName} cwd is now '{currentCwd}' (was '{lastAiCwd}'). Pipeline NOT executed — verify and re-execute.",
+                        Output = $"Console {displayName} has had {currentUserCmds} user-typed command(s) since your last AI command; {cwdText}. Pipeline NOT executed — verify and re-execute.",
                     });
             }
         }
@@ -1190,20 +1223,6 @@ public class ConsoleManager
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     /// <summary>
-    /// True when a console's live cwd differs from the cwd the AI last saw
-    /// it complete a command in (its LastAiCwd), i.e. the human user has
-    /// manually cd'd since the last AI command. Null on either side means
-    /// the AI has no prior expectation (fresh console, or no cwd reported
-    /// by the worker) and so nothing has drifted — the routing code treats
-    /// that as "use the live cwd as-is". Uses the same path comparison
-    /// policy (Ordinal on POSIX, OrdinalIgnoreCase on Windows) as every
-    /// other path match in this file.
-    /// </summary>
-    internal static bool IsCwdDrifted(string? lastAiCwd, string? liveCwd)
-        => lastAiCwd != null && liveCwd != null
-           && !liveCwd.Equals(lastAiCwd, PathComparison);
-
-    /// <summary>
     /// Case/separator-normalized cwd comparison used by the cd-failure
     /// detector in ExecutePlannedCommandAsync. Normalizes both paths
     /// via <see cref="Path.GetFullPath(string)"/> so trailing slashes
@@ -1443,6 +1462,32 @@ public class ConsoleManager
             return resp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Query both cwd and the provenance counter (userCmdsSinceLastAi) via
+    /// a single get_status round-trip. Used by the same-console drift check
+    /// in <see cref="PlanExecutionAsync"/>, where a non-zero counter means
+    /// the human has completed one or more user-typed commands in this
+    /// console since AI's last RegisterCommand — i.e. the live cwd is owned
+    /// by the user session and AI should verify before continuing. On query
+    /// failure returns (null, 0) so the caller treats the console as
+    /// "no drift observed"; not reporting is not the same as reporting user
+    /// activity.
+    /// </summary>
+    private async Task<(string? cwd, int userCmds)> QueryConsoleStatusAsync(string pipeName)
+    {
+        try
+        {
+            var resp = await SendPipeRequestAsync(pipeName,
+                w => w.WriteString("type", "get_status"),
+                TimeSpan.FromSeconds(3));
+            var cwd = resp.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
+            var userCmds = resp.TryGetProperty("userCmdsSinceLastAi", out var uc) && uc.ValueKind == JsonValueKind.Number
+                ? uc.GetInt32() : 0;
+            return (cwd, userCmds);
+        }
+        catch { return (null, 0); }
     }
 
     /// <summary>

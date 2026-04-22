@@ -2422,6 +2422,11 @@ public class ConsoleWorker
                 w.WriteString("shellFamily", _shellFamily);
                 w.WriteString("shellPath", _shell);
                 w.WriteStringOrNull("cwd", _tracker.LastKnownCwd);
+                // Provenance signal for the proxy's drift detector: count
+                // of user-typed commands completed since the last AI
+                // RegisterCommand. >0 means the live cwd may have been
+                // moved by the human and is untrusted as AI state.
+                w.WriteNumber("userCmdsSinceLastAi", _tracker.UserCmdsSinceLastAi);
                 w.WriteStringOrNull("runningCommand", _tracker.RunningCommand);
                 var elapsed = _tracker.RunningElapsedSeconds;
                 if (elapsed.HasValue) w.WriteNumber("runningElapsedSeconds", elapsed.Value);
