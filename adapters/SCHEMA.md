@@ -338,7 +338,7 @@ output:
 input:
   line_ending: "\n"
   multiline_detect: prompt_based | wrapper | balanced_parens | indent_based | none
-  multiline_delivery: direct | tempfile | heredoc | wrapper
+  multiline_delivery: direct | tempfile | heredoc | wrapper | encoded_scriptblock
   multiline_wrapper:
     open: ":{"
     close: ":}"
@@ -395,10 +395,16 @@ input:
 - **`multiline_delivery`** — how a confirmed-complete multi-line block
   reaches the interpreter:
   - `direct` — write line-by-line to PTY stdin (bash, zsh, most REPLs)
-  - `tempfile` — write the body to a temp file and dot-source it (pwsh's
-    `.ripple-exec-*.ps1`, cmd's `.ripple-exec-*.cmd`)
+  - `tempfile` — write the body to a temp file and dot-source it (cmd's
+    `.ripple-exec-*.cmd`, any REPL that needs stable multi-line parsing)
   - `heredoc` — send `cat <<EOF ... EOF` construct (reserved)
   - `wrapper` — send `wrapper.open + body + wrapper.close` (ghci)
+  - `encoded_scriptblock` — base64-encode the body and send a single-line
+    `. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>'))))`
+    invocation (pwsh). Dot-sourcing keeps the caller's scope (variables
+    and functions persist across commands) just like the tempfile path,
+    but without disk I/O or history-filter bookkeeping. Dropped back to
+    `tempfile` if the encoded line would exceed PSReadLine's input cap.
 - **`tempfile.history_filter`** — regex matched against shell history entries.
   Lines matching this are hidden from shell history so ripple's
   implementation detail doesn't pollute the user's `Up-arrow` recall.

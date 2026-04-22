@@ -2693,23 +2693,59 @@ public class ConsoleWorker
         string ptyPayload;
         if (isMultiLinePwsh)
         {
-            var tmpFile = Path.Combine(Path.GetTempPath(), $".ripple-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
-            var ptyInput = $". '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
-
-            // Work out how many terminal rows the dot-source + Remove-Item
-            // input occupies once it wraps at the PTY's current width, so
-            // BuildMultiLineTempfileBody can emit `\e[<N>F\e[0J` and wipe
-            // every wrapped row rather than just the last one. Prompt is
-            // "PS <cwd>> " followed by the ptyInput itself.
+            // Two delivery strategies, picked per adapter:
+            //   encoded_scriptblock — base64-encode the multi-line body and
+            //     send a single-line `. ([ScriptBlock]::Create(...))`
+            //     invocation. No disk I/O, no tempfile cleanup, no history
+            //     filter needed; measured ~0.3-0.5s faster than tempfile.
+            //   tempfile (default)  — write the body to a temp .ps1 and
+            //     dot-source it. Slower but works even when the decoded
+            //     body length would exceed PSReadLine's input line cap.
             int termWidth = 120;
             try { if (Console.WindowWidth > 0) termWidth = Console.WindowWidth; } catch { }
             var cwdForPrompt = _tracker.LastKnownCwd ?? _cwd ?? "";
             var promptLen = 3 /* "PS " */ + cwdForPrompt.Length + 2 /* "> " */;
-            var totalCols = promptLen + ptyInput.Length;
-            var wrapRowCount = Math.Max(1, (totalCols + termWidth - 1) / termWidth);
 
-            await File.WriteAllTextAsync(tmpFile, BuildMultiLineTempfileBody(command, wrapRowCount), ct);
-            ptyPayload = ptyInput + enter;
+            if (_adapter?.Input.MultilineDelivery == "encoded_scriptblock")
+            {
+                // Two-pass sizing: wrapRowCount appears inside the body as
+                // the digit count in the \e[NF wipe sequence, and the body
+                // is what we base64-encode into the ptyInput whose length
+                // determines wrapRowCount. One pass converges whenever the
+                // row count stays within a single digit-width bucket (the
+                // practical case); a second pass is enough when it flips
+                // from 1- to 2-digit.
+                int wrapRowCount = 1;
+                string ptyInput = "";
+                for (int pass = 0; pass < 3; pass++)
+                {
+                    var body = BuildMultiLineTempfileBody(command, wrapRowCount);
+                    var bodyB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(body));
+                    ptyInput = $". ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{bodyB64}'))))";
+                    var totalCols = promptLen + ptyInput.Length;
+                    var next = Math.Max(1, (totalCols + termWidth - 1) / termWidth);
+                    if (next == wrapRowCount)
+                        break;
+                    wrapRowCount = next;
+                }
+                ptyPayload = ptyInput + enter;
+            }
+            else
+            {
+                var tmpFile = Path.Combine(Path.GetTempPath(), $".ripple-exec-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
+                var ptyInput = $". '{tmpFile}'; Remove-Item '{tmpFile}' -ErrorAction SilentlyContinue";
+
+                // Work out how many terminal rows the dot-source + Remove-Item
+                // input occupies once it wraps at the PTY's current width, so
+                // BuildMultiLineTempfileBody can emit `\e[<N>F\e[0J` and wipe
+                // every wrapped row rather than just the last one. Prompt is
+                // "PS <cwd>> " followed by the ptyInput itself.
+                var totalCols = promptLen + ptyInput.Length;
+                var wrapRowCount = Math.Max(1, (totalCols + termWidth - 1) / termWidth);
+
+                await File.WriteAllTextAsync(tmpFile, BuildMultiLineTempfileBody(command, wrapRowCount), ct);
+                ptyPayload = ptyInput + enter;
+            }
         }
         else if (isMultiLineCmd)
         {

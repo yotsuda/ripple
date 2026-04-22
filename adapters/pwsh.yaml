@@ -62,6 +62,16 @@ output:
 input:
   line_ending: "\r"
   multiline_detect: prompt_based
+  # encoded_scriptblock is measurably faster than tempfile on the warm
+  # path (base64-encode the body, send a single-line
+  # `. ([ScriptBlock]::Create(...))` invocation — no disk I/O, no
+  # history-filter bookkeeping). The delivery is implemented and its
+  # unit tests pass, but empirical runs show occasional synth-prompt
+  # leakage into the AI-facing output on long commands (root cause
+  # under investigation — likely baseline VT state interacting with the
+  # long encoded ptyInput echo). Staying on tempfile as the default
+  # until that race is pinned down; encoded_scriptblock can be re-
+  # enabled by changing this single line.
   multiline_delivery: tempfile
   tempfile:
     prefix: .ripple-exec-

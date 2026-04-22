@@ -245,7 +245,7 @@ public class InputSpec
 {
     public string LineEnding { get; set; } = "\n";
     public string MultilineDetect { get; set; } = "none";      // prompt_based | wrapper | balanced_parens | indent_based | none
-    public string MultilineDelivery { get; set; } = "direct";  // direct | tempfile | heredoc | wrapper
+    public string MultilineDelivery { get; set; } = "direct";  // direct | tempfile | heredoc | wrapper | encoded_scriptblock
     public MultilineWrapperSpec? MultilineWrapper { get; set; }
     public BalancedParensSpec? BalancedParens { get; set; }
     public TempfileSpec? Tempfile { get; set; }
