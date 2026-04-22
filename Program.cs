@@ -112,6 +112,7 @@ public class Program
             Tests.ModeDetectorTests.Run();
             Tests.OutputTruncationHelperTests.Run();
             Tests.CommandOutputCaptureTests.Run();
+            Tests.CommandOutputRendererTests.Run();
             Tests.CommandOutputFinalizerTests.Run();
             Tests.FileToolsTests.Run();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);

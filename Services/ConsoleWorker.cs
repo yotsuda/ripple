@@ -2171,16 +2171,6 @@ public class ConsoleWorker
                     if (read == 0) break;
 
                     var text = Encoding.UTF8.GetString(buffer, 0, read);
-                    // Advance the live VT-100 interpreter with the raw
-                    // chunk BEFORE stripping DSR queries. Feeding raw is
-                    // safe: DSR's final byte ('n') is a no-op in
-                    // ApplyCsi, so the cursor isn't perturbed by the
-                    // query itself. Runs on every platform so the peek
-                    // path and any other readers can share one
-                    // authoritative cursor. Hot path is span-based and
-                    // allocation-free — the earlier Windows-only gate
-                    // was needed before VtLiteState.Feed was refactored.
-                    _vtState.Feed(text.AsSpan());
                     text = AnswerAndStripTerminalQueries(text);
                     if (_tracker.Busy) Log($"RAW: {EscapeForLog(text)}");
                     var result = _parser.Parse(text);
@@ -2278,19 +2268,36 @@ public class ConsoleWorker
                         }
                     }
 
-                    // Interleave FeedOutput and HandleEvent in source order
-                    // using each event's TextOffset (position in Cleaned where
-                    // the event fired in the original byte stream). This is
-                    // how the tracker knows "_output was N bytes long when
-                    // OSC C arrived", so it can slice out just the region
-                    // between OSC C and OSC D when producing the command
-                    // result — no first-\r\n stripping or AcceptLine heuristics.
+                    // Interleave _vtState.Feed, FeedOutput, and HandleEvent
+                    // in source order using each event's TextOffset (position
+                    // in Cleaned where the event fired). Feeding the live
+                    // VT-100 interpreter in slices aligned with OSC event
+                    // offsets — instead of the whole chunk up front — means
+                    // Snapshot() at CommandExecuted reflects exactly the
+                    // screen state as of the OSC C byte, not end-of-chunk
+                    // state that would include downstream command-output
+                    // bytes. Without the alignment, a single chunk that
+                    // straddled OSC C (encoded_scriptblock multi-line
+                    // delivery with the payload + first output lines in one
+                    // read) would snapshot a baseline containing cells from
+                    // the very command output about to be replayed into
+                    // CommandOutputRenderer, and the renderer's cursor would
+                    // start at the post-output position instead of the
+                    // blank row the AI expects command output to land on.
+                    // Feeding cleaned text (OSC 633 stripped) to _vtState is
+                    // equivalent to feeding raw for VT interpretation — OSC
+                    // sequences are dropped by ApplyOsc — and DSR queries
+                    // are already stripped upstream. The tracker knows
+                    // "_output was N bytes long when OSC C arrived" so it
+                    // can still slice out just the region between OSC C and
+                    // OSC D when producing the command result.
                     int lastOffset = 0;
                     foreach (var evt in result.Events)
                     {
                         if (evt.TextOffset > lastOffset)
                         {
                             var slice = result.Cleaned.Substring(lastOffset, evt.TextOffset - lastOffset);
+                            _vtState.Feed(slice.AsSpan());
                             _tracker.FeedOutput(slice);
                             _outputLength += slice.Length;
                             MirrorToVisible(slice);
@@ -2322,6 +2329,7 @@ public class ConsoleWorker
                     if (lastOffset < result.Cleaned.Length)
                     {
                         var tail = result.Cleaned.Substring(lastOffset);
+                        _vtState.Feed(tail.AsSpan());
                         _tracker.FeedOutput(tail);
                         _outputLength += tail.Length;
                         MirrorToVisible(tail);
