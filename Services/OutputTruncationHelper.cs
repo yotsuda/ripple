@@ -60,6 +60,12 @@ public class OutputTruncationHelper
     private const string TailSeparator = "--- Preview (last ~2000 chars) ---";
     private const string TruncatedSeparatorFormat = "--- truncated ({0} chars omitted) ---";
     private const string OversizeHeaderFormat = "Output too large ({0} characters). Full output saved to: {1}";
+    // Tells the AI how to drill into the spill file using ripple's own
+    // MCP tools instead of shell commands. Names are deliberately bare
+    // (search_files / read_file) so the hint stays valid no matter which
+    // namespace prefix the MCP client applied (ripple / ripple-stable /
+    // ripple-dev / etc.) — the AI resolves that from its tool list.
+    private const string InspectHintFormat = "Inspect with ripple's search_files (pattern=\"<regex>\", path=\"{0}\") or read_file (path=\"{0}\", offset=<line>, limit=<count>).";
     private const string SaveFailedHeaderFormat = "Output too large ({0} characters). Could not save full output to file.";
 
     // The threshold must exceed the combined preview sizes; otherwise the
@@ -140,7 +146,10 @@ public class OutputTruncationHelper
 
         var sb = new StringBuilder();
         if (filePath != null)
+        {
             sb.AppendLine(string.Format(OversizeHeaderFormat, output.Length, filePath));
+            sb.AppendLine(string.Format(InspectHintFormat, filePath));
+        }
         else
             sb.AppendLine(string.Format(SaveFailedHeaderFormat, output.Length));
 
