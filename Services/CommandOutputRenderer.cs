@@ -489,6 +489,22 @@ internal sealed class CommandOutputRenderer
         EnsureRow(newRow);
         SetCol(0);
 
+        // An explicit LineFeed (bare LF or CRLF from the command's own
+        // output) means we're at the start of a new logical line — the
+        // row we just moved to is NOT a soft-wrap continuation of the
+        // row above, regardless of what the baseline snapshot said. The
+        // baseline's ContinuedFromAbove flag is only valid for rows
+        // that remain untouched (they represent pre-command wrap state).
+        // Clearing it here prevents the Render-time join logic from
+        // chaining a command-emitted row onto its predecessor just
+        // because the row happened to exist in the pre-command grid as
+        // a wrap continuation of a long input echo that has since been
+        // erased and replaced. Only clear for rows inside the baseline
+        // range — rows beyond the baseline never had the flag set.
+        var activeRows = ActiveRows;
+        if (newRow < _baselineRowCount && newRow < activeRows.Count)
+            activeRows[newRow].ContinuedFromAbove = false;
+
         // Viewport scroll bookkeeping — only the main buffer; the alt
         // buffer has its own cursor space and doesn't interact with the
         // baseline snapshot.
