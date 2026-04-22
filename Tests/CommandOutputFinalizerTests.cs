@@ -474,6 +474,78 @@ public static class CommandOutputFinalizerTests
                 $"partial-overwrite: touched cells drop SGR, tail untouched — got '{cleaned}'");
         }
 
+        // ---- OSC 8 hyperlink URI projection ----
+        // OSC 8 is the "make link text clickable in modern terminals"
+        // convention (xterm, Windows Terminal, iTerm2, VS Code). Other
+        // OSCs get silently dropped because their payload is terminal
+        // chrome (window title, cwd report, shell markers). OSC 8 is
+        // different: the URI is a semantic destination that AI consumers
+        // of the MCP output need — build tools emit OSC 8 around error
+        // file paths, diagnostic links, etc. Preserving it as `<URI>`
+        // after the link text is the plain-text projection.
+
+        // CAUTION on string literals in this section: `\x07` (BEL) is a
+        // C# hex escape that greedily consumes up to 4 hex digits. Writing
+        // `"\x07click"` would parse as `\x07c` + "lick" = '|' + "lick"
+        // because 'c' is a hex digit — silently corrupting the OSC
+        // terminator. Use the fixed-length `\a` escape (= U+0007) instead;
+        // it's identical in semantic and immune to greedy hex eating.
+
+        // BEL-terminated OSC 8 with trivial URL — link text preserved,
+        // URL appended in angle brackets.
+        {
+            var raw = "prefix \x1b]8;;https://example.com/\aclick here\x1b]8;;\a suffix";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "prefix click here<https://example.com/> suffix",
+                $"osc8-bel: URL appended after link text — got '{cleaned}'");
+        }
+
+        // ST-terminated OSC 8. Same content shape but the terminator is
+        // `\e\\` instead of BEL. Must behave identically.
+        {
+            var raw = "see \x1b]8;;file:///C:/log.txt\x1b\\log\x1b]8;;\x1b\\ here";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "see log<file:///C:/log.txt> here",
+                $"osc8-st: ST-terminated OSC 8 projects the URL too — got '{cleaned}'");
+        }
+
+        // OSC 8 with params (e.g. `id=foo`) — the URI is the segment
+        // after the SECOND semicolon; params in between are ignored.
+        {
+            var raw = "x\x1b]8;id=xyz;https://example.org/\atext\x1b]8;;\ay";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "xtext<https://example.org/>y",
+                $"osc8-params: URI after second semicolon — got '{cleaned}'");
+        }
+
+        // Unclosed OSC 8 (no matching close marker) — URI is captured but
+        // never flushed. No garbage in output; the URL is lost, same
+        // graceful degradation as pre-change behaviour. Covers truncated
+        // captures and mid-stream command boundaries.
+        {
+            var raw = "open-only \x1b]8;;https://example.com/\atail";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "open-only tail",
+                $"osc8-unclosed: lost URI but no escape residue — got '{cleaned}'");
+        }
+
+        // Close without matching open — the close's empty URI triggers
+        // the flush path, but with no pending URI nothing is emitted.
+        {
+            var raw = "stray \x1b]8;;\aclose";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "stray close",
+                $"osc8-stray-close: unmatched close is a no-op — got '{cleaned}'");
+        }
+
+        // Other OSCs still drop silently — only 8 is promoted.
+        {
+            var raw = "\x1b]0;window title\abefore\x1b]8;;https://x.com/\alink\x1b]8;;\a\x1b]7;file:///tmp\aafter";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == "beforelink<https://x.com/>after",
+                $"osc8-mix: OSC 0 and OSC 7 stay dropped, only OSC 8 projected — got '{cleaned}'");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

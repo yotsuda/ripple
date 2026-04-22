@@ -114,6 +114,18 @@ internal sealed class CommandOutputRenderer
     // (e.g. \e[31m\e[1m) into one prefix string.
     private string? _pendingSgr;
 
+    // Active OSC 8 hyperlink URL. OSC 8 emits a start marker
+    // (`\e]8;;<URL>\a` or with ST) before the link text and a close
+    // marker (`\e]8;;\a`) after it. Terminals that honor hyperlinks
+    // make the link text clickable. In our text-only rendering we'd
+    // otherwise drop the URL entirely with every other OSC, so AI
+    // consumers lose the semantic destination of diagnostics / file
+    // refs that build tools emit via OSC 8. Capture the URL on open
+    // and flush it as `<URL>` characters into the grid on close —
+    // same treatment color SGR gets (preserved, not stripped), just
+    // projected into a text-only form that survives the MCP boundary.
+    private string? _pendingHyperlinkUrl;
+
     // Number of rows pre-populated from the baseline snapshot. Used
     // by the no-baseline CUP-clamp fallback (CleanString tests) to
     // know whether absolute cursor positioning can be trusted.
@@ -729,14 +741,65 @@ internal sealed class CommandOutputRenderer
         }
         if (next == ']')
         {
-            int j = i + 1;
+            int payloadStart = i + 1;
+            int j = payloadStart;
+            int payloadEnd = -1;
+            int terminatorLen = 0;
             while (j < input.Length)
             {
-                if (input[j] == '\x07') { j++; break; }
-                if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\') { j += 2; break; }
+                if (input[j] == '\x07') { payloadEnd = j; terminatorLen = 1; break; }
+                if (input[j] == '\x1b' && j + 1 < input.Length && input[j + 1] == '\\') { payloadEnd = j; terminatorLen = 2; break; }
                 j++;
             }
-            return j;
+            if (payloadEnd < 0) return j; // unterminated — consume what we've seen
+
+            // OSC 8 hyperlink handling: format is `8 ; <params> ; <URI>`.
+            // Open emits a non-empty URI before the link text; close emits
+            // an empty URI after the link text. Capture the URI on open
+            // and project it into the grid as `<URI>` cells on close so
+            // the destination survives the plain-text MCP response. Any
+            // other OSC (window title, cwd report, ripple's own 633
+            // markers) stays silently dropped — only 8 is promoted.
+            var payload = input.Slice(payloadStart, payloadEnd - payloadStart);
+            if (payload.Length >= 2 && payload[0] == '8' && payload[1] == ';')
+            {
+                int secondSemicolon = -1;
+                for (int k = 2; k < payload.Length; k++)
+                {
+                    if (payload[k] == ';') { secondSemicolon = k; break; }
+                }
+                if (secondSemicolon >= 0)
+                {
+                    var uri = payload.Slice(secondSemicolon + 1);
+                    if (uri.Length > 0)
+                    {
+                        // Open: stash the URI for the matching close. A
+                        // stray nested open replaces the previous URI —
+                        // acceptable for rare nesting, and safer than
+                        // trying to emit both (we'd double-write the
+                        // outer URI's text).
+                        _pendingHyperlinkUrl = uri.ToString();
+                    }
+                    else
+                    {
+                        // Close: flush `<URI>` into the grid at the
+                        // current cursor column. Using WriteChar so each
+                        // char advances the cursor and respects the
+                        // existing grid semantics (line wrap, SGR,
+                        // baseline diffing). Clear the URI so a close
+                        // without matching open is a no-op.
+                        if (!string.IsNullOrEmpty(_pendingHyperlinkUrl))
+                        {
+                            WriteChar('<');
+                            foreach (var ch in _pendingHyperlinkUrl)
+                                WriteChar(ch);
+                            WriteChar('>');
+                            _pendingHyperlinkUrl = null;
+                        }
+                    }
+                }
+            }
+            return payloadEnd + terminatorLen;
         }
         if (next == '(' || next == ')') return Math.Min(i + 2, input.Length);
         if (next == '7') { _savedRow = _row; _savedCol = _col; return i + 1; }
