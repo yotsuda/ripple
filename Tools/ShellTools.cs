@@ -259,9 +259,18 @@ public class ShellTools
         if (r.ShellFamily == "cmd")
             return $"○ {r.DisplayName}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
 
-        return r.ExitCode == 0
-            ? $"✓ {r.DisplayName}{shell} | Status: Completed{errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}"
-            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}){errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+        // Three outcomes for shells that report exit codes:
+        //   exit != 0           → ✗ Failed
+        //   exit 0 + errCount>0 → ⚠ Completed with errors (pwsh non-terminating
+        //                         errors: the command RAN but $Error grew, so a
+        //                         green ✓ would understate what the AI needs to
+        //                         look at)
+        //   exit 0 + errCount=0 → ✓ Completed (happy path)
+        if (r.ExitCode != 0)
+            return $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}){errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+        if (r.ErrorCount > 0)
+            return $"⚠  {r.DisplayName}{shell} | Status: Completed with errors{errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+        return $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
     }
 
     /// <summary>

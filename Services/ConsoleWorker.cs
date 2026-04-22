@@ -3568,9 +3568,18 @@ public class ConsoleWorker
         if (shellFamily == "cmd")
             return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
 
-        return exitCode == 0
-            ? $"✓ {identity}{shell} | Status: Completed{errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
-            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}){errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+        // Three outcomes for shells that report exit codes:
+        //   exit != 0           → ✗ Failed
+        //   exit 0 + errCount>0 → ⚠ Completed with errors (pwsh non-terminating
+        //                         errors: the command RAN but $Error grew, so a
+        //                         green ✓ would understate what the AI needs to
+        //                         look at)
+        //   exit 0 + errCount=0 → ✓ Completed (happy path)
+        if (exitCode != 0)
+            return $"✗ {identity}{shell} | Status: Failed (exit {exitCode}){errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+        if (errorCount > 0)
+            return $"⚠  {identity}{shell} | Status: Completed with errors{errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+        return $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
     }
 
     /// <summary>
