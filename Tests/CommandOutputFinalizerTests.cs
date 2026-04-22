@@ -449,12 +449,16 @@ public static class CommandOutputFinalizerTests
         // Same-char overwrite is still a ConPTY repaint idempotence case
         // and MUST keep the original SGR. Covers the post-alt-screen /
         // post-prompt redraw bursts the renderer was designed around.
+        // Expected output also carries the trailing `\e[0m` that the
+        // dangling-SGR pass appends so the consumer's next write doesn't
+        // inherit red.
         {
             // [31m makes 'A' red. \r returns to col 0. Overwrite same 'A'
-            // with no SGR pending. Expected: 'A' keeps red SGR.
+            // with no SGR pending. Expected: 'A' keeps red SGR, finalizer
+            // appends a closing reset.
             var raw = "\x1b[31mA\rA";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
-            Assert(cleaned == "\x1b[31mA",
+            Assert(cleaned == "\x1b[31mA\x1b[0m",
                 $"repaint-same-char: SGR preserved on same-char overwrite — got '{cleaned}'");
         }
 
@@ -610,6 +614,81 @@ public static class CommandOutputFinalizerTests
             var cleaned = CommandOutputFinalizer.CleanString(raw);
             Assert(cleaned.Contains("C:\\Users\\alice\\app.ps1:42"),
                 $"tempfile-strip-nontemp: unrelated paths untouched — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // ---- Dangling SGR reset handling ----
+        // Two boundary cases make SGR sequences leak visible noise or
+        // bleed colour into the consumer's next output:
+        //   (a) LEADING reset — no-op at the MCP boundary because the
+        //       consumer hasn't applied any SGR yet, but shows up as
+        //       visible `[m` garbage. Typical source: Write-Progress
+        //       cleanup drops a reset into the progress-bar row, which
+        //       attaches as SgrPrefix to the first non-bar character.
+        //   (b) MISSING trailing reset — when the output ends in a
+        //       colour-set without a reset, the consumer's next prompt
+        //       or tool response shows up in that colour ("stuck on").
+        //       Typical source: `Write-Error` / coloured diagnostics
+        //       that rely on the shell's own prompt to re-assert
+        //       default attributes.
+
+        // (a) leading reset only — dropped.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[mafter");
+            Assert(cleaned == "after",
+                $"dangling-lead: bare `\\e[m` at start stripped — got '{cleaned}'");
+        }
+
+        // (a) multiple leading resets — all dropped, chained forms covered.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[0m\x1b[m\x1b[0;0mhello");
+            Assert(cleaned == "hello",
+                $"dangling-lead-multi: chained resets stripped — got '{cleaned}'");
+        }
+
+        // (a) leading non-reset SGR survives — it carries meaning
+        // (actually changes the consumer's rendering state).
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[31mred");
+            Assert(cleaned.StartsWith("\x1b[31m"),
+                $"dangling-lead-setter: non-reset SGR kept at start — got '{cleaned}'");
+        }
+
+        // (b) output ends colour-set without reset — trailing `\e[0m` appended.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[31mERROR");
+            Assert(cleaned == "\x1b[31mERROR\x1b[0m",
+                $"dangling-trail: missing trailing reset added — got '{cleaned}'");
+        }
+
+        // (b) output already ends in a reset — no duplicate appended.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[31mERROR\x1b[0m");
+            Assert(cleaned == "\x1b[31mERROR\x1b[0m",
+                $"dangling-trail-existing: existing reset kept, no dup — got '{cleaned}'");
+        }
+
+        // (b) output already ends in a bare `\e[m` (param omitted) — same
+        // meaning as `\e[0m`, must also suppress auto-append.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[31mERROR\x1b[m");
+            Assert(cleaned == "\x1b[31mERROR\x1b[m",
+                $"dangling-trail-bare: `\\e[m` recognised as reset — got '{cleaned}'");
+        }
+
+        // (b) output has no SGR at all — no reset appended (nothing to undo).
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("plain text");
+            Assert(cleaned == "plain text",
+                $"dangling-trail-none: plain text unchanged — got '{cleaned}'");
+        }
+
+        // Combined: leading reset stripped AND trailing reset added.
+        // `\e[m\e[31mERROR` → strip leading `\e[m`, then detect missing
+        // trailing → `\e[31mERROR\e[0m`.
+        {
+            var cleaned = CommandOutputFinalizer.CleanString("\x1b[m\x1b[31mERROR");
+            Assert(cleaned == "\x1b[31mERROR\x1b[0m",
+                $"dangling-both: leading strip + trailing reset — got '{cleaned}'");
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");

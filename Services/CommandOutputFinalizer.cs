@@ -111,7 +111,27 @@ internal static class CommandOutputFinalizer
         // Stripping the whole offending line keeps the `Line | N | <source>`
         // block below, which carries the real diagnostic content.
         rendered = TempfileReferenceLine.Replace(rendered, "");
-        return rendered.Trim();
+        // Strip leading SGR resets — they're no-ops at the MCP boundary
+        // (the consumer hasn't applied any SGR before this output, so
+        // resetting to default state changes nothing). Common source:
+        // PowerShell's Write-Progress cleanup writes a reset right where
+        // the bar lived; that reset attaches as the SGR prefix of the
+        // first non-bar character that ends up at that column, producing
+        // visible noise like `[mafter` for a bare `"after"` write.
+        rendered = LeadingResetSgr.Replace(rendered, "");
+        // Trim whitespace BEFORE deciding about the trailing reset —
+        // the reset is appended after the last visible character, not
+        // after stray newline padding from the renderer's row trimming.
+        rendered = rendered.Trim();
+        // Append `\e[0m` if the cumulative SGR state at end-of-output is
+        // non-default. Otherwise the consumer's next output (their next
+        // prompt, the AI's next tool result, etc.) inherits whatever
+        // colour / weight / reverse-video the last cell left active —
+        // observed when a command ends with `Write-Error` (red) or a
+        // colourised diagnostic that doesn't emit its own trailing reset.
+        if (NeedsTrailingReset(rendered))
+            rendered += "\x1b[0m";
+        return rendered;
     }
 
     // Windows: `C:\path\to\ripple-exec-<pid>-<guid>.ps1` (optionally `:N`).
@@ -122,6 +142,48 @@ internal static class CommandOutputFinalizer
     private static readonly Regex TempfileReferenceLine = new(
         @"^[^\n]*(?:[A-Za-z]:[\\/]|/)[^\s:]*?ripple-exec-\d+-[0-9a-fA-F]+\.(?:ps1|cmd|sh)[^\n]*(?:\n|$)",
         RegexOptions.Multiline | RegexOptions.Compiled);
+
+    // SGR reset variants: `\e[m` (omitted parameter), `\e[0m`,
+    // `\e[0;0m`, `\e[00m`, `\e[0;0;0m` — anything whose parameters
+    // are empty or all zeros means reset-all-attributes. The leading
+    // strip matches one or more contiguous resets.
+    private static readonly Regex LeadingResetSgr = new(
+        @"^(?:\x1b\[(?:0?(?:;0?)*)m)+",
+        RegexOptions.Compiled);
+
+    // Match every `\e[<params>m` SGR sequence so NeedsTrailingReset can
+    // inspect the LAST one. SGR is `CSI <params> m`; params are
+    // semicolon-separated decimal numbers (or empty).
+    private static readonly Regex AnySgr = new(
+        @"\x1b\[([\d;]*)m",
+        RegexOptions.Compiled);
+
+    // True when the parameter blob represents a reset-all sequence —
+    // empty, or all components are zero (or empty).
+    private static bool IsResetSgrParam(string param)
+    {
+        if (string.IsNullOrEmpty(param)) return true;
+        foreach (var part in param.Split(';'))
+        {
+            if (string.IsNullOrEmpty(part)) continue;
+            if (!int.TryParse(part, out var n) || n != 0) return false;
+        }
+        return true;
+    }
+
+    // True when the rendered output's cumulative SGR state at end is
+    // non-default — i.e. the LAST SGR sequence in the output is a setter
+    // rather than a reset. Trim trailing whitespace first because
+    // newlines don't change SGR state.
+    private static bool NeedsTrailingReset(string text)
+    {
+        var trimmed = text.TrimEnd();
+        Match? last = null;
+        foreach (Match m in AnySgr.Matches(trimmed))
+            last = m;
+        if (last is null) return false;
+        return !IsResetSgrParam(last.Groups[1].Value);
+    }
 }
 
 /// <summary>
