@@ -62,17 +62,18 @@ output:
 input:
   line_ending: "\r"
   multiline_detect: prompt_based
-  # encoded_scriptblock is measurably faster than tempfile on the warm
-  # path (base64-encode the body, send a single-line
+  # encoded_scriptblock: base64-encode the body, send a single-line
   # `. ([ScriptBlock]::Create(...))` invocation — no disk I/O, no
-  # history-filter bookkeeping). The delivery is implemented and its
-  # unit tests pass, but empirical runs show occasional synth-prompt
-  # leakage into the AI-facing output on long commands (root cause
-  # under investigation — likely baseline VT state interacting with the
-  # long encoded ptyInput echo). Staying on tempfile as the default
-  # until that race is pinned down; encoded_scriptblock can be re-
-  # enabled by changing this single line.
-  multiline_delivery: tempfile
+  # tempfile cleanup, no history-filter bookkeeping; ~0.3-0.5s faster
+  # on the warm path than tempfile. The earlier baseline-bleed race
+  # (synth-prompt tail leaking into the AI-facing output when a single
+  # PTY read spanned OSC C and subsequent command output) is fixed by
+  # feeding the worker's _vtState in slices aligned to OSC event
+  # offsets, so Snapshot() at CommandExecuted reflects state AS OF the
+  # OSC C byte rather than end-of-chunk state. tempfile remains
+  # selectable for bodies whose decoded length would exceed
+  # PSReadLine's input line cap.
+  multiline_delivery: encoded_scriptblock
   tempfile:
     prefix: .ripple-exec-
     extension: .ps1

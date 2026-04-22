@@ -66,8 +66,8 @@ public static class AdapterLoaderTests
                 "pwsh: integration_script contains PreCommandLookupAction hook");
             Assert(pwsh.Init.HookType == "precommand_lookup_action",
                 "pwsh: init.hook_type == precommand_lookup_action");
-            Assert(pwsh.Input.MultilineDelivery == "tempfile",
-                "pwsh: input.multiline_delivery == tempfile");
+            Assert(pwsh.Input.MultilineDelivery == "encoded_scriptblock",
+                "pwsh: input.multiline_delivery == encoded_scriptblock");
             Assert(pwsh.Process.InheritEnvironment == false,
                 "pwsh: process.inherit_environment == false (clean env)");
             Assert(pwsh.Capabilities.ExitCode == "true",
