@@ -505,10 +505,35 @@ internal sealed class CommandOutputRenderer
         if (CurCol < cells.Count)
         {
             var existing = cells[CurCol];
+            // SGR resolution on overwrite:
+            //   (a) New SGR pending       → always use it.
+            //   (b) Same char, no new SGR → keep existing (ConPTY repaint
+            //       idempotence: the same byte sequence re-drawn by a
+            //       post-alt-screen or post-prompt burst must not
+            //       introduce a diff).
+            //   (c) Different char, no new SGR → drop existing SGR. The
+            //       previous character and its SGR belonged together; a
+            //       genuine overwrite has no reason to inherit them.
+            //       Without this, PowerShell's Write-Progress Minimal
+            //       view leaks [7m from the cleaned-up progress bar row
+            //       into normal text that later gets written at the same
+            //       columns ("[mafter [7mprogress" for Write-Host "after
+            //       progress"). Observation: bar cells hold reverse-video
+            //       SGR even after `\e[2K` if the cleanup path reuses
+            //       cells (writes space, clears cells, etc.), and the
+            //       next normal write at those columns otherwise inherits
+            //       the bar's SGR verbatim.
+            string? resolvedSgr;
+            if (prefix != null)
+                resolvedSgr = prefix;
+            else if (c == existing.Ch)
+                resolvedSgr = existing.SgrPrefix;
+            else
+                resolvedSgr = null;
             cells[CurCol] = new Cell
             {
                 Ch = c,
-                SgrPrefix = prefix ?? existing.SgrPrefix
+                SgrPrefix = resolvedSgr
             };
         }
         else
