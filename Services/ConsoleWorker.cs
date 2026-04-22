@@ -440,17 +440,16 @@ public class ConsoleWorker
         // "pwsh family = clean env, everyone else = inherit" rule.
         bool inheritEnv = _adapter?.Process.InheritEnvironment
             ?? !_isPwshFamily;
-        // PTY cols are floored at 200 even when the worker's visible ConHost
-        // is narrower. Shells decide where to emit soft-wrap \n at the
-        // declared PTY width; narrow terminals have been observed to split
-        // words mid-grapheme (e.g. "coverage" → "covera\nge") when the
-        // shell wraps at 80, which corrupts the AI-facing text slice.
-        // ConHost re-wraps visually at its actual window width on display,
-        // so the human experience is unchanged — but the captured bytes
-        // stay as full 200-col logical lines for AI consumption. Callers
-        // that genuinely need native-width rendering (TUIs like vim/less)
-        // are out of scope for the AI command path.
-        int cols = Math.Max(Console.WindowWidth > 0 ? Console.WindowWidth : 120, 200);
+        // PTY cols track the visible ConHost width. A previous version
+        // floored at 200 to dodge mid-word soft-wraps in AI output, but
+        // that broke self-repainting lines: pwsh's Write-Progress pads
+        // its bar to the declared PTY width, and when that exceeds the
+        // visible console's width the bar wraps in ConHost and the
+        // trailing \r returns to the wrapped row only, leaving each
+        // update stacked vertically. Matching the visible width makes
+        // \r overwrite semantics work; mid-word splitting on very narrow
+        // terminals is a rare edge case the AI can still read through.
+        int cols = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
         int rows = Console.WindowHeight > 0 ? Console.WindowHeight : 30;
         var envOverrides = _adapter?.Process.Env;
 
@@ -1497,10 +1496,11 @@ public class ConsoleWorker
             {
                 int rawCols = Console.WindowWidth;
                 int rows = Console.WindowHeight;
-                // Floor PTY width at 200 to prevent mid-word soft-wraps in
-                // AI-captured output. Matches the spawn-time policy at the
-                // top of this file — keep the two branches in sync.
-                int cols = Math.Max(rawCols, 200);
+                // Match the visible ConHost width so Write-Progress and
+                // other \r-based in-place repainting behave correctly.
+                // Matches the spawn-time policy at the top of this file —
+                // keep the two branches in sync.
+                int cols = rawCols;
                 if (rawCols > 0 && rows > 0 && (cols != lastCols || rows != lastRows))
                 {
                     lastCols = cols;
