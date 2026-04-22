@@ -4,6 +4,10 @@ All notable changes to ripple are documented here. Format based on [Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tempfile path no longer leaks into multi-line AI command error output.** Multi-line AI commands are wrapped into a `.ripple-exec-<pid>-<guid>.ps1` (or `.cmd` / `.sh`) file and dot-sourced, which is invisible for the happy path but PowerShell's `ConciseView` error renderer prefixes the summary with `{Cmdlet}: {TempfilePath}:{Line}`, exposing ripple's implementation detail. AI consumers had no way to know that path was a wrapper they didn't write — it just looked like an unrelated file in their error trace. `CommandOutputFinalizer.CleanString` now strips any line containing a `ripple-exec-<pid>-<hex>.{ps1,cmd,sh}` reference (Windows or POSIX flavor); the `Line | N | <source>` block below — which carries the actual diagnostic — is preserved untouched. Single-line AI commands never wrap, so they never produced this leakage and stay unaffected. Five regression asserts in `CommandOutputFinalizerTests` cover pwsh ConciseView output, bash on POSIX, cmd.exe `.cmd` paths, mid-line occurrences, and a negative case verifying that unrelated `.ps1` paths are untouched.
+
 ### Added
 
 - **OSC 8 hyperlinks preserved as `<URI>` in the MCP response.** Modern terminals (xterm, Windows Terminal, iTerm2, VS Code) accept `\e]8;;<URI>\a link-text \e]8;;\a` to make link-text clickable. Build tools (`dotnet`, some linters), `Write-Information`, and IDE integrations emit these around file paths and documentation URLs. Previously ripple dropped them with every other OSC, losing the destination — the AI saw only the link-text and couldn't reference the URI back to the user. Now `CommandOutputRenderer` detects OSC 8 (open and close variants, both BEL- and ST-terminated) and injects the captured URI into the grid as `<URI>` cells right after the link-text, e.g. `"click here<https://example.com/>"`. All other OSCs still drop silently. Six asserts added to `CommandOutputFinalizerTests` covering BEL/ST terminators, params segment (`id=foo` between the semicolons), unclosed opens, stray closes, and mix with surrounding OSC 0/7 traffic.

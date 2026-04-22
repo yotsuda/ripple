@@ -546,6 +546,72 @@ public static class CommandOutputFinalizerTests
                 $"osc8-mix: OSC 0 and OSC 7 stay dropped, only OSC 8 projected — got '{cleaned}'");
         }
 
+        // ---- Tempfile path leak from multi-line AI command delivery ----
+        // Multi-line AI commands wrap the user's body into a temp file and
+        // dot-source it. PowerShell's ConciseView prefixes the error
+        // summary with `{Cmdlet}: {TempfilePath}:{Line}`, exposing ripple's
+        // implementation detail. Strip any line referencing a tempfile.
+
+        // PowerShell ConciseView with Windows-native tempfile path.
+        {
+            var raw = "Get-Item: C:\\Users\\u\\AppData\\Local\\Temp\\.ripple-exec-12345-abcdef0123.ps1:5\n"
+                   + "Line |\n"
+                   + "   5 | Get-Item C:\\nope\n"
+                   + "     | ~~~~~~~~~~~~~~~~\n"
+                   + "     | Cannot find path 'C:\\nope' because it does not exist.";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(!cleaned.Contains("ripple-exec-"),
+                $"tempfile-strip-pwsh: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned.Contains("Cannot find path"),
+                $"tempfile-strip-pwsh: error message preserved — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned.Contains("Line |") && cleaned.Contains("   5 |"),
+                $"tempfile-strip-pwsh: Line block preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // bash (WSL) — POSIX path + .sh extension.
+        {
+            var raw = "bash: /tmp/ripple-exec-12345-abcdef0123.sh: line 3: nope: command not found\nreal tail line";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(!cleaned.Contains("ripple-exec-"),
+                $"tempfile-strip-bash: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned.Contains("real tail line"),
+                $"tempfile-strip-bash: other content preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // cmd.exe — .cmd extension + Windows-native path.
+        {
+            var raw = "C:\\Temp\\ripple-exec-12345-abcdef.cmd was not expected at this time.\nafter";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(!cleaned.Contains("ripple-exec-"),
+                $"tempfile-strip-cmd: .cmd path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned.Contains("after"),
+                $"tempfile-strip-cmd: subsequent line preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // Benign mention in user content — if the AI's own command text
+        // prints a string literally containing `ripple-exec-<N>-<hex>.ps1`,
+        // we still strip. Acceptable false-positive: rare in practice, and
+        // the strip is scoped to one line so surrounding context stays
+        // intact. Tradeoff: keep the filter trivial and predictable
+        // rather than trying to distinguish real usage from accidental
+        // mentions.
+        {
+            var raw = "line before\nsome text C:\\tmp\\ripple-exec-1-abc.ps1:7 in middle\nline after";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(!cleaned.Contains("ripple-exec-"),
+                $"tempfile-strip-middle: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned.Contains("line before") && cleaned.Contains("line after"),
+                $"tempfile-strip-middle: surrounding lines preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // Non-tempfile paths are untouched — we only strip our own.
+        {
+            var raw = "error at C:\\Users\\alice\\app.ps1:42\nother content";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned.Contains("C:\\Users\\alice\\app.ps1:42"),
+                $"tempfile-strip-nontemp: unrelated paths untouched — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
