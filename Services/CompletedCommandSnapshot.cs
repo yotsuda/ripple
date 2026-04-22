@@ -176,4 +176,11 @@ public sealed record CompletedCommandSnapshot(
     // otherwise treat as command output. Null when no baseline was
     // captured (e.g. early-exit paths that bypass OSC C, or test
     // harnesses that build snapshots directly).
-    VtLiteSnapshot? VtBaseline = null);
+    VtLiteSnapshot? VtBaseline = null,
+    // PowerShell-specific: number of error records the pipeline added
+    // to $Error during execution, captured via the integration script's
+    // OSC 633;E;{N} marker. The worker passes this through to the proxy
+    // status line ("Errors: N" when N > 0). Zero for shells that don't
+    // emit an OSC E marker — most adapters don't because they have no
+    // analogous always-on error counter.
+    int ErrorCount = 0);

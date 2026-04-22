@@ -241,7 +241,12 @@ public class ConsoleWorker
         string Command,
         string Duration,
         string StatusLine,
-        string? SpillFilePath);
+        string? SpillFilePath,
+        // Number of error records the pipeline added to $Error during
+        // execution. Surfaced in the worker's execute response so the
+        // proxy can render "Errors: N" in the inline-path status line.
+        // PowerShell-only (other adapters leave this at 0).
+        int ErrorCount = 0);
 
     private readonly string? _banner;
     private readonly string? _reason;
@@ -3113,6 +3118,7 @@ public class ConsoleWorker
         {
             w.WriteStringOrNull("output", result.Output);
             w.WriteNumber("exitCode", result.ExitCode);
+            w.WriteNumber("errorCount", result.ErrorCount);
             w.WriteStringOrNull("cwd", result.Cwd);
             w.WriteStringOrNull("duration", result.Duration);
             w.WriteBoolean("timedOut", false);
@@ -3313,7 +3319,8 @@ public class ConsoleWorker
                 snapshot.Duration,
                 snapshot.Cwd,
                 snapshot.ShellFamily,
-                snapshot.DisplayName);
+                snapshot.DisplayName,
+                snapshot.ErrorCount);
 
             var result = new CommandResult(
                 Output: truncation.DisplayOutput,
@@ -3322,7 +3329,8 @@ public class ConsoleWorker
                 Command: snapshot.Command,
                 Duration: snapshot.Duration,
                 StatusLine: statusLine,
-                SpillFilePath: truncation.SpillFilePath);
+                SpillFilePath: truncation.SpillFilePath,
+                ErrorCount: snapshot.ErrorCount);
 
             // Step 6: deliver inline OR cache. Route by the snapshot's
             // InlineDeliveryId so each command hits its own TCS — a
@@ -3397,7 +3405,8 @@ public class ConsoleWorker
                         snapshot.Duration,
                         snapshot.Cwd,
                         snapshot.ShellFamily,
-                        snapshot.DisplayName);
+                        snapshot.DisplayName,
+                        snapshot.ErrorCount);
                     var fallback = new CommandResult(
                         Output: $"finalize failed: {ex.GetType().Name}: {ex.Message}",
                         ExitCode: snapshot.ExitCode,
@@ -3503,12 +3512,18 @@ public class ConsoleWorker
     /// </summary>
     private static string BuildStatusLine(
         string? command, int exitCode, string duration, string? cwd,
-        string? shellFamily, string? displayName)
+        string? shellFamily, string? displayName, int errorCount)
     {
         var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
         var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
         var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
         var cmd = CommandTracker.TruncateForStatusLine(command);
+        // Only PowerShell currently emits OSC 633;E. For other adapters
+        // errorCount stays at 0 and "Errors: N" is omitted, so the line
+        // shape remains identical to before. Avoid a trivial "Errors: 0"
+        // for pwsh too — zero is the silent happy-path case and not
+        // worth a token.
+        var errInfo = errorCount > 0 ? $" | Errors: {errorCount}" : "";
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Render a neutral
@@ -3518,8 +3533,8 @@ public class ConsoleWorker
             return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
 
         return exitCode == 0
-            ? $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
-            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+            ? $"✓ {identity}{shell} | Status: Completed{errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}"
+            : $"✗ {identity}{shell} | Status: Failed (exit {exitCode}){errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
     }
 
     /// <summary>
@@ -3566,6 +3581,7 @@ public class ConsoleWorker
                 w.WriteStartObject();
                 w.WriteStringOrNull("output", r.Output);
                 w.WriteNumber("exitCode", r.ExitCode);
+                w.WriteNumber("errorCount", r.ErrorCount);
                 w.WriteStringOrNull("cwd", r.Cwd);
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);

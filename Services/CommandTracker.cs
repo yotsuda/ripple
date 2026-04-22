@@ -128,6 +128,13 @@ public class CommandTracker
     private int _recentPos;     // next write index
     private int _recentLen;     // count of valid chars, capped at capacity
     private int _exitCode;
+    // Latest OSC 633;E;{N} value reported between RegisterCommand and the
+    // snapshot emission. PowerShell's prompt fn fires this once per
+    // command with the $Error.Count delta over the pipeline. Other shells
+    // don't emit OSC E so the value stays at 0 — meaning "Errors: N"
+    // never appears in the proxy status line for non-pwsh adapters,
+    // which is correct: $Error.Count has no equivalent in bash / cmd.
+    private int _errorCount;
     private string? _cwd;
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
@@ -361,6 +368,7 @@ public class CommandTracker
             _capturedBaselineSnapshot = null;
             _capture = new CommandOutputCapture();
             _exitCode = 0;
+            _errorCount = 0;
             _cwd = null;
             _commandSent = registration.CommandText;
             _registeredShellFamily = registration.ShellFamily;
@@ -596,6 +604,14 @@ public class CommandTracker
 
                 case OscParser.OscEventType.Cwd:
                     _cwd = evt.Cwd;
+                    break;
+
+                case OscParser.OscEventType.ErrorCount:
+                    // OSC E: PowerShell prompt fn reports the $Error.Count
+                    // delta over the just-finished pipeline. Carry it
+                    // through to the snapshot so the proxy can format
+                    // "Errors: N" in the status line.
+                    _errorCount = evt.ErrorCount;
                     break;
 
                 case OscParser.OscEventType.PromptStart:
@@ -836,7 +852,8 @@ public class CommandTracker
             PromptStartOffset: _promptStartOffset,
             Generation: _commandGeneration,
             InlineDeliveryId: _registeredInlineDeliveryId,
-            VtBaseline: _capturedBaselineSnapshot);
+            VtBaseline: _capturedBaselineSnapshot,
+            ErrorCount: _errorCount);
 
         // Hand the inline caller (if still attached) the snapshot
         // directly; the worker's shared finalize-once path consumes

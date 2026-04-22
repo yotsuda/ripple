@@ -246,6 +246,11 @@ public class ShellTools
         var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
         var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
         var cmd = CommandTracker.TruncateForStatusLine(r.Command);
+        // Only the pwsh adapter populates ErrorCount (via the integration
+        // script's OSC 633;E;{N}). Other adapters leave it at 0, so the
+        // segment is omitted there. Zero is also omitted for pwsh — the
+        // happy path doesn't need a "Errors: 0" tag.
+        var errInfo = r.ErrorCount > 0 ? $" | Errors: {r.ErrorCount}" : "";
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Showing a success tick
@@ -255,8 +260,8 @@ public class ShellTools
             return $"○ {r.DisplayName}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
 
         return r.ExitCode == 0
-            ? $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}"
-            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+            ? $"✓ {r.DisplayName}{shell} | Status: Completed{errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}"
+            : $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}){errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
     }
 
     /// <summary>

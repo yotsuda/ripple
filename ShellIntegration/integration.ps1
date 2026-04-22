@@ -49,6 +49,17 @@ $global:__rp_lec_at_cmd_start = $null
 # $?-based detection.
 $global:__rp_ai_pipeline_ok = $null
 $global:__rp_ai_pipeline_lec = $null
+# Snapshot of $Error.Count at PreCommandLookupAction. The prompt fn
+# computes ($Error.Count - this) to report the number of error records
+# the pipeline added — written to OSC 633;E;{N} so the proxy can
+# surface it as `Errors: N` in the status line. Errors are PowerShell's
+# canonical "something failed" signal: cmdlet non-terminating errors,
+# `Write-Error`, thrown exceptions all populate $Error. Native exe
+# non-zero exits do NOT — those are covered by OSC D's $? path. Warning
+# / Information streams don't have an analogous reliable counter (no
+# global `$Warning.Count`; cmdlets emit warnings via the engine pipe,
+# bypassing any Write-Warning proxy), so only errors are counted.
+$global:__rp_err_count_at_cmd_start = 0
 
 function global:prompt {
     # CRITICAL: $? must be captured on the very first line — any statement
@@ -106,6 +117,14 @@ function global:prompt {
                   else { 1 }
         }
         $prefix += (__rp_osc_str "D;$ec")
+
+        # Errors-this-pipeline count via $Error.Count delta. Floor at 0
+        # so a user `$Error.Clear()` mid-command can't produce a negative
+        # delta that breaks the int parser on the proxy side. The proxy
+        # surfaces this as `Errors: N` in the status line when N > 0.
+        $errDelta = $Error.Count - $global:__rp_err_count_at_cmd_start
+        if ($errDelta -lt 0) { $errDelta = 0 }
+        $prefix += (__rp_osc_str "E;$errDelta")
     }
 
     # Clear the pre-command snapshot so the next command starts fresh.
@@ -149,6 +168,11 @@ $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
         # cmd.exe exit 7 followed by a pure-PS pipeline would be reported
         # as exit 7.
         $global:__rp_lec_at_cmd_start = $global:LASTEXITCODE
+        # Same idea for $Error.Count: snapshot here so the prompt fn can
+        # report the delta as the number of error records this pipeline
+        # added. $Error is per-runspace and persists across commands; only
+        # the delta is meaningful as "this pipeline's errors".
+        $global:__rp_err_count_at_cmd_start = $Error.Count
         [Console]::Write((__rp_osc_str "C"))
     }
 }

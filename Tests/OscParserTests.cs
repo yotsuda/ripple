@@ -44,6 +44,35 @@ public class OscParserTests
             Assert(result.Events[0].Cwd == "/home/user", "Cwd value");
         }
 
+        // Test 3b: ErrorCount (OSC 633;E;{N}) — ripple's PowerShell-only
+        // extension that lets the proxy render `Errors: N` in the status
+        // line. Parsed identically to D's exit code; the count flows
+        // through OscEvent.ErrorCount.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("\x1b]633;E;3");
+            Assert(result.Events.Count == 1, "ErrorCount event count");
+            Assert(result.Events[0].Type == OscParser.OscEventType.ErrorCount, "ErrorCount type");
+            Assert(result.Events[0].ErrorCount == 3, "ErrorCount value");
+        }
+
+        // Test 3c: ErrorCount with zero — still emitted, downstream
+        // formatter gates on > 0.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("\x1b]633;E;0");
+            Assert(result.Events.Count == 1, "ErrorCount-zero event count");
+            Assert(result.Events[0].ErrorCount == 0, "ErrorCount-zero value");
+        }
+
+        // Test 3d: ErrorCount with malformed payload defaults to 0.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("\x1b]633;E;not-a-number");
+            Assert(result.Events.Count == 1, "ErrorCount-bad event count");
+            Assert(result.Events[0].ErrorCount == 0, "ErrorCount-bad defaults to 0");
+        }
+
         // Test 4: Mixed output + OSC
         {
             var parser = new OscParser();

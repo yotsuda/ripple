@@ -9,6 +9,9 @@ namespace Ripple.Services;
 ///   B = CommandInputStart
 ///   C = CommandExecuted
 ///   D;{exitCode} = CommandFinished
+///   E;{errorCount} = ErrorsThisPipeline (PowerShell $Error.Count delta;
+///                    surfaced as "Errors: N" in the proxy status line
+///                    when N &gt; 0; ripple-specific extension).
 ///   P;Cwd={path} = Property (cwd)
 /// </summary>
 public class OscParser
@@ -27,7 +30,7 @@ public class OscParser
     /// exact order the shell wrote them, instead of feeding everything then
     /// flushing events (which loses positional information).
     /// </summary>
-    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0);
+    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0);
 
     public enum OscEventType
     {
@@ -36,6 +39,11 @@ public class OscParser
         CommandExecuted,
         CommandFinished,
         Cwd,
+        // Ripple-specific extension: PowerShell's prompt fn emits this with
+        // the $Error.Count delta over the just-finished pipeline. Worker
+        // captures the latest value into the snapshot so the proxy can
+        // render `Errors: N` in the status line.
+        ErrorCount,
     }
 
     public record ParseResult(string Cleaned, List<OscEvent> Events);
@@ -134,6 +142,7 @@ public class OscParser
             'B' => new OscEvent(OscEventType.CommandInputStart),
             'C' => new OscEvent(OscEventType.CommandExecuted),
             'D' => new OscEvent(OscEventType.CommandFinished, data != null && int.TryParse(data, out var ec) ? ec : 0),
+            'E' => new OscEvent(OscEventType.ErrorCount, ErrorCount: data != null && int.TryParse(data, out var n) ? n : 0),
             'P' when data != null && data.StartsWith("Cwd=") => new OscEvent(OscEventType.Cwd, Cwd: data[4..]),
             _ => null,
         };
