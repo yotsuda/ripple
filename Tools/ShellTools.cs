@@ -1,6 +1,7 @@
 using ModelContextProtocol.Server;
 using System.ComponentModel;
 using System.Text;
+using System.Text.RegularExpressions;
 using Ripple.Services;
 
 namespace Ripple.Tools;
@@ -8,6 +9,24 @@ namespace Ripple.Tools;
 [McpServerToolType]
 public class ShellTools
 {
+    // SGR escape sequence: ESC [ {params} m. Used for color / bold /
+    // reverse video, etc. Stripping this — via the opt-in strip_ansi
+    // parameter on execute_command / wait_for_completion — trades
+    // visual fidelity for token savings when an AI caller has no use
+    // for color and just wants the text content. Deliberately NARROW:
+    // other CSI sequences (cursor movement, line erase) should already
+    // have been consumed by the renderer grid upstream; anything that
+    // survives in command output is the SGR the finalizer attached as
+    // cell prefixes. Compile-once + RegexOptions.Compiled keeps the
+    // matcher fast on repeated calls; the pattern has no alternation
+    // or backrefs so AOT is happy without [GeneratedRegex] + partial.
+    private static readonly Regex s_sgrPattern = new(
+        @"\x1b\[[0-9;]*m",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static string StripAnsi(string s) =>
+        string.IsNullOrEmpty(s) ? s : s_sgrPattern.Replace(s, "");
+
     [McpServerTool]
     [Description("Open a visible terminal window. The user can see and type in this terminal; AI commands sent via execute_command will also appear here in real time. If a standby console of the requested shell already exists it is reused unless `reason` is provided. Multiple shell types can be active simultaneously. Every response also reports the busy / finished / closed state of any other consoles you have open so background work stays visible.")]
     public static async Task<string> StartConsole(
@@ -54,6 +73,8 @@ public class ShellTools
         string shell,
         [Description("Timeout in seconds (0-170, default: 30). On timeout, execution continues in the background and output is cached for wait_for_completion. The timeout response includes a partialOutput snapshot so you can diagnose immediately. Increase for known long-running commands (builds, module imports). Use 0 for commands that block on user interaction (pause, Read-Host, read -p) — ripple flips to cache mode as soon as the pipeline is on the PTY so execute_command returns without blocking on the human key press, and the result is drained on the next tool call.")]
         int timeout_seconds = 30,
+        [Description("Strip ANSI SGR (color / bold / reverse-video) escape sequences from the command output before returning. Default false — the visible console keeps colors regardless of this flag (ripple's shared-console model deliberately preserves them for human viewing). Set true to save tokens when the AI caller only needs the text content. Narrow strip: other control sequences (cursor movement, OSC hyperlinks) are already consumed by the renderer and not affected. Only acts on this call's response; cached results drained via wait_for_completion carry their own strip_ansi flag.")]
+        bool strip_ansi = false,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
@@ -70,7 +91,10 @@ public class ShellTools
             var cmd = CommandTracker.TruncateForStatusLine(result.Command);
             var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {cmd}\nRelated tools (try in this order): peek_console (see what the console is showing right now), send_input (if peek reveals an interactive prompt / pager / stuck TUI), wait_for_completion (if the command is just long-running)";
             if (!string.IsNullOrEmpty(result.PartialOutput))
-                response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{result.PartialOutput}";
+            {
+                var partial = strip_ansi ? StripAnsi(result.PartialOutput) : result.PartialOutput;
+                response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{partial}";
+            }
             else
                 response = header;
         }
@@ -79,7 +103,10 @@ public class ShellTools
         else
         {
             var statusLine = FormatStatusLine(result);
-            response = $"{statusLine}\n\n{(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}";
+            var body = string.IsNullOrEmpty(result.Output) ? "(no output)"
+                     : strip_ansi ? StripAnsi(result.Output)
+                     : result.Output;
+            response = $"{statusLine}\n\n{body}";
         }
 
         // A routing notice (e.g. "source console was moved by user, your
@@ -98,6 +125,8 @@ public class ShellTools
         ConsoleManager consoleManager,
         [Description("Maximum seconds to wait (default: 30)")]
         int timeout_seconds = 30,
+        [Description("Strip ANSI SGR escape sequences from each drained result's output. Default false. Same semantics as execute_command's strip_ansi: text content only, no cursor/OSC impact, visible console keeps colors regardless.")]
+        bool strip_ansi = false,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
         CancellationToken cancellationToken = default)
@@ -114,7 +143,10 @@ public class ShellTools
         {
             sb.AppendLine(!string.IsNullOrEmpty(r.StatusLine) ? r.StatusLine : FormatStatusLine(r));
             sb.AppendLine();
-            sb.AppendLine(string.IsNullOrEmpty(r.Output) ? "(no output)" : r.Output);
+            var body = string.IsNullOrEmpty(r.Output) ? "(no output)"
+                     : strip_ansi ? StripAnsi(r.Output)
+                     : r.Output;
+            sb.AppendLine(body);
             sb.AppendLine();
         }
 
