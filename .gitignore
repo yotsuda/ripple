@@ -6,3 +6,8 @@ dist/
 test-cmd.md
 scratch/
 *.tgz
+# Holds work-in-progress adapters / files that were pulled out of a
+# release cycle and parked for the next one. Contents are transient
+# (moved back into tracking when ready) so the dir should never show
+# up in `git status`.
+.stash-next-release/
