@@ -24,7 +24,7 @@ public static class AdapterLoaderTests
 
         // Load errors are a hard fail — they mean a shipped adapter is broken.
         Assert(report.ParseErrors.Count == 0,
-            $"no parse errors (got {report.ParseErrors.Count}: {string.Join("; ", report.ParseErrors.Select(e => $"{e.Resource}: {e.Error}"))})");
+            $"no parse errors (got {report.ParseErrors.Count}: {string.Join("; ", report.ParseErrors.Select(e => $"[{e.Source}] {e.Resource}: {e.Error}"))})");
 
         Assert(report.Collisions.Count == 0,
             $"no name collisions (got {report.Collisions.Count}: {string.Join("; ", report.Collisions)})");

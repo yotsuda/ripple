@@ -39,7 +39,88 @@ public class Adapter
     /// the full content of ShellIntegration/integration.{ps1,bash,zsh}.
     /// </summary>
     public string? IntegrationScript { get; set; }
+
+    /// <summary>
+    /// Load provenance, set by <see cref="AdapterRegistry"/> at registration
+    /// time. "embedded" for adapters compiled into the ripple binary,
+    /// "external" for YAMLs loaded from the user's override directory
+    /// (see <see cref="AdapterRegistry.DefaultExternalDirectory"/>).
+    /// Exposed via the list_adapters MCP tool so AI consumers can tell
+    /// whether a given adapter came from the binary itself or from a
+    /// user-dropped override file.
+    /// </summary>
+    public string Source { get; set; } = "";
+
+    /// <summary>
+    /// Resolve the executable that <c>start_console</c> / <c>execute_command</c>
+    /// would actually launch when the adapter is selected via its
+    /// <see cref="Name"/>. Precedence mirrors
+    /// <see cref="ConsoleWorker"/>'s launch path:
+    ///   1. Each entry in <see cref="ProcessSpec.ExecutableCandidates"/>
+    ///      is expanded (<c>%VAR%</c>) and resolved against the registry
+    ///      PATH; the first existing file wins.
+    ///   2. <see cref="ProcessSpec.Executable"/> is expanded and resolved.
+    ///   3. The adapter <see cref="Name"/> itself is resolved via PATH +
+    ///      PATHEXT.
+    /// Returned <see cref="LaunchResolution.ResolvedPath"/> is a rooted,
+    /// existing file or null. <see cref="LaunchResolution.Attempted"/>
+    /// lists every raw candidate tried so list_adapters can show "all
+    /// these were checked, none exist" when resolution fails.
+    /// </summary>
+    public LaunchResolution ResolveLaunchExecutable()
+    {
+        var attempted = new List<string>();
+
+        if (Process.ExecutableCandidates is { Count: > 0 } candidates)
+        {
+            foreach (var raw in candidates)
+            {
+                attempted.Add(raw);
+                var expanded = Environment.ExpandEnvironmentVariables(raw);
+                var resolved = ConsoleManager.ResolveShellPath(expanded);
+                if (File.Exists(resolved))
+                    return new LaunchResolution(resolved, raw, attempted, Path.IsPathRooted(raw) ? "executable_candidates_rooted" : "executable_candidates_path");
+            }
+            // fall through — no candidate existed
+        }
+
+        if (!string.IsNullOrEmpty(Process.Executable))
+        {
+            attempted.Add(Process.Executable);
+            var expanded = Environment.ExpandEnvironmentVariables(Process.Executable);
+            var resolved = ConsoleManager.ResolveShellPath(expanded);
+            if (File.Exists(resolved))
+                return new LaunchResolution(resolved, Process.Executable, attempted, "executable");
+        }
+
+        // Final fallback: the adapter name itself, matching the default
+        // code path when neither Executable nor ExecutableCandidates are
+        // set.
+        attempted.Add(Name);
+        var nameResolved = ConsoleManager.ResolveShellPath(Name);
+        if (Path.IsPathRooted(nameResolved) && File.Exists(nameResolved))
+            return new LaunchResolution(nameResolved, Name, attempted, "name");
+
+        return new LaunchResolution(null, null, attempted, "unresolved");
+    }
 }
+
+/// <summary>
+/// Result of <see cref="Adapter.ResolveLaunchExecutable"/>. When
+/// <see cref="ResolvedPath"/> is null the adapter name is not on PATH
+/// and no <c>executable_candidates</c> / <c>executable</c> override
+/// produced an existing file — <c>start_console</c> with that shell
+/// would fail with ERROR_FILE_NOT_FOUND.
+/// </summary>
+/// <param name="ResolvedPath">Absolute path to the launchable binary, or null if resolution failed.</param>
+/// <param name="PickedRaw">The raw candidate string (before env-var expansion) that resolved, or null.</param>
+/// <param name="Attempted">Every candidate tried, in order, up to and including the one that resolved.</param>
+/// <param name="Strategy">Which precedence branch produced the result: <c>executable_candidates_*</c> / <c>executable</c> / <c>name</c> / <c>unresolved</c>.</param>
+public record LaunchResolution(
+    string? ResolvedPath,
+    string? PickedRaw,
+    IReadOnlyList<string> Attempted,
+    string Strategy);
 
 public class ProcessSpec
 {

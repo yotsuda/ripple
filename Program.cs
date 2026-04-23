@@ -25,12 +25,41 @@ public class Program
         // constructors. Failures are non-fatal — we log and continue with
         // the existing hardcoded shell paths still intact as fallback.
         var (registry, adapterReport) = AdapterRegistry.LoadDefault();
-        AdapterRegistry.SetDefault(registry);
-        bool isWorkerMode = args.Contains("--console");
-        if (!isWorkerMode || adapterReport.HasErrors)
+        AdapterRegistry.SetDefault(registry, adapterReport);
+        // Two-tier stderr policy.
+        //
+        // CLI modes (--test, --adapter-tests, --list-adapters, etc.) —
+        // a human is reading the terminal. Print the full summary as
+        // before so ad-hoc runs retain the startup-state roll-up.
+        //
+        // Silent modes (MCP stdio server with no args, ConPTY worker
+        // via --console) — no human watching stderr in the moment.
+        // Split the report:
+        //   - User-actionable issues (parse errors / collisions that
+        //     involve an EXTERNAL YAML the user dropped in
+        //     ~/.ripple/adapters) still print as WARNING, because the
+        //     user is the only one who can fix them and silently
+        //     swallowing the failure leaves them confused about why
+        //     their override isn't working.
+        //   - Embedded-only failures (ripple bugs the user cannot fix)
+        //     and routine info (the "N loaded (...)" roll-up,
+        //     overrides) stay off the wire. AI consumers that need the
+        //     full picture call the list_adapters MCP tool, whose
+        //     response carries every parse error / collision / override
+        //     with its user-actionable flag.
+        //   - Use-site failures (start_console / execute_command against
+        //     an adapter that failed to load) surface at the point of
+        //     use as the MCP tool response error — that's where the
+        //     problem actually matters to the caller.
+        bool isSilentMode = args.Length == 0 || args.Contains("--console");
+        if (!isSilentMode)
         {
             var level = adapterReport.HasErrors ? "WARNING" : "info";
             Console.Error.WriteLine($"[ripple adapters {level}] {adapterReport.Summary()}");
+        }
+        else if (adapterReport.HasUserActionableIssues)
+        {
+            Console.Error.WriteLine($"[ripple adapters WARNING] {adapterReport.UserActionableSummary()}");
         }
 
         // --console mode: run as ConPTY console worker process
@@ -154,7 +183,8 @@ public class Program
             .AddMcpServer()
             .WithStdioServerTransport()
             .WithTools<ShellTools>()
-            .WithTools<FileTools>();
+            .WithTools<FileTools>()
+            .WithTools<AdapterTools>();
 
         var host = builder.Build();
 
@@ -203,16 +233,16 @@ public class Program
         if (report.ParseErrors.Count > 0)
         {
             Console.WriteLine("Parse errors:");
-            foreach (var (resource, error) in report.ParseErrors)
-                Console.WriteLine($"  {resource}: {error}");
+            foreach (var e in report.ParseErrors)
+                Console.WriteLine($"  [{e.Source.ToString().ToLowerInvariant()}] {e.Resource}: {e.Error}");
             Console.WriteLine();
         }
 
         if (report.Collisions.Count > 0)
         {
             Console.WriteLine("Collisions:");
-            foreach (var line in report.Collisions)
-                Console.WriteLine($"  {line}");
+            foreach (var c in report.Collisions)
+                Console.WriteLine($"  {c.Message}{(c.IsUserActionable ? " (user-actionable)" : "")}");
             Console.WriteLine();
         }
 

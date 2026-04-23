@@ -20,7 +20,20 @@ public sealed class AdapterRegistry
     /// </summary>
     public static AdapterRegistry? Default { get; private set; }
 
-    public static void SetDefault(AdapterRegistry registry) => Default = registry;
+    /// <summary>
+    /// Load report that accompanied the <see cref="Default"/> registry.
+    /// Captured alongside so the list_adapters MCP tool can surface
+    /// parse errors, collisions, and external-over-embedded overrides
+    /// without re-running the load. Null until Program.cs calls
+    /// SetDefault.
+    /// </summary>
+    public static LoadReport? DefaultReport { get; private set; }
+
+    public static void SetDefault(AdapterRegistry registry, LoadReport? report = null)
+    {
+        Default = registry;
+        DefaultReport = report;
+    }
 
     private AdapterRegistry(Dictionary<string, Adapter> byName)
     {
@@ -64,9 +77,9 @@ public sealed class AdapterRegistry
     {
         var byName = new Dictionary<string, Adapter>(StringComparer.OrdinalIgnoreCase);
         var loadedOrigins = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var collisions = new List<string>();
+        var collisions = new List<Collision>();
         var overrides = new List<string>();
-        var parseErrors = new List<(string Resource, string Error)>();
+        var parseErrors = new List<AdapterLoader.ParseError>();
 
         foreach (var source in sources)
         {
@@ -93,7 +106,18 @@ public sealed class AdapterRegistry
                     }
                     else
                     {
-                        collisions.Add($"adapter name '{adapter.Name}' from {originLabel} collides with existing registration ({existingOrigin})");
+                        // A collision is user-actionable whenever an external
+                        // YAML is involved on either side: the user dropped
+                        // the duplicate in ~/.ripple/adapters and can fix it
+                        // by renaming or removing. Pure embedded-vs-embedded
+                        // collisions can only happen on a broken ripple
+                        // build, so the user cannot fix them — keep those
+                        // AI-facing via list_adapters only.
+                        bool userActionable =
+                            loaded.Source == AdapterLoader.AdapterSource.External ||
+                            existingOrigin.StartsWith("external:");
+                        collisions.Add(new Collision(userActionable,
+                            $"adapter name '{adapter.Name}' from {originLabel} collides with existing registration ({existingOrigin})"));
                         continue;
                     }
                 }
@@ -101,13 +125,26 @@ public sealed class AdapterRegistry
                 byName[adapter.Name] = adapter;
                 loadedOrigins[adapter.Name] = originLabel;
 
+                // Stamp load provenance onto the adapter itself so the
+                // list_adapters MCP tool (and any other consumer that
+                // holds an Adapter reference) can surface where the
+                // adapter came from without needing access to the
+                // registry's private origin map.
+                adapter.Source = loaded.Source == AdapterLoader.AdapterSource.External
+                    ? "external" : "embedded";
+
                 if (adapter.Aliases != null)
                 {
                     foreach (var alias in adapter.Aliases)
                     {
                         if (byName.TryGetValue(alias, out var aliasExisting) && !ReferenceEquals(aliasExisting, adapter))
                         {
-                            collisions.Add($"alias '{alias}' for adapter '{adapter.Name}' ({originLabel}) collides with existing registration ({loadedOrigins.GetValueOrDefault(alias, "?")})");
+                            var existingOrigin2 = loadedOrigins.GetValueOrDefault(alias, "?");
+                            bool userActionable =
+                                loaded.Source == AdapterLoader.AdapterSource.External ||
+                                existingOrigin2.StartsWith("external:");
+                            collisions.Add(new Collision(userActionable,
+                                $"alias '{alias}' for adapter '{adapter.Name}' ({originLabel}) collides with existing registration ({existingOrigin2})"));
                             continue;
                         }
                         byName[alias] = adapter;
@@ -154,13 +191,37 @@ public sealed class AdapterRegistry
 
     public int Count => _byName.Values.Distinct().Count();
 
+    /// <summary>
+    /// A name- or alias-level collision surfaced during load. <see cref="IsUserActionable"/>
+    /// is true when a file in the user's external adapter directory is
+    /// involved on at least one side of the clash — the user can fix it
+    /// by renaming or removing that YAML. Pure embedded-vs-embedded
+    /// collisions cannot happen in a correctly shipped ripple build, so
+    /// those are flagged false and kept off the silent-mode stderr.
+    /// </summary>
+    public record Collision(bool IsUserActionable, string Message);
+
     public record LoadReport(
         IReadOnlyList<string> Loaded,
-        IReadOnlyList<(string Resource, string Error)> ParseErrors,
-        IReadOnlyList<string> Collisions,
+        IReadOnlyList<AdapterLoader.ParseError> ParseErrors,
+        IReadOnlyList<Collision> Collisions,
         IReadOnlyList<string> Overrides)
     {
         public bool HasErrors => ParseErrors.Count > 0 || Collisions.Count > 0;
+
+        /// <summary>
+        /// True when at least one parse error or collision involves an
+        /// external YAML (the user's own ~/.ripple/adapters file).
+        /// Those are the issues the user can act on, so silent-mode
+        /// (MCP server / worker) emits only this subset on stderr —
+        /// embedded-only failures are ripple bugs the user cannot fix,
+        /// and firing them at every AI prompt is noise with no path to
+        /// resolution. The AI can still inspect everything via the
+        /// list_adapters MCP tool.
+        /// </summary>
+        public bool HasUserActionableIssues =>
+            ParseErrors.Any(e => e.Source == AdapterLoader.AdapterSource.External)
+            || Collisions.Any(c => c.IsUserActionable);
 
         public string Summary()
         {
@@ -173,7 +234,27 @@ public sealed class AdapterRegistry
             if (ParseErrors.Count > 0)
                 parts.Add($"{ParseErrors.Count} parse error(s): {string.Join("; ", ParseErrors.Select(e => $"{e.Resource}: {e.Error}"))}");
             if (Collisions.Count > 0)
-                parts.Add($"{Collisions.Count} collision(s): {string.Join("; ", Collisions)}");
+                parts.Add($"{Collisions.Count} collision(s): {string.Join("; ", Collisions.Select(c => c.Message))}");
+            return string.Join(" | ", parts);
+        }
+
+        /// <summary>
+        /// Compact user-actionable summary, used by silent-mode stderr
+        /// when at least one external-involved issue fired. Leaves out
+        /// the happy-path "N loaded" roll-up and the noise-level
+        /// embedded-only issues.
+        /// </summary>
+        public string UserActionableSummary()
+        {
+            var parts = new List<string>();
+            var userParseErrors = ParseErrors
+                .Where(e => e.Source == AdapterLoader.AdapterSource.External)
+                .ToList();
+            var userCollisions = Collisions.Where(c => c.IsUserActionable).ToList();
+            if (userParseErrors.Count > 0)
+                parts.Add($"{userParseErrors.Count} external parse error(s): {string.Join("; ", userParseErrors.Select(e => $"{e.Resource}: {e.Error}"))}");
+            if (userCollisions.Count > 0)
+                parts.Add($"{userCollisions.Count} external collision(s): {string.Join("; ", userCollisions.Select(c => c.Message))}");
             return string.Join(" | ", parts);
         }
     }

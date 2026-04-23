@@ -69,7 +69,7 @@ public static class AdapterLoader
     {
         var assembly = Assembly.GetExecutingAssembly();
         var adapters = new List<LoadedAdapter>();
-        var errors = new List<(string Resource, string Error)>();
+        var errors = new List<ParseError>();
 
         foreach (var resourceName in assembly.GetManifestResourceNames())
         {
@@ -90,7 +90,7 @@ public static class AdapterLoader
             }
             catch (Exception ex)
             {
-                errors.Add((resourceName, ex.Message));
+                errors.Add(new ParseError(AdapterSource.Embedded, resourceName, ex.Message));
             }
         }
 
@@ -114,7 +114,7 @@ public static class AdapterLoader
     public static LoadResult LoadFromDirectory(string directory)
     {
         var adapters = new List<LoadedAdapter>();
-        var errors = new List<(string Resource, string Error)>();
+        var errors = new List<ParseError>();
 
         if (!Directory.Exists(directory))
             return new LoadResult(adapters, errors);
@@ -132,7 +132,7 @@ public static class AdapterLoader
             }
             catch (Exception ex)
             {
-                errors.Add((filePath, ex.Message));
+                errors.Add(new ParseError(AdapterSource.External, filePath, ex.Message));
             }
         }
 
@@ -190,7 +190,16 @@ public static class AdapterLoader
 
     public record LoadedAdapter(Adapter Adapter, AdapterSource Source, string Origin);
 
+    /// <summary>
+    /// A single parse failure from a load attempt. <see cref="Source"/>
+    /// is carried through so downstream callers (LoadReport consumers,
+    /// silent-mode stderr gates) can split user-actionable failures
+    /// (external YAML the user dropped) from internal ones (embedded
+    /// YAML compiled into the binary — a ripple bug the user can't fix).
+    /// </summary>
+    public record ParseError(AdapterSource Source, string Resource, string Error);
+
     public record LoadResult(
         IReadOnlyList<LoadedAdapter> Adapters,
-        IReadOnlyList<(string Resource, string Error)> Errors);
+        IReadOnlyList<ParseError> Errors);
 }
