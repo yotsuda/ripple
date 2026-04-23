@@ -174,10 +174,12 @@ function global:prompt {
                 }
             }
             if ($errDelta -gt $__rp_emitLimit) {
-                $__rp_trunc = [Convert]::ToBase64String(
-                    [Text.Encoding]::UTF8.GetBytes(
-                        "[... $($errDelta - $__rp_emitLimit) newer error record(s) truncated ...]"))
-                $prefix += (__rp_osc_str "R;$__rp_trunc")
+                # OSC T: how many newer error records were dropped from
+                # the cap. Distinct from R so the proxy can render this
+                # as list metadata (header "20 of 25" + trailing "5
+                # truncated" note) instead of forcing the marker into
+                # the numbered entry list as if it were error #21.
+                $prefix += (__rp_osc_str "T;$($errDelta - $__rp_emitLimit)")
             }
         }
 

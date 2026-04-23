@@ -117,6 +117,27 @@ public class OscParserTests
             Assert(result.Events[0].ErrorMessage == null, "ErrorMessage-bad value is null");
         }
 
+        // Test 3i: TruncatedErrorCount (OSC 633;T;{N}) — emitted by
+        // the integration script when its R cap was hit. Distinct
+        // from R so the proxy can render truncation as list metadata
+        // instead of as a phantom error entry.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("]633;T;5");
+            Assert(result.Events.Count == 1, "TruncatedErrorCount event count");
+            Assert(result.Events[0].Type == OscParser.OscEventType.TruncatedErrorCount, "TruncatedErrorCount type");
+            Assert(result.Events[0].TruncatedErrorCount == 5, "TruncatedErrorCount value");
+        }
+
+        // Test 3j: TruncatedErrorCount with malformed payload defaults to 0.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("]633;T;not-a-number");
+            Assert(result.Events.Count == 1, "TruncatedErrorCount-bad event count");
+            Assert(result.Events[0].TruncatedErrorCount == 0, "TruncatedErrorCount-bad defaults to 0");
+        }
+
+
 
         // Test 4: Mixed output + OSC
         {

@@ -196,8 +196,17 @@ public sealed record CompletedCommandSnapshot(
     // pipeline added, decoded from OSC 633;R;{base64} payloads in the
     // order the integration script emitted them. Empty for non-pwsh
     // adapters and for pwsh pipelines that produced no errors; capped
-    // by the integration script at 20 entries with a truncation marker
-    // in the 21st slot. The proxy renders these as a structured
-    // `--- errors ---` section after the main output so the AI can
-    // consume error text without parsing SGR-coloured inline spans.
-    IReadOnlyList<string>? ErrorMessages = null);
+    // by the integration script at 20 entries (with the dropped count
+    // surfaced separately via TruncatedErrorCount). The proxy renders
+    // these as a structured `--- errors ---` section after the main
+    // output so the AI can consume error text without parsing
+    // SGR-coloured inline spans.
+    IReadOnlyList<string>? ErrorMessages = null,
+    // PowerShell-specific: how many $Error records the integration
+    // script DROPPED from the R stream because its per-command cap was
+    // hit. Always 0 when ErrorMessages.Count <= cap; positive when the
+    // pipeline produced more errors than the cap. The proxy renders
+    // this as `(N of total)` in the section header plus a trailing
+    // "X newer error record(s) truncated" note — separate from the
+    // numbered error entries so the marker isn't misread as error #21.
+    int TruncatedErrorCount = 0);

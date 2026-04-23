@@ -146,6 +146,10 @@ public class CommandTracker
     // snapshot at command end. Empty for non-pwsh adapters (they emit
     // no R events) and for pwsh commands that produced no errors.
     private List<string>? _errorMessages;
+    // Number of $Error records the integration script dropped from the
+    // OSC R stream when its per-command cap was hit (OSC 633;T;N). Stays
+    // at 0 when no truncation occurred or the adapter emits no T event.
+    private int _truncatedErrorCount;
     private string? _cwd;
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
@@ -382,6 +386,7 @@ public class CommandTracker
             _errorCount = 0;
             _lastExitCode = 0;
             _errorMessages = null;
+            _truncatedErrorCount = 0;
             _cwd = null;
             _commandSent = registration.CommandText;
             _registeredShellFamily = registration.ShellFamily;
@@ -648,6 +653,18 @@ public class CommandTracker
                     }
                     break;
 
+                case OscParser.OscEventType.TruncatedErrorCount:
+                    // OSC T: integration script reports how many error
+                    // records were dropped beyond its per-command cap.
+                    // Latest-write-wins (the integration emits at most
+                    // one T per pipeline). Negative payload defends
+                    // against a malformed value reaching this field —
+                    // floor at 0 so the proxy renderer never sees a
+                    // nonsensical "(N of -1)" header.
+                    if (evt.TruncatedErrorCount > 0)
+                        _truncatedErrorCount = evt.TruncatedErrorCount;
+                    break;
+
                 case OscParser.OscEventType.PromptStart:
                     // Only treat OSC A as the end of an AI command when we
                     // actually saw a command cycle — both OSC C (command
@@ -889,7 +906,8 @@ public class CommandTracker
             VtBaseline: _capturedBaselineSnapshot,
             ErrorCount: _errorCount,
             LastExitCode: _lastExitCode,
-            ErrorMessages: _errorMessages);
+            ErrorMessages: _errorMessages,
+            TruncatedErrorCount: _truncatedErrorCount);
 
         // Hand the inline caller (if still attached) the snapshot
         // directly; the worker's shared finalize-once path consumes

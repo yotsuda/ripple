@@ -1044,6 +1044,7 @@ public class ConsoleManager
             var errorCount = response.TryGetProperty("errorCount", out var ecProp) && ecProp.ValueKind == JsonValueKind.Number ? ecProp.GetInt32() : 0;
             var lastExitCode = response.TryGetProperty("lastExitCode", out var lecProp) && lecProp.ValueKind == JsonValueKind.Number ? lecProp.GetInt32() : 0;
             var errorMessages = ParseErrorMessages(response);
+            var truncatedErrorCount = response.TryGetProperty("truncatedErrorCount", out var tecProp) && tecProp.ValueKind == JsonValueKind.Number ? tecProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var spillPath = response.TryGetProperty("spillFilePath", out var spProp) ? spProp.GetString() : null;
@@ -1073,6 +1074,7 @@ public class ConsoleManager
                 ErrorCount = errorCount,
                 LastExitCode = lastExitCode,
                 ErrorMessages = errorMessages,
+                TruncatedErrorCount = truncatedErrorCount,
                 Duration = duration,
                 Command = command,
                 DisplayName = displayName2,
@@ -1765,6 +1767,7 @@ public class ConsoleManager
                         ErrorCount = entry.TryGetProperty("errorCount", out var ecnt) && ecnt.ValueKind == JsonValueKind.Number ? ecnt.GetInt32() : 0,
                         LastExitCode = entry.TryGetProperty("lastExitCode", out var lec2) && lec2.ValueKind == JsonValueKind.Number ? lec2.GetInt32() : 0,
                         ErrorMessages = ParseErrorMessages(entry),
+                        TruncatedErrorCount = entry.TryGetProperty("truncatedErrorCount", out var tec2) && tec2.ValueKind == JsonValueKind.Number ? tec2.GetInt32() : 0,
                         Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
                         DisplayName = displayName,
@@ -2476,6 +2479,11 @@ public class ConsoleManager
         // `--- errors ---` section in the proxy's response after
         // the main output.
         public IReadOnlyList<string> ErrorMessages { get; set; } = Array.Empty<string>();
+        // How many $Error records were dropped beyond the integration
+        // script's per-command cap (PowerShell only, via OSC 633;T).
+        // 0 when no truncation occurred. Surfaced by the proxy as
+        // `(N of total)` in the section header plus a trailing line.
+        public int TruncatedErrorCount { get; set; }
         public string Duration { get; set; } = "0";
         public string? Command { get; set; }
         public string? DisplayName { get; set; }

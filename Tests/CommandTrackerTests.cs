@@ -1194,6 +1194,47 @@ public class CommandTrackerTests
                 "errmsgs-reset: second snapshot does NOT inherit the first snapshot's error list");
         }
 
+        // OSC T (TruncatedErrorCount) flows through into the snapshot
+        // alongside the R-derived ErrorMessages list. Cap-side gating
+        // lives in integration.ps1; here we just verify the C# data
+        // path threads the value untouched.
+        {
+            var t = new CommandTracker();
+            var (_, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("loop with many errors"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 1));
+            t.HandleEvent(ErrEvt("first"));
+            t.HandleEvent(ErrEvt("second"));
+            // Integration script emits this when its 20-entry cap drops 5.
+            t.HandleEvent(new OscParser.OscEvent(
+                OscParser.OscEventType.TruncatedErrorCount,
+                TruncatedErrorCount: 5));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            var snap = task.Result;
+            Assert(snap.TruncatedErrorCount == 5, "trunc: count threaded into snapshot");
+            Assert(snap.ErrorMessages?.Count == 2, "trunc: R list still populated alongside T");
+        }
+
+        // Negative / zero TruncatedErrorCount payloads are floored to 0
+        // so a malformed wire value can't produce nonsensical
+        // `(N of -1)` rendering downstream. Two events: one negative
+        // (ignored), one positive (recorded).
+        {
+            var t = new CommandTracker();
+            var (_, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("cmd"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(new OscParser.OscEvent(
+                OscParser.OscEventType.TruncatedErrorCount,
+                TruncatedErrorCount: -3));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            var snap = task.Result;
+            Assert(snap.TruncatedErrorCount == 0,
+                "trunc: negative payload floored to 0 (no nonsense rendering)");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

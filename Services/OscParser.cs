@@ -25,6 +25,13 @@ namespace Ripple.Services;
 ///                    special escaping. Surfaced as the structured
 ///                    `--- errors ---` list in the proxy response;
 ///                    PowerShell-only, ripple-specific extension.
+///   T;{N}        = TruncatedErrorCount — number of $Error records the
+///                    integration script dropped from the OSC R stream
+///                    because the per-command cap was hit. Distinct
+///                    from R so the proxy renders truncation as list
+///                    metadata (`(20 of 25)` header + trailing note)
+///                    instead of stuffing the marker into the entry
+///                    list. PowerShell-only, ripple-specific extension.
 ///   P;Cwd={path} = Property (cwd)
 /// </summary>
 public class OscParser
@@ -43,7 +50,7 @@ public class OscParser
     /// exact order the shell wrote them, instead of feeding everything then
     /// flushing events (which loses positional information).
     /// </summary>
-    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0, int LastExitCode = 0, string? ErrorMessage = null);
+    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0, int LastExitCode = 0, string? ErrorMessage = null, int TruncatedErrorCount = 0);
 
     public enum OscEventType
     {
@@ -68,6 +75,12 @@ public class OscParser
         // ToString(). Worker accumulates decoded strings into a list the
         // proxy renders as a structured `--- errors ---` section.
         ErrorMessage,
+        // Ripple-specific extension: how many $Error records were
+        // dropped from the OSC R stream by the integration-side cap.
+        // Distinct from ErrorMessage so the proxy can render truncation
+        // as list metadata (header `(N of total)` + trailing line)
+        // rather than as a phantom error entry.
+        TruncatedErrorCount,
     }
 
     public record ParseResult(string Cleaned, List<OscEvent> Events);
@@ -169,6 +182,7 @@ public class OscParser
             'E' => new OscEvent(OscEventType.ErrorCount, ErrorCount: data != null && int.TryParse(data, out var n) ? n : 0),
             'L' => new OscEvent(OscEventType.LastExitCode, LastExitCode: data != null && int.TryParse(data, out var lec) ? lec : 0),
             'R' => new OscEvent(OscEventType.ErrorMessage, ErrorMessage: DecodeBase64Utf8(data)),
+            'T' => new OscEvent(OscEventType.TruncatedErrorCount, TruncatedErrorCount: data != null && int.TryParse(data, out var trunc) ? trunc : 0),
             'P' when data != null && data.StartsWith("Cwd=") => new OscEvent(OscEventType.Cwd, Cwd: data[4..]),
             _ => null,
         };

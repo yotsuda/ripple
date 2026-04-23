@@ -260,7 +260,12 @@ public class ConsoleWorker
         // that produced no errors. Surfaced in the worker's execute
         // response as an "errorMessages" JSON array so the proxy can
         // render a structured "--- errors ---" section.
-        IReadOnlyList<string>? ErrorMessages = null);
+        IReadOnlyList<string>? ErrorMessages = null,
+        // How many $Error records were dropped beyond the integration
+        // script's cap (OSC 633;T). Surfaced in the JSON response as
+        // "truncatedErrorCount" so the proxy header can show
+        // `(N of total)` instead of just `(N)`. 0 = no truncation.
+        int TruncatedErrorCount = 0);
 
     private readonly string? _banner;
     private readonly string? _reason;
@@ -3208,6 +3213,8 @@ public class ConsoleWorker
                 foreach (var m in msgs) w.WriteStringValue(m);
                 w.WriteEndArray();
             }
+            if (result.TruncatedErrorCount > 0)
+                w.WriteNumber("truncatedErrorCount", result.TruncatedErrorCount);
             w.WriteStringOrNull("cwd", result.Cwd);
             w.WriteStringOrNull("duration", result.Duration);
             w.WriteBoolean("timedOut", false);
@@ -3422,7 +3429,8 @@ public class ConsoleWorker
                 SpillFilePath: truncation.SpillFilePath,
                 ErrorCount: snapshot.ErrorCount,
                 LastExitCode: snapshot.LastExitCode,
-                ErrorMessages: snapshot.ErrorMessages);
+                ErrorMessages: snapshot.ErrorMessages,
+                TruncatedErrorCount: snapshot.TruncatedErrorCount);
 
             // Step 6: deliver inline OR cache. Route by the snapshot's
             // InlineDeliveryId so each command hits its own TCS — a
@@ -3699,6 +3707,8 @@ public class ConsoleWorker
                     foreach (var m in drainedMsgs) w.WriteStringValue(m);
                     w.WriteEndArray();
                 }
+                if (r.TruncatedErrorCount > 0)
+                    w.WriteNumber("truncatedErrorCount", r.TruncatedErrorCount);
                 w.WriteStringOrNull("cwd", r.Cwd);
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);

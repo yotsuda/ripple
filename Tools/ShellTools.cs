@@ -35,30 +35,52 @@ public class ShellTools
     // already appears in the status line ("Errors: N") so duplicating
     // it here is noise on the single-error path.
     //
+    // When the integration script truncated some error records (because
+    // its per-command cap was hit), the section header shows
+    // `(N of total)` where N is what we got and total is N + dropped,
+    // and a trailing line restates how many newer records were dropped.
+    // The marker is rendered OUTSIDE the numbered entry list so it
+    // can't be misread as error #N+1 — that was a design smell the
+    // initial OSC 633;R-only encoding had.
+    //
     // This is complementary to the SGR-coloured inline error text in
     // the main output: the inline path preserves the visible-console
     // fidelity the user sees, and this section gives the AI a clean
     // parseable list (especially valuable when strip_ansi=true removed
     // the SGR span cues the AI would otherwise use to pick error lines
     // out of stdout).
-    private static string FormatErrorsSection(IReadOnlyList<string>? messages)
+    private static string FormatErrorsSection(IReadOnlyList<string>? messages, int truncatedCount = 0)
     {
-        if (messages is null || messages.Count == 0) return "";
+        if ((messages is null || messages.Count == 0) && truncatedCount == 0) return "";
         var sb = new StringBuilder();
+        var shown = messages?.Count ?? 0;
         sb.Append("\n\n--- errors (");
-        sb.Append(messages.Count);
-        sb.Append(") ---\n");
-        if (messages.Count == 1)
+        if (truncatedCount > 0)
         {
-            sb.Append(messages[0]);
+            sb.Append(shown).Append(" of ").Append(shown + truncatedCount);
         }
         else
         {
-            for (int i = 0; i < messages.Count; i++)
+            sb.Append(shown);
+        }
+        sb.Append(") ---\n");
+        if (shown == 1 && truncatedCount == 0)
+        {
+            sb.Append(messages![0]);
+        }
+        else if (shown > 0)
+        {
+            for (int i = 0; i < shown; i++)
             {
-                sb.Append('[').Append(i + 1).Append("] ").Append(messages[i]);
-                if (i < messages.Count - 1) sb.Append('\n');
+                sb.Append('[').Append(i + 1).Append("] ").Append(messages![i]);
+                if (i < shown - 1) sb.Append('\n');
             }
+        }
+        if (truncatedCount > 0)
+        {
+            if (shown > 0) sb.Append('\n');
+            sb.Append("... ").Append(truncatedCount)
+              .Append(" newer error record(s) truncated.");
         }
         return sb.ToString();
     }
@@ -142,7 +164,7 @@ public class ShellTools
             var body = string.IsNullOrEmpty(result.Output) ? "(no output)"
                      : strip_ansi ? StripAnsi(result.Output)
                      : result.Output;
-            response = $"{statusLine}\n\n{body}{FormatErrorsSection(result.ErrorMessages)}";
+            response = $"{statusLine}\n\n{body}{FormatErrorsSection(result.ErrorMessages, result.TruncatedErrorCount)}";
         }
 
         // A routing notice (e.g. "source console was moved by user, your
@@ -183,7 +205,7 @@ public class ShellTools
                      : strip_ansi ? StripAnsi(r.Output)
                      : r.Output;
             sb.AppendLine(body);
-            var errSection = FormatErrorsSection(r.ErrorMessages);
+            var errSection = FormatErrorsSection(r.ErrorMessages, r.TruncatedErrorCount);
             if (errSection.Length > 0) sb.Append(errSection);
             sb.AppendLine();
         }
