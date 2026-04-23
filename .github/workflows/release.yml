@@ -3,9 +3,17 @@ name: Release
 # Triggered only by tag pushes matching v*. The release environment's
 # deployment_branch_policy further restricts execution to tag refs
 # matching v*; subscribed environment reviewers must approve before
-# the publish job runs. Build jobs do NOT require approval (they
-# produce unsigned artifacts that are useless without the publish
-# step's signing + npm push), so review friction is one-time.
+# each job that deploys to the environment. Build jobs do NOT touch
+# the environment (they produce unsigned artifacts) — the two gates
+# are on sign-windows (Azure KV code-signing cert access) and publish
+# (npm publish + GitHub release creation). The approvals are
+# intentional: the two operations guard distinct sensitive assets
+# (private key vs. registry credentials) and gating them separately
+# means a compromised Azure path can't ride an already-approved
+# publish slot (and vice-versa). Removing either gate would require
+# either demoting NPM_TOKEN from env secret to repo secret (exposes
+# it to every workflow) or re-scoping Azure federated credential
+# from environment-subject to ref-subject.
 on:
   push:
     tags:
@@ -68,7 +76,7 @@ jobs:
           "./dist/${{ matrix.exe }}" --test
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ripple-${{ matrix.platform }}
           path: dist/${{ matrix.exe }}
@@ -92,13 +100,13 @@ jobs:
 
     steps:
       - name: Download win32-x64 artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: ripple-win32-x64
           path: win32-x64
 
       - name: Azure OIDC login
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -135,7 +143,7 @@ jobs:
           Write-Host "Signed OK (thumbprint: $($sig.SignerCertificate.Thumbprint))"
 
       - name: Upload signed win32-x64 artifact (overwrites unsigned)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ripple-win32-x64
           path: win32-x64/ripple.exe
@@ -184,7 +192,7 @@ jobs:
       # by the sign-windows job) alongside the unsigned linux-x64 and
       # darwin-arm64 artifacts from the build job.
       - name: Download all platform binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
