@@ -2943,6 +2943,18 @@ public class ConsoleWorker
         // editor). The hold gate operates at ripple's own forwarding
         // layer, above the shell, so it works universally.
         _holdUserInput = true;
+        // From here to the end of the method, any early return calls
+        // ReleaseHeldUserInput explicitly (before building the response,
+        // so the shell gets a head start on replaying held keystrokes).
+        // The outer try/finally is purely a safety net: if WriteToPty,
+        // the race await, or any other code below throws without
+        // reaching an explicit release, the finally un-sticks the hold
+        // gate so the next user keystroke is not silently buffered into
+        // a queue that nobody will ever drain. ReleaseHeldUserInput is
+        // idempotent (flag→false, drain-queue-until-empty), so the
+        // duplicate call on the happy path is a no-op.
+        try
+        {
 
         // Legacy clear_line: still useful as a belt-and-suspenders
         // defense for characters that slipped into the line editor
@@ -3096,6 +3108,18 @@ public class ConsoleWorker
         }
         ReleaseHeldUserInput();
         return await BuildExecuteSuccessResponseAsync(result, ct);
+
+        }
+        finally
+        {
+            // Safety net — see the comment at _holdUserInput = true
+            // above. Explicit release is called on every happy-path /
+            // expected-failure branch before this runs; the finally
+            // only does real work if an unexpected exception bypassed
+            // those paths. ReleaseHeldUserInput is idempotent so the
+            // second call on normal paths is harmless.
+            ReleaseHeldUserInput();
+        }
     }
 
     /// <summary>
