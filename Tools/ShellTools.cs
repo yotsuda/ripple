@@ -333,44 +333,18 @@ public class ShellTools
     /// Format a status line for a completed/failed command result.
     /// Includes console name, shell type, status, pipeline, duration, and location.
     /// </summary>
+    /// <summary>
+    /// Thin unpack of <see cref="ConsoleManager.ExecuteResult"/> into
+    /// the shared <see cref="StatusLineFormatter.Format"/> — see that
+    /// helper for the full rendering rules. Keeping the unpack here
+    /// (instead of teaching the formatter about the ExecuteResult
+    /// record) avoids a dependency from Services onto Tools.
+    /// </summary>
     private static string FormatStatusLine(ConsoleManager.ExecuteResult r)
-    {
-        var shell = r.ShellFamily != null ? $" ({r.ShellFamily})" : "";
-        var cwdInfo = r.Cwd != null ? $" | Location: {r.Cwd}" : "";
-        var cmd = CommandTracker.TruncateForStatusLine(r.Command);
-        // Only the pwsh adapter populates ErrorCount (via the integration
-        // script's OSC 633;E;{N}). Other adapters leave it at 0, so the
-        // segment is omitted there. Zero is also omitted for pwsh — the
-        // happy path doesn't need a "Errors: 0" tag.
-        var errInfo = r.ErrorCount > 0 ? $" | Errors: {r.ErrorCount}" : "";
-        // "LastExit: N" exposes a native exe that returned non-zero
-        // mid-pipeline when the pipeline overall succeeded. Worker only
-        // populates LastExitCode via OSC 633;L for pwsh and only when
-        // both gates are met (non-zero native exit + overall ok), so a
-        // value > 0 here is unambiguous — no extra condition needed.
-        // Omitted on ✗ Failed because `exit N` already covers it.
-        var lastExitInfo = r.LastExitCode > 0 ? $" | LastExit: {r.LastExitCode}" : "";
-
-        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
-        // worker always reports ExitCode=0 for cmd. Showing a success tick
-        // would mislead the AI into thinking every cmd command succeeded —
-        // render a neutral "Finished" line with no success/failure marker.
-        if (r.ShellFamily == "cmd")
-            return $"○ {r.DisplayName}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
-
-        // Three outcomes for shells that report exit codes:
-        //   exit != 0           → ✗ Failed
-        //   exit 0 + errCount>0 → ⚠ Completed with errors (pwsh non-terminating
-        //                         errors: the command RAN but $Error grew, so a
-        //                         green ✓ would understate what the AI needs to
-        //                         look at)
-        //   exit 0 + errCount=0 → ✓ Completed (happy path)
-        if (r.ExitCode != 0)
-            return $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}){errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
-        if (r.ErrorCount > 0)
-            return $"⚠  {r.DisplayName}{shell} | Status: Completed with errors{errInfo}{lastExitInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
-        return $"✓ {r.DisplayName}{shell} | Status: Completed{lastExitInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
-    }
+        => StatusLineFormatter.Format(
+            r.Command, r.ExitCode, r.Duration, r.Cwd,
+            r.ShellFamily, r.DisplayName,
+            r.ErrorCount, r.LastExitCode);
 
     /// <summary>
     /// Detect closed consoles, collect cached outputs, and report busy

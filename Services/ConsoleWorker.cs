@@ -3602,49 +3602,18 @@ public class ConsoleWorker
     /// having to re-join metadata from the proxy's ConsoleInfo
     /// which may have drifted since the command was registered.
     /// </summary>
+    /// <summary>
+    /// Thin passthrough to the shared <see cref="StatusLineFormatter"/>.
+    /// See that class for the rendering rules — keeping this call site
+    /// so the worker-internal callers don't depend on the Services-
+    /// layer helper type name directly.
+    /// </summary>
     private static string BuildStatusLine(
         string? command, int exitCode, string duration, string? cwd,
         string? shellFamily, string? displayName, int errorCount, int lastExitCode)
-    {
-        var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
-        var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
-        var cwdInfo = string.IsNullOrEmpty(cwd) ? "" : $" | Location: {cwd}";
-        var cmd = CommandTracker.TruncateForStatusLine(command);
-        // Only PowerShell currently emits OSC 633;E. For other adapters
-        // errorCount stays at 0 and "Errors: N" is omitted, so the line
-        // shape remains identical to before. Avoid a trivial "Errors: 0"
-        // for pwsh too — zero is the silent happy-path case and not
-        // worth a token.
-        var errInfo = errorCount > 0 ? $" | Errors: {errorCount}" : "";
-        // "LastExit: N" surfaces a native exe that returned non-zero
-        // mid-pipeline when the overall pipeline succeeded. Only populated
-        // for pwsh (OSC L emission is pwsh-only) and only when the
-        // integration script judged it worth reporting (lecChanged &
-        // non-zero & pipeline overall ok — see integration.ps1 prompt fn).
-        // Rendered only on the ✓ / ⚠ branches; omitted on ✗ Failed
-        // because `exit N` already carries the non-zero signal there.
-        var lastExitInfo = lastExitCode > 0 ? $" | LastExit: {lastExitCode}" : "";
-
-        // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
-        // worker always reports ExitCode=0 for cmd. Render a neutral
-        // "Finished" line with no success marker so the AI doesn't assume
-        // every cmd command succeeded.
-        if (shellFamily == "cmd")
-            return $"○ {identity}{shell} | Status: Finished (exit code unavailable) | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-
-        // Three outcomes for shells that report exit codes:
-        //   exit != 0           → ✗ Failed
-        //   exit 0 + errCount>0 → ⚠ Completed with errors (pwsh non-terminating
-        //                         errors: the command RAN but $Error grew, so a
-        //                         green ✓ would understate what the AI needs to
-        //                         look at)
-        //   exit 0 + errCount=0 → ✓ Completed (happy path)
-        if (exitCode != 0)
-            return $"✗ {identity}{shell} | Status: Failed (exit {exitCode}){errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-        if (errorCount > 0)
-            return $"⚠  {identity}{shell} | Status: Completed with errors{errInfo}{lastExitInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-        return $"✓ {identity}{shell} | Status: Completed{lastExitInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-    }
+        => StatusLineFormatter.Format(
+            command, exitCode, duration, cwd,
+            shellFamily, displayName, errorCount, lastExitCode);
 
     /// <summary>
     /// Release the user-input hold gate and replay any keystrokes that
