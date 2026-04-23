@@ -3205,16 +3205,7 @@ public class ConsoleWorker
         {
             w.WriteStringOrNull("output", result.Output);
             w.WriteNumber("exitCode", result.ExitCode);
-            w.WriteNumber("errorCount", result.ErrorCount);
-            if (result.LastExitCode > 0) w.WriteNumber("lastExitCode", result.LastExitCode);
-            if (result.ErrorMessages is { Count: > 0 } msgs)
-            {
-                w.WriteStartArray("errorMessages");
-                foreach (var m in msgs) w.WriteStringValue(m);
-                w.WriteEndArray();
-            }
-            if (result.TruncatedErrorCount > 0)
-                w.WriteNumber("truncatedErrorCount", result.TruncatedErrorCount);
+            WriteOscExtensionFields(w, result);
             w.WriteStringOrNull("cwd", result.Cwd);
             w.WriteStringOrNull("duration", result.Duration);
             w.WriteBoolean("timedOut", false);
@@ -3672,6 +3663,30 @@ public class ConsoleWorker
         try { _pty?.InputStream.Flush(); } catch { }
     }
 
+    /// <summary>
+    /// Serialize the OSC 633 extension fields that ride on every
+    /// finalized <see cref="CommandResult"/>: <c>errorCount</c> (always
+    /// written, 0 for non-pwsh adapters that emit no OSC E),
+    /// <c>lastExitCode</c> / <c>errorMessages</c> / <c>truncatedErrorCount</c>
+    /// (conditional — omitted when zero / empty so the wire stays tight
+    /// on the happy path). Both the inline execute response path and
+    /// the cached-drain response path call this so a new extension
+    /// field is added in one place instead of two.
+    /// </summary>
+    private static void WriteOscExtensionFields(System.Text.Json.Utf8JsonWriter w, CommandResult r)
+    {
+        w.WriteNumber("errorCount", r.ErrorCount);
+        if (r.LastExitCode > 0) w.WriteNumber("lastExitCode", r.LastExitCode);
+        if (r.ErrorMessages is { Count: > 0 } msgs)
+        {
+            w.WriteStartArray("errorMessages");
+            foreach (var m in msgs) w.WriteStringValue(m);
+            w.WriteEndArray();
+        }
+        if (r.TruncatedErrorCount > 0)
+            w.WriteNumber("truncatedErrorCount", r.TruncatedErrorCount);
+    }
+
     private JsonElement HandleGetCachedOutput()
     {
         // Drain snapshot under _cacheLock, then release spill leases so the
@@ -3699,16 +3714,7 @@ public class ConsoleWorker
                 w.WriteStartObject();
                 w.WriteStringOrNull("output", r.Output);
                 w.WriteNumber("exitCode", r.ExitCode);
-                w.WriteNumber("errorCount", r.ErrorCount);
-                if (r.LastExitCode > 0) w.WriteNumber("lastExitCode", r.LastExitCode);
-                if (r.ErrorMessages is { Count: > 0 } drainedMsgs)
-                {
-                    w.WriteStartArray("errorMessages");
-                    foreach (var m in drainedMsgs) w.WriteStringValue(m);
-                    w.WriteEndArray();
-                }
-                if (r.TruncatedErrorCount > 0)
-                    w.WriteNumber("truncatedErrorCount", r.TruncatedErrorCount);
+                WriteOscExtensionFields(w, r);
                 w.WriteStringOrNull("cwd", r.Cwd);
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);

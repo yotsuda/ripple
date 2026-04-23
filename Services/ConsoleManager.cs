@@ -1041,10 +1041,6 @@ public class ConsoleManager
 
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
-            var errorCount = response.TryGetProperty("errorCount", out var ecProp) && ecProp.ValueKind == JsonValueKind.Number ? ecProp.GetInt32() : 0;
-            var lastExitCode = response.TryGetProperty("lastExitCode", out var lecProp) && lecProp.ValueKind == JsonValueKind.Number ? lecProp.GetInt32() : 0;
-            var errorMessages = ParseErrorMessages(response);
-            var truncatedErrorCount = response.TryGetProperty("truncatedErrorCount", out var tecProp) && tecProp.ValueKind == JsonValueKind.Number ? tecProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var spillPath = response.TryGetProperty("spillFilePath", out var spProp) ? spProp.GetString() : null;
@@ -1066,15 +1062,11 @@ public class ConsoleManager
             if (cwdResult != null)
                 RecordShellCwd(consolePid, cwdResult);
 
-            return new ExecuteResult
+            var execResult = new ExecuteResult
             {
                 Pid = consolePid,
                 Output = output,
                 ExitCode = exitCode,
-                ErrorCount = errorCount,
-                LastExitCode = lastExitCode,
-                ErrorMessages = errorMessages,
-                TruncatedErrorCount = truncatedErrorCount,
                 Duration = duration,
                 Command = command,
                 DisplayName = displayName2,
@@ -1083,6 +1075,8 @@ public class ConsoleManager
                 Notice = routingNotice,
                 SpillFilePath = spillPath,
             };
+            ReadOscExtensionFields(response, execResult);
+            return execResult;
         }
         catch (TimeoutException)
         {
@@ -1176,6 +1170,31 @@ public class ConsoleManager
                 list.Add(s);
         }
         return list;
+    }
+
+    /// <summary>
+    /// Populate the four OSC 633 extension fields (ErrorCount,
+    /// LastExitCode, ErrorMessages, TruncatedErrorCount) on an
+    /// <see cref="ExecuteResult"/> from a worker's JSON response. Both
+    /// the inline path (live worker response) and the cached-drain
+    /// path (<c>get_cached_output</c> result entries) read the same
+    /// wire fields, so keeping the extraction in one place prevents
+    /// the two sites from drifting when a new extension is added.
+    ///
+    /// Tolerates missing / wrong-type fields: each extension defaults
+    /// to zero / empty so old binaries that never wrote the field
+    /// produce the same result shape as a pwsh command that simply
+    /// did not populate it.
+    /// </summary>
+    private static void ReadOscExtensionFields(JsonElement obj, ExecuteResult r)
+    {
+        r.ErrorCount = obj.TryGetProperty("errorCount", out var ec)
+            && ec.ValueKind == JsonValueKind.Number ? ec.GetInt32() : 0;
+        r.LastExitCode = obj.TryGetProperty("lastExitCode", out var lec)
+            && lec.ValueKind == JsonValueKind.Number ? lec.GetInt32() : 0;
+        r.ErrorMessages = ParseErrorMessages(obj);
+        r.TruncatedErrorCount = obj.TryGetProperty("truncatedErrorCount", out var tec)
+            && tec.ValueKind == JsonValueKind.Number ? tec.GetInt32() : 0;
     }
 
     private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
@@ -1759,15 +1778,11 @@ public class ConsoleManager
                 // the AI sees the full history on the next tool call.
                 foreach (var entry in resultsProp.EnumerateArray())
                 {
-                    results.Add(new ExecuteResult
+                    var drained = new ExecuteResult
                     {
                         Pid = pid.Value,
                         Output = entry.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
                         ExitCode = entry.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
-                        ErrorCount = entry.TryGetProperty("errorCount", out var ecnt) && ecnt.ValueKind == JsonValueKind.Number ? ecnt.GetInt32() : 0,
-                        LastExitCode = entry.TryGetProperty("lastExitCode", out var lec2) && lec2.ValueKind == JsonValueKind.Number ? lec2.GetInt32() : 0,
-                        ErrorMessages = ParseErrorMessages(entry),
-                        TruncatedErrorCount = entry.TryGetProperty("truncatedErrorCount", out var tec2) && tec2.ValueKind == JsonValueKind.Number ? tec2.GetInt32() : 0,
                         Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
                         DisplayName = displayName,
@@ -1775,7 +1790,9 @@ public class ConsoleManager
                         Cwd = entry.TryGetProperty("cwd", out var w) ? w.GetString() : null,
                         StatusLine = entry.TryGetProperty("statusLine", out var sl) ? sl.GetString() : null,
                         SpillFilePath = entry.TryGetProperty("spillFilePath", out var sp) ? sp.GetString() : null,
-                    });
+                    };
+                    ReadOscExtensionFields(entry, drained);
+                    results.Add(drained);
                 }
                 UnmarkPipeBusy(agentId, pid.Value);
             }
