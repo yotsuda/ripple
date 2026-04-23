@@ -35,6 +35,13 @@ public class CommandTrackerTests
         static OscParser.OscEvent Evt(OscParser.OscEventType t, int exit = 0, string? cwd = null)
             => new(t, exit, cwd);
 
+        // Variant for OSC R — lets tests build `ErrorMessage` events
+        // without constructing the full OscEvent record by hand every
+        // time. Keeps the primary Evt overload untouched so existing
+        // tests that pass positional (t, exit, cwd) are unaffected.
+        static OscParser.OscEvent ErrEvt(string message)
+            => new(OscParser.OscEventType.ErrorMessage, ErrorMessage: message);
+
         // Helper: build a minimally-populated CommandRegistration. All
         // per-adapter context (shell family, echo strategy, display name)
         // is passed through verbatim to the emitted snapshot, so most
@@ -1104,6 +1111,87 @@ public class CommandTrackerTests
             // AI sends the next command — the reset brings the counter back to 0.
             _ = t.RegisterCommand(Reg("Get-Item nonexistent"));
             Assert(t.UserCmdsSinceLastAi == 0, "provenance: next AI RegisterCommand resets counter to 0 again");
+        }
+
+        // ErrorMessages accumulation — verify tracker threads OSC R
+        // events into snapshot.ErrorMessages in the order they arrive,
+        // preserves text verbatim, and filters nulls (which the parser
+        // emits for malformed base64 payloads).
+        //
+        // Integration-side cap / ordering / provenance live in
+        // ShellIntegration/integration.ps1 and require a live pwsh to
+        // exercise end-to-end; here we only verify the C# data path
+        // from OscParser events through the tracker into the snapshot.
+        {
+            var t = new CommandTracker();
+            var (getLast, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("Get-Item /a, /b, /c"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 1));
+            // Integration script emits oldest-first. Three R events,
+            // plus one intentional null (malformed base64 on the wire)
+            // that the tracker must NOT append.
+            t.HandleEvent(ErrEvt("Get-Item: Cannot find path '/a'"));
+            t.HandleEvent(ErrEvt("Get-Item: Cannot find path '/b'"));
+            t.HandleEvent(new OscParser.OscEvent(
+                OscParser.OscEventType.ErrorMessage, ErrorMessage: null));
+            t.HandleEvent(ErrEvt("Get-Item: Cannot find path '/c'"));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+
+            Assert(task.IsCompletedSuccessfully, "errmsgs: snapshot emitted");
+            var snap = task.Result;
+            Assert(snap.ErrorMessages != null, "errmsgs: list populated");
+            Assert(snap.ErrorMessages!.Count == 3,
+                $"errmsgs: 3 valid entries (null filtered) — got {snap.ErrorMessages.Count}");
+            Assert(snap.ErrorMessages[0] == "Get-Item: Cannot find path '/a'",
+                "errmsgs: first entry preserves text + order");
+            Assert(snap.ErrorMessages[1] == "Get-Item: Cannot find path '/b'",
+                "errmsgs: second entry preserves order across the skipped null");
+            Assert(snap.ErrorMessages[2] == "Get-Item: Cannot find path '/c'",
+                "errmsgs: third entry is the one after the skipped null");
+        }
+
+        // No OSC R events emitted → ErrorMessages is null on the
+        // snapshot, not an empty list. Non-pwsh adapters (which never
+        // emit R) fall into this case and should pay zero list
+        // allocation cost.
+        {
+            var t = new CommandTracker();
+            var (_, _) = CaptureSnapshot(t);
+            var task = t.RegisterCommand(Reg("Get-Date"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            Assert(task.IsCompletedSuccessfully, "errmsgs-none: snapshot emitted");
+            Assert(task.Result.ErrorMessages == null,
+                "errmsgs-none: list is null (lazy allocation) — no R events means no accumulation");
+        }
+
+        // RegisterCommand clears the error list from any prior command
+        // so a new AI command never inherits stale entries. Drive a
+        // cycle that accumulates one R event, finish it, register a
+        // fresh command with no R events, and confirm the new snapshot
+        // has an empty/null list rather than carrying the old entry.
+        {
+            var t = new CommandTracker();
+            var (getLast1, _) = CaptureSnapshot(t);
+            var task1 = t.RegisterCommand(Reg("first"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 1));
+            t.HandleEvent(ErrEvt("first-error"));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            var snap1 = task1.Result;
+            t.ReleaseAiCommand(snap1.Generation);
+            Assert(snap1.ErrorMessages != null && snap1.ErrorMessages.Count == 1,
+                "errmsgs-reset: first snapshot captured its one error");
+
+            var task2 = t.RegisterCommand(Reg("second"));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandExecuted));
+            t.HandleEvent(Evt(OscParser.OscEventType.CommandFinished, exit: 0));
+            t.HandleEvent(Evt(OscParser.OscEventType.PromptStart));
+            var snap2 = task2.Result;
+            Assert(snap2.ErrorMessages == null,
+                "errmsgs-reset: second snapshot does NOT inherit the first snapshot's error list");
         }
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");

@@ -131,18 +131,35 @@ function global:prompt {
         # clean `--- errors ---` list alongside (or instead of, when the
         # caller passes strip_ansi=true) the inline SGR-coloured error
         # text. $Error[0] is most recent; $Error[$errDelta-1] is the
-        # earliest one this pipeline added — iterate oldest-first so the
-        # AI reads them in the order the user's commands produced them.
+        # earliest one this pipeline added.
         #
-        # Bounds kept tight so a command that fills $Error with a
-        # thousand records (pathological loops) can't stuff megabytes
-        # into the OSC stream. Per-entry base64 encoding tolerates
-        # newlines and non-ASCII without needing payload escaping.
+        # Each message is prefixed with the raising cmdlet's name (from
+        # $err.InvocationInfo.InvocationName), matching the "Get-Item:
+        # ..." format PowerShell's ConciseView uses for inline errors.
+        # Naked `throw "..."` statements have no InvocationName, so the
+        # prefix is omitted in that case — the message text stands alone,
+        # same as the inline render.
+        #
+        # Cap kept tight so a command that fills $Error with a thousand
+        # records (pathological loops) can't stuff megabytes into the
+        # OSC stream. When capped, we emit the OLDEST $emitLimit entries
+        # (root cause side) and drop the newer cascade errors; the
+        # truncation marker makes that ordering explicit so the AI does
+        # not misread which records are missing. Per-entry base64
+        # encoding tolerates newlines and non-ASCII without needing
+        # payload escaping.
         if ($errDelta -gt 0) {
             $__rp_emitLimit = [Math]::Min($errDelta, 20)
-            for ($__rp_i = $__rp_emitLimit - 1; $__rp_i -ge 0; $__rp_i--) {
+            $__rp_firstIdx = $errDelta - 1                   # oldest new error ($Error[N] = older)
+            $__rp_lastIdx  = $errDelta - $__rp_emitLimit     # stop here (inclusive)
+            for ($__rp_i = $__rp_firstIdx; $__rp_i -ge $__rp_lastIdx; $__rp_i--) {
                 try {
-                    $__rp_msg = "$($Error[$__rp_i])"
+                    $__rp_err = $Error[$__rp_i]
+                    $__rp_name = if ($__rp_err.InvocationInfo -and
+                                     $__rp_err.InvocationInfo.InvocationName) {
+                        "$($__rp_err.InvocationInfo.InvocationName): "
+                    } else { "" }
+                    $__rp_msg = $__rp_name + "$__rp_err"
                     if ($__rp_msg.Length -gt 1000) {
                         $__rp_msg = $__rp_msg.Substring(0, 997) + '...'
                     }
@@ -159,7 +176,7 @@ function global:prompt {
             if ($errDelta -gt $__rp_emitLimit) {
                 $__rp_trunc = [Convert]::ToBase64String(
                     [Text.Encoding]::UTF8.GetBytes(
-                        "[... $($errDelta - $__rp_emitLimit) more error record(s) truncated ...]"))
+                        "[... $($errDelta - $__rp_emitLimit) newer error record(s) truncated ...]"))
                 $prefix += (__rp_osc_str "R;$__rp_trunc")
             }
         }
