@@ -68,7 +68,7 @@ public class ShellTools
         {
             var shellInfo = result.ShellFamily != null ? $" ({result.ShellFamily})" : "";
             var cmd = CommandTracker.TruncateForStatusLine(result.Command);
-            var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {cmd}\nUse wait_for_completion tool to wait and retrieve the result.";
+            var header = $"⧗ {result.DisplayName}{shellInfo} | Status: Busy | Pipeline: {cmd}\nRelated tools: wait_for_completion (retrieve result), send_input (if stuck on interactive prompt / pager)";
             if (!string.IsNullOrEmpty(result.PartialOutput))
                 response = $"{header}\n\n--- partial output (recent window, not the final result) ---\n{result.PartialOutput}";
             else
