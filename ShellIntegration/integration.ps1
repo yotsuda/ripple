@@ -125,6 +125,28 @@ function global:prompt {
         $errDelta = $Error.Count - $global:__rp_err_count_at_cmd_start
         if ($errDelta -lt 0) { $errDelta = 0 }
         $prefix += (__rp_osc_str "E;$errDelta")
+
+        # OSC L: raw $LASTEXITCODE at command end, emitted ONLY when a
+        # native exe returned non-zero inside this pipeline AND the
+        # pipeline overall succeeded ($? True on the last statement).
+        # D has already been emitted as 0 in that case (PS semantics —
+        # pipeline concept is success of the last statement, not any
+        # native exit along the way); L exists so the AI can still see
+        # "a native returned N mid-pipeline" instead of a silent green ✓
+        # Completed. The proxy renders it as `| LastExit: N`.
+        #
+        # Gates:
+        #   $overallOk true   → the pipeline succeeded overall (D == 0)
+        #   $lecChanged       → $LASTEXITCODE was written BY this pipeline
+        #                       (not a stale value from a prior session)
+        #   $lec non-null & ≠0 → a native actually returned non-zero
+        # When $overallOk is false, D already carries the non-zero exit
+        # value (the elseif branch above), so L would be redundant.
+        $overallOk = if ($null -ne $aiOk) { $aiOk } else { $ok }
+        $lecChangedForTag = $lec -ne $lecAtStart
+        if ($overallOk -and $lecChangedForTag -and $null -ne $lec -and $lec -ne 0) {
+            $prefix += (__rp_osc_str "L;$lec")
+        }
     }
 
     # Clear the pre-command snapshot so the next command starts fresh.

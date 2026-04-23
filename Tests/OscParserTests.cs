@@ -73,6 +73,27 @@ public class OscParserTests
             Assert(result.Events[0].ErrorCount == 0, "ErrorCount-bad defaults to 0");
         }
 
+        // Test 3e: LastExitCode (OSC 633;L;{N}) — ripple's PowerShell-only
+        // extension. Integration script emits it only when a native exe
+        // returned non-zero mid-pipeline AND the overall pipeline succeeded,
+        // but the parser treats any well-formed payload as a valid event
+        // (gating lives in integration.ps1).
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("\x1b]633;L;7");
+            Assert(result.Events.Count == 1, "LastExitCode event count");
+            Assert(result.Events[0].Type == OscParser.OscEventType.LastExitCode, "LastExitCode type");
+            Assert(result.Events[0].LastExitCode == 7, "LastExitCode value");
+        }
+
+        // Test 3f: LastExitCode with malformed payload defaults to 0.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("\x1b]633;L;not-a-number");
+            Assert(result.Events.Count == 1, "LastExitCode-bad event count");
+            Assert(result.Events[0].LastExitCode == 0, "LastExitCode-bad defaults to 0");
+        }
+
         // Test 4: Mixed output + OSC
         {
             var parser = new OscParser();

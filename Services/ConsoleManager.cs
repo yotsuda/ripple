@@ -1042,6 +1042,7 @@ public class ConsoleManager
             var output = response.TryGetProperty("output", out var outputProp) ? outputProp.GetString() ?? "" : "";
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
             var errorCount = response.TryGetProperty("errorCount", out var ecProp) && ecProp.ValueKind == JsonValueKind.Number ? ecProp.GetInt32() : 0;
+            var lastExitCode = response.TryGetProperty("lastExitCode", out var lecProp) && lecProp.ValueKind == JsonValueKind.Number ? lecProp.GetInt32() : 0;
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var spillPath = response.TryGetProperty("spillFilePath", out var spProp) ? spProp.GetString() : null;
@@ -1069,6 +1070,7 @@ public class ConsoleManager
                 Output = output,
                 ExitCode = exitCode,
                 ErrorCount = errorCount,
+                LastExitCode = lastExitCode,
                 Duration = duration,
                 Command = command,
                 DisplayName = displayName2,
@@ -1739,6 +1741,7 @@ public class ConsoleManager
                         Output = entry.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "",
                         ExitCode = entry.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
                         ErrorCount = entry.TryGetProperty("errorCount", out var ecnt) && ecnt.ValueKind == JsonValueKind.Number ? ecnt.GetInt32() : 0,
+                        LastExitCode = entry.TryGetProperty("lastExitCode", out var lec2) && lec2.ValueKind == JsonValueKind.Number ? lec2.GetInt32() : 0,
                         Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
                         DisplayName = displayName,
@@ -2438,6 +2441,12 @@ public class ConsoleManager
         // status line when N > 0; ignored for non-pwsh adapters where it
         // stays at 0.
         public int ErrorCount { get; set; }
+        // Raw $LASTEXITCODE at command end (PowerShell only, via
+        // OSC 633;L;{N}). Only populated when a native exe returned
+        // non-zero mid-pipeline AND the overall pipeline succeeded
+        // (ExitCode == 0); in every other case it stays at 0 and
+        // "LastExit: N" is omitted from the status line.
+        public int LastExitCode { get; set; }
         public string Duration { get; set; } = "0";
         public string? Command { get; set; }
         public string? DisplayName { get; set; }

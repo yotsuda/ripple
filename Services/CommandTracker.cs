@@ -135,6 +135,11 @@ public class CommandTracker
     // never appears in the proxy status line for non-pwsh adapters,
     // which is correct: $Error.Count has no equivalent in bash / cmd.
     private int _errorCount;
+    // Latest OSC 633;L;{N} value. PowerShell only emits this when a
+    // native exe returned non-zero mid-pipeline AND the pipeline overall
+    // succeeded (so D == 0); in every other case the value stays at 0
+    // and the proxy omits the "LastExit: N" status-line segment.
+    private int _lastExitCode;
     private string? _cwd;
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
@@ -369,6 +374,7 @@ public class CommandTracker
             _capture = new CommandOutputCapture();
             _exitCode = 0;
             _errorCount = 0;
+            _lastExitCode = 0;
             _cwd = null;
             _commandSent = registration.CommandText;
             _registeredShellFamily = registration.ShellFamily;
@@ -614,6 +620,14 @@ public class CommandTracker
                     _errorCount = evt.ErrorCount;
                     break;
 
+                case OscParser.OscEventType.LastExitCode:
+                    // OSC L: PowerShell prompt fn emits this only when a
+                    // native exe returned non-zero and the pipeline
+                    // overall succeeded. Carry through so the proxy can
+                    // render "LastExit: N" alongside the ✓ / ⚠ badge.
+                    _lastExitCode = evt.LastExitCode;
+                    break;
+
                 case OscParser.OscEventType.PromptStart:
                     // Only treat OSC A as the end of an AI command when we
                     // actually saw a command cycle — both OSC C (command
@@ -853,7 +867,8 @@ public class CommandTracker
             Generation: _commandGeneration,
             InlineDeliveryId: _registeredInlineDeliveryId,
             VtBaseline: _capturedBaselineSnapshot,
-            ErrorCount: _errorCount);
+            ErrorCount: _errorCount,
+            LastExitCode: _lastExitCode);
 
         // Hand the inline caller (if still attached) the snapshot
         // directly; the worker's shared finalize-once path consumes

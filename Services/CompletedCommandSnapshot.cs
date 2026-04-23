@@ -183,4 +183,12 @@ public sealed record CompletedCommandSnapshot(
     // status line ("Errors: N" when N > 0). Zero for shells that don't
     // emit an OSC E marker — most adapters don't because they have no
     // analogous always-on error counter.
-    int ErrorCount = 0);
+    int ErrorCount = 0,
+    // PowerShell-specific: raw $LASTEXITCODE at command end, populated
+    // from OSC 633;L;{N} only when a native exe returned non-zero inside
+    // this pipeline AND the overall pipeline still succeeded (D == 0).
+    // Zero means "no report" (either no native ran, it returned 0, or
+    // this is a non-pwsh adapter). The proxy renders `LastExit: N` in
+    // the status line when N > 0 so the AI can see a native exit the
+    // ✓ Completed badge would otherwise hide.
+    int LastExitCode = 0);

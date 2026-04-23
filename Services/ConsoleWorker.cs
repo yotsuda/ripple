@@ -246,7 +246,13 @@ public class ConsoleWorker
         // execution. Surfaced in the worker's execute response so the
         // proxy can render "Errors: N" in the inline-path status line.
         // PowerShell-only (other adapters leave this at 0).
-        int ErrorCount = 0);
+        int ErrorCount = 0,
+        // Raw $LASTEXITCODE at command end — only populated when a
+        // native exe returned non-zero mid-pipeline AND the overall
+        // pipeline succeeded (ExitCode already 0). Surfaced as
+        // "LastExit: N" in the status line. Zero means "no report"
+        // (no native, native returned 0, or non-pwsh adapter).
+        int LastExitCode = 0);
 
     private readonly string? _banner;
     private readonly string? _reason;
@@ -3187,6 +3193,7 @@ public class ConsoleWorker
             w.WriteStringOrNull("output", result.Output);
             w.WriteNumber("exitCode", result.ExitCode);
             w.WriteNumber("errorCount", result.ErrorCount);
+            if (result.LastExitCode > 0) w.WriteNumber("lastExitCode", result.LastExitCode);
             w.WriteStringOrNull("cwd", result.Cwd);
             w.WriteStringOrNull("duration", result.Duration);
             w.WriteBoolean("timedOut", false);
@@ -3388,7 +3395,8 @@ public class ConsoleWorker
                 snapshot.Cwd,
                 snapshot.ShellFamily,
                 snapshot.DisplayName,
-                snapshot.ErrorCount);
+                snapshot.ErrorCount,
+                snapshot.LastExitCode);
 
             var result = new CommandResult(
                 Output: truncation.DisplayOutput,
@@ -3398,7 +3406,8 @@ public class ConsoleWorker
                 Duration: snapshot.Duration,
                 StatusLine: statusLine,
                 SpillFilePath: truncation.SpillFilePath,
-                ErrorCount: snapshot.ErrorCount);
+                ErrorCount: snapshot.ErrorCount,
+                LastExitCode: snapshot.LastExitCode);
 
             // Step 6: deliver inline OR cache. Route by the snapshot's
             // InlineDeliveryId so each command hits its own TCS — a
@@ -3474,7 +3483,8 @@ public class ConsoleWorker
                         snapshot.Cwd,
                         snapshot.ShellFamily,
                         snapshot.DisplayName,
-                        snapshot.ErrorCount);
+                        snapshot.ErrorCount,
+                        snapshot.LastExitCode);
                     var fallback = new CommandResult(
                         Output: $"finalize failed: {ex.GetType().Name}: {ex.Message}",
                         ExitCode: snapshot.ExitCode,
@@ -3580,7 +3590,7 @@ public class ConsoleWorker
     /// </summary>
     private static string BuildStatusLine(
         string? command, int exitCode, string duration, string? cwd,
-        string? shellFamily, string? displayName, int errorCount)
+        string? shellFamily, string? displayName, int errorCount, int lastExitCode)
     {
         var identity = string.IsNullOrEmpty(displayName) ? "" : displayName;
         var shell = string.IsNullOrEmpty(shellFamily) ? "" : $" ({shellFamily})";
@@ -3592,6 +3602,14 @@ public class ConsoleWorker
         // for pwsh too — zero is the silent happy-path case and not
         // worth a token.
         var errInfo = errorCount > 0 ? $" | Errors: {errorCount}" : "";
+        // "LastExit: N" surfaces a native exe that returned non-zero
+        // mid-pipeline when the overall pipeline succeeded. Only populated
+        // for pwsh (OSC L emission is pwsh-only) and only when the
+        // integration script judged it worth reporting (lecChanged &
+        // non-zero & pipeline overall ok — see integration.ps1 prompt fn).
+        // Rendered only on the ✓ / ⚠ branches; omitted on ✗ Failed
+        // because `exit N` already carries the non-zero signal there.
+        var lastExitInfo = lastExitCode > 0 ? $" | LastExit: {lastExitCode}" : "";
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Render a neutral
@@ -3610,8 +3628,8 @@ public class ConsoleWorker
         if (exitCode != 0)
             return $"✗ {identity}{shell} | Status: Failed (exit {exitCode}){errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
         if (errorCount > 0)
-            return $"⚠  {identity}{shell} | Status: Completed with errors{errInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
-        return $"✓ {identity}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+            return $"⚠  {identity}{shell} | Status: Completed with errors{errInfo}{lastExitInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
+        return $"✓ {identity}{shell} | Status: Completed{lastExitInfo} | Pipeline: {cmd} | Duration: {duration}s{cwdInfo}";
     }
 
     /// <summary>
@@ -3659,6 +3677,7 @@ public class ConsoleWorker
                 w.WriteStringOrNull("output", r.Output);
                 w.WriteNumber("exitCode", r.ExitCode);
                 w.WriteNumber("errorCount", r.ErrorCount);
+                if (r.LastExitCode > 0) w.WriteNumber("lastExitCode", r.LastExitCode);
                 w.WriteStringOrNull("cwd", r.Cwd);
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);

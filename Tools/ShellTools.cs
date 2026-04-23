@@ -251,6 +251,13 @@ public class ShellTools
         // segment is omitted there. Zero is also omitted for pwsh — the
         // happy path doesn't need a "Errors: 0" tag.
         var errInfo = r.ErrorCount > 0 ? $" | Errors: {r.ErrorCount}" : "";
+        // "LastExit: N" exposes a native exe that returned non-zero
+        // mid-pipeline when the pipeline overall succeeded. Worker only
+        // populates LastExitCode via OSC 633;L for pwsh and only when
+        // both gates are met (non-zero native exit + overall ok), so a
+        // value > 0 here is unambiguous — no extra condition needed.
+        // Omitted on ✗ Failed because `exit N` already covers it.
+        var lastExitInfo = r.LastExitCode > 0 ? $" | LastExit: {r.LastExitCode}" : "";
 
         // cmd.exe can't expose real %ERRORLEVEL% through its PROMPT, so the
         // worker always reports ExitCode=0 for cmd. Showing a success tick
@@ -269,8 +276,8 @@ public class ShellTools
         if (r.ExitCode != 0)
             return $"✗ {r.DisplayName}{shell} | Status: Failed (exit {r.ExitCode}){errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
         if (r.ErrorCount > 0)
-            return $"⚠  {r.DisplayName}{shell} | Status: Completed with errors{errInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
-        return $"✓ {r.DisplayName}{shell} | Status: Completed | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+            return $"⚠  {r.DisplayName}{shell} | Status: Completed with errors{errInfo}{lastExitInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
+        return $"✓ {r.DisplayName}{shell} | Status: Completed{lastExitInfo} | Pipeline: {cmd} | Duration: {r.Duration}s{cwdInfo}";
     }
 
     /// <summary>

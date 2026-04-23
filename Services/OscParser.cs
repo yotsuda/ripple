@@ -12,6 +12,12 @@ namespace Ripple.Services;
 ///   E;{errorCount} = ErrorsThisPipeline (PowerShell $Error.Count delta;
 ///                    surfaced as "Errors: N" in the proxy status line
 ///                    when N &gt; 0; ripple-specific extension).
+///   L;{lastExitCode} = LastExitCode — raw $LASTEXITCODE at command end.
+///                    Emitted ONLY when a native exe returned non-zero
+///                    inside this pipeline AND the pipeline overall
+///                    succeeded (so D is already 0). Surfaced as
+///                    "LastExit: N" on the proxy status line;
+///                    PowerShell-only, ripple-specific extension.
 ///   P;Cwd={path} = Property (cwd)
 /// </summary>
 public class OscParser
@@ -30,7 +36,7 @@ public class OscParser
     /// exact order the shell wrote them, instead of feeding everything then
     /// flushing events (which loses positional information).
     /// </summary>
-    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0);
+    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0, int LastExitCode = 0);
 
     public enum OscEventType
     {
@@ -44,6 +50,12 @@ public class OscParser
         // captures the latest value into the snapshot so the proxy can
         // render `Errors: N` in the status line.
         ErrorCount,
+        // Ripple-specific extension: raw $LASTEXITCODE at command end,
+        // emitted ONLY when a native exe returned non-zero mid-pipeline
+        // AND the overall pipeline succeeded (D == 0). Worker captures
+        // the value into the snapshot so the proxy can render
+        // `LastExit: N` in the status line alongside the ✓ / ⚠ badge.
+        LastExitCode,
     }
 
     public record ParseResult(string Cleaned, List<OscEvent> Events);
@@ -143,6 +155,7 @@ public class OscParser
             'C' => new OscEvent(OscEventType.CommandExecuted),
             'D' => new OscEvent(OscEventType.CommandFinished, data != null && int.TryParse(data, out var ec) ? ec : 0),
             'E' => new OscEvent(OscEventType.ErrorCount, ErrorCount: data != null && int.TryParse(data, out var n) ? n : 0),
+            'L' => new OscEvent(OscEventType.LastExitCode, LastExitCode: data != null && int.TryParse(data, out var lec) ? lec : 0),
             'P' when data != null && data.StartsWith("Cwd=") => new OscEvent(OscEventType.Cwd, Cwd: data[4..]),
             _ => null,
         };
