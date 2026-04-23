@@ -140,6 +140,12 @@ public class CommandTracker
     // succeeded (so D == 0); in every other case the value stays at 0
     // and the proxy omits the "LastExit: N" status-line segment.
     private int _lastExitCode;
+    // Decoded OSC 633;R payloads for the in-flight command — one entry
+    // per new $Error record the PowerShell integration script emitted
+    // during the pipeline. Cleared on RegisterCommand and handed to the
+    // snapshot at command end. Empty for non-pwsh adapters (they emit
+    // no R events) and for pwsh commands that produced no errors.
+    private List<string>? _errorMessages;
     private string? _cwd;
     private string _commandSent = "";
     private Stopwatch? _stopwatch;
@@ -375,6 +381,7 @@ public class CommandTracker
             _exitCode = 0;
             _errorCount = 0;
             _lastExitCode = 0;
+            _errorMessages = null;
             _cwd = null;
             _commandSent = registration.CommandText;
             _registeredShellFamily = registration.ShellFamily;
@@ -628,6 +635,19 @@ public class CommandTracker
                     _lastExitCode = evt.LastExitCode;
                     break;
 
+                case OscParser.OscEventType.ErrorMessage:
+                    // OSC R: one decoded $Error record per event.
+                    // Filter null (malformed base64 in payload) so the
+                    // list stays clean — losing a malformed record is
+                    // better than propagating `null` into the proxy
+                    // response. Allocate lazily so non-pwsh adapters
+                    // that never emit R don't pay for the list.
+                    if (evt.ErrorMessage is string msg)
+                    {
+                        (_errorMessages ??= new List<string>()).Add(msg);
+                    }
+                    break;
+
                 case OscParser.OscEventType.PromptStart:
                     // Only treat OSC A as the end of an AI command when we
                     // actually saw a command cycle — both OSC C (command
@@ -868,7 +888,8 @@ public class CommandTracker
             InlineDeliveryId: _registeredInlineDeliveryId,
             VtBaseline: _capturedBaselineSnapshot,
             ErrorCount: _errorCount,
-            LastExitCode: _lastExitCode);
+            LastExitCode: _lastExitCode,
+            ErrorMessages: _errorMessages);
 
         // Hand the inline caller (if still attached) the snapshot
         // directly; the worker's shared finalize-once path consumes

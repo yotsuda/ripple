@@ -126,6 +126,44 @@ function global:prompt {
         if ($errDelta -lt 0) { $errDelta = 0 }
         $prefix += (__rp_osc_str "E;$errDelta")
 
+        # OSC R: structured error messages. Emit each new $Error entry
+        # as a base64-encoded UTF-8 string so the proxy can surface a
+        # clean `--- errors ---` list alongside (or instead of, when the
+        # caller passes strip_ansi=true) the inline SGR-coloured error
+        # text. $Error[0] is most recent; $Error[$errDelta-1] is the
+        # earliest one this pipeline added — iterate oldest-first so the
+        # AI reads them in the order the user's commands produced them.
+        #
+        # Bounds kept tight so a command that fills $Error with a
+        # thousand records (pathological loops) can't stuff megabytes
+        # into the OSC stream. Per-entry base64 encoding tolerates
+        # newlines and non-ASCII without needing payload escaping.
+        if ($errDelta -gt 0) {
+            $__rp_emitLimit = [Math]::Min($errDelta, 20)
+            for ($__rp_i = $__rp_emitLimit - 1; $__rp_i -ge 0; $__rp_i--) {
+                try {
+                    $__rp_msg = "$($Error[$__rp_i])"
+                    if ($__rp_msg.Length -gt 1000) {
+                        $__rp_msg = $__rp_msg.Substring(0, 997) + '...'
+                    }
+                    $__rp_b64 = [Convert]::ToBase64String(
+                        [Text.Encoding]::UTF8.GetBytes($__rp_msg))
+                    $prefix += (__rp_osc_str "R;$__rp_b64")
+                } catch {
+                    # Malformed error record — skip rather than aborting
+                    # the OSC stream. The E count has already given the
+                    # proxy a reliable indicator; losing one R payload
+                    # only loses the text of this record, not the count.
+                }
+            }
+            if ($errDelta -gt $__rp_emitLimit) {
+                $__rp_trunc = [Convert]::ToBase64String(
+                    [Text.Encoding]::UTF8.GetBytes(
+                        "[... $($errDelta - $__rp_emitLimit) more error record(s) truncated ...]"))
+                $prefix += (__rp_osc_str "R;$__rp_trunc")
+            }
+        }
+
         # OSC L: raw $LASTEXITCODE at command end, emitted ONLY when a
         # native exe returned non-zero inside this pipeline AND the
         # pipeline overall succeeded ($? True on the last statement).

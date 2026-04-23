@@ -18,6 +18,13 @@ namespace Ripple.Services;
 ///                    succeeded (so D is already 0). Surfaced as
 ///                    "LastExit: N" on the proxy status line;
 ///                    PowerShell-only, ripple-specific extension.
+///   R;{base64_utf8} = ErrorMessage — one per new $Error entry this
+///                    pipeline added (up to an adapter-side cap).
+///                    Payload is base64(UTF-8) so messages with newlines
+///                    / non-ASCII survive the OSC wire without needing
+///                    special escaping. Surfaced as the structured
+///                    `--- errors ---` list in the proxy response;
+///                    PowerShell-only, ripple-specific extension.
 ///   P;Cwd={path} = Property (cwd)
 /// </summary>
 public class OscParser
@@ -36,7 +43,7 @@ public class OscParser
     /// exact order the shell wrote them, instead of feeding everything then
     /// flushing events (which loses positional information).
     /// </summary>
-    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0, int LastExitCode = 0);
+    public record OscEvent(OscEventType Type, int ExitCode = 0, string? Cwd = null, int TextOffset = 0, int ErrorCount = 0, int LastExitCode = 0, string? ErrorMessage = null);
 
     public enum OscEventType
     {
@@ -56,6 +63,11 @@ public class OscParser
         // the value into the snapshot so the proxy can render
         // `LastExit: N` in the status line alongside the ✓ / ⚠ badge.
         LastExitCode,
+        // Ripple-specific extension: one event per new $Error entry the
+        // pipeline added, payload is base64(UTF-8) of the error record's
+        // ToString(). Worker accumulates decoded strings into a list the
+        // proxy renders as a structured `--- errors ---` section.
+        ErrorMessage,
     }
 
     public record ParseResult(string Cleaned, List<OscEvent> Events);
@@ -156,8 +168,29 @@ public class OscParser
             'D' => new OscEvent(OscEventType.CommandFinished, data != null && int.TryParse(data, out var ec) ? ec : 0),
             'E' => new OscEvent(OscEventType.ErrorCount, ErrorCount: data != null && int.TryParse(data, out var n) ? n : 0),
             'L' => new OscEvent(OscEventType.LastExitCode, LastExitCode: data != null && int.TryParse(data, out var lec) ? lec : 0),
+            'R' => new OscEvent(OscEventType.ErrorMessage, ErrorMessage: DecodeBase64Utf8(data)),
             'P' when data != null && data.StartsWith("Cwd=") => new OscEvent(OscEventType.Cwd, Cwd: data[4..]),
             _ => null,
         };
+    }
+
+    /// <summary>
+    /// Decode an OSC R payload (base64 UTF-8) back to a string. Returns
+    /// null for null / empty / malformed input rather than throwing —
+    /// tracker filters nulls before appending to its list so a single
+    /// corrupted payload can't derail the entire error-list capture.
+    /// </summary>
+    private static string? DecodeBase64Utf8(string? data)
+    {
+        if (string.IsNullOrEmpty(data)) return null;
+        try
+        {
+            var bytes = Convert.FromBase64String(data);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

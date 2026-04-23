@@ -94,6 +94,30 @@ public class OscParserTests
             Assert(result.Events[0].LastExitCode == 0, "LastExitCode-bad defaults to 0");
         }
 
+        // Test 3g: ErrorMessage (OSC 633;R;{base64}) — ripple's
+        // PowerShell-only extension. One event per new $Error entry;
+        // payload is base64(UTF-8) of the error's ToString().
+        {
+            var parser = new OscParser();
+            // "boom" base64-encoded is "Ym9vbQ=="
+            var result = parser.Parse("]633;R;Ym9vbQ==");
+            Assert(result.Events.Count == 1, "ErrorMessage event count");
+            Assert(result.Events[0].Type == OscParser.OscEventType.ErrorMessage, "ErrorMessage type");
+            Assert(result.Events[0].ErrorMessage == "boom", "ErrorMessage decoded value");
+        }
+
+        // Test 3h: ErrorMessage with malformed base64 keeps the event
+        // but leaves ErrorMessage null — tracker filters nulls before
+        // appending, so a corrupted payload is lost but the pipeline
+        // continues.
+        {
+            var parser = new OscParser();
+            var result = parser.Parse("]633;R;!!!not-valid-base64!!!");
+            Assert(result.Events.Count == 1, "ErrorMessage-bad event count");
+            Assert(result.Events[0].ErrorMessage == null, "ErrorMessage-bad value is null");
+        }
+
+
         // Test 4: Mixed output + OSC
         {
             var parser = new OscParser();

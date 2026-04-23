@@ -191,4 +191,13 @@ public sealed record CompletedCommandSnapshot(
     // this is a non-pwsh adapter). The proxy renders `LastExit: N` in
     // the status line when N > 0 so the AI can see a native exit the
     // ✓ Completed badge would otherwise hide.
-    int LastExitCode = 0);
+    int LastExitCode = 0,
+    // PowerShell-specific: ToString() of each new $Error entry the
+    // pipeline added, decoded from OSC 633;R;{base64} payloads in the
+    // order the integration script emitted them. Empty for non-pwsh
+    // adapters and for pwsh pipelines that produced no errors; capped
+    // by the integration script at 20 entries with a truncation marker
+    // in the 21st slot. The proxy renders these as a structured
+    // `--- errors ---` section after the main output so the AI can
+    // consume error text without parsing SGR-coloured inline spans.
+    IReadOnlyList<string>? ErrorMessages = null);

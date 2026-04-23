@@ -1043,6 +1043,7 @@ public class ConsoleManager
             var exitCode = response.TryGetProperty("exitCode", out var exitProp) ? exitProp.GetInt32() : 0;
             var errorCount = response.TryGetProperty("errorCount", out var ecProp) && ecProp.ValueKind == JsonValueKind.Number ? ecProp.GetInt32() : 0;
             var lastExitCode = response.TryGetProperty("lastExitCode", out var lecProp) && lecProp.ValueKind == JsonValueKind.Number ? lecProp.GetInt32() : 0;
+            var errorMessages = ParseErrorMessages(response);
             var duration = response.TryGetProperty("duration", out var durProp) ? durProp.GetString() ?? "0" : "0";
             var cwdResult = response.TryGetProperty("cwd", out var cwdProp) ? cwdProp.GetString() : null;
             var spillPath = response.TryGetProperty("spillFilePath", out var spProp) ? spProp.GetString() : null;
@@ -1071,6 +1072,7 @@ public class ConsoleManager
                 ExitCode = exitCode,
                 ErrorCount = errorCount,
                 LastExitCode = lastExitCode,
+                ErrorMessages = errorMessages,
                 Duration = duration,
                 Command = command,
                 DisplayName = displayName2,
@@ -1152,6 +1154,26 @@ public class ConsoleManager
         await ReadExactAsync(client, recvBytes, cts.Token);
 
         return PipeJson.ParseElement(recvBytes);
+    }
+
+    // Deserialize the optional "errorMessages" string array the worker
+    // writes for pwsh commands with $Error records. Missing / wrong-type
+    // entries are silently skipped — a malformed element should not
+    // poison the whole list. Returns a fresh list (callers don't share).
+    private static IReadOnlyList<string> ParseErrorMessages(JsonElement obj)
+    {
+        if (!obj.TryGetProperty("errorMessages", out var arr)
+            || arr.ValueKind != JsonValueKind.Array
+            || arr.GetArrayLength() == 0)
+            return Array.Empty<string>();
+
+        var list = new List<string>(arr.GetArrayLength());
+        foreach (var el in arr.EnumerateArray())
+        {
+            if (el.ValueKind == JsonValueKind.String && el.GetString() is string s)
+                list.Add(s);
+        }
+        return list;
     }
 
     private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
@@ -1742,6 +1764,7 @@ public class ConsoleManager
                         ExitCode = entry.TryGetProperty("exitCode", out var e) ? e.GetInt32() : 0,
                         ErrorCount = entry.TryGetProperty("errorCount", out var ecnt) && ecnt.ValueKind == JsonValueKind.Number ? ecnt.GetInt32() : 0,
                         LastExitCode = entry.TryGetProperty("lastExitCode", out var lec2) && lec2.ValueKind == JsonValueKind.Number ? lec2.GetInt32() : 0,
+                        ErrorMessages = ParseErrorMessages(entry),
                         Duration = entry.TryGetProperty("duration", out var d) ? d.GetString() ?? "0" : "0",
                         Command = entry.TryGetProperty("command", out var c) ? c.GetString() : null,
                         DisplayName = displayName,
@@ -2447,6 +2470,12 @@ public class ConsoleManager
         // (ExitCode == 0); in every other case it stays at 0 and
         // "LastExit: N" is omitted from the status line.
         public int LastExitCode { get; set; }
+        // Structured error-message list (PowerShell only, via
+        // OSC 633;R). Empty for non-pwsh adapters and for pwsh
+        // pipelines that produced no errors. Rendered as a
+        // `--- errors ---` section in the proxy's response after
+        // the main output.
+        public IReadOnlyList<string> ErrorMessages { get; set; } = Array.Empty<string>();
         public string Duration { get; set; } = "0";
         public string? Command { get; set; }
         public string? DisplayName { get; set; }

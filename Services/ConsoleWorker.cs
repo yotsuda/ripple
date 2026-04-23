@@ -252,7 +252,15 @@ public class ConsoleWorker
         // pipeline succeeded (ExitCode already 0). Surfaced as
         // "LastExit: N" in the status line. Zero means "no report"
         // (no native, native returned 0, or non-pwsh adapter).
-        int LastExitCode = 0);
+        int LastExitCode = 0,
+        // Structured error-message list — one entry per new $Error
+        // record the PowerShell integration script emitted during the
+        // pipeline (decoded from OSC 633;R payloads by the tracker).
+        // Empty / null for non-pwsh adapters and for pwsh pipelines
+        // that produced no errors. Surfaced in the worker's execute
+        // response as an "errorMessages" JSON array so the proxy can
+        // render a structured "--- errors ---" section.
+        IReadOnlyList<string>? ErrorMessages = null);
 
     private readonly string? _banner;
     private readonly string? _reason;
@@ -3194,6 +3202,12 @@ public class ConsoleWorker
             w.WriteNumber("exitCode", result.ExitCode);
             w.WriteNumber("errorCount", result.ErrorCount);
             if (result.LastExitCode > 0) w.WriteNumber("lastExitCode", result.LastExitCode);
+            if (result.ErrorMessages is { Count: > 0 } msgs)
+            {
+                w.WriteStartArray("errorMessages");
+                foreach (var m in msgs) w.WriteStringValue(m);
+                w.WriteEndArray();
+            }
             w.WriteStringOrNull("cwd", result.Cwd);
             w.WriteStringOrNull("duration", result.Duration);
             w.WriteBoolean("timedOut", false);
@@ -3407,7 +3421,8 @@ public class ConsoleWorker
                 StatusLine: statusLine,
                 SpillFilePath: truncation.SpillFilePath,
                 ErrorCount: snapshot.ErrorCount,
-                LastExitCode: snapshot.LastExitCode);
+                LastExitCode: snapshot.LastExitCode,
+                ErrorMessages: snapshot.ErrorMessages);
 
             // Step 6: deliver inline OR cache. Route by the snapshot's
             // InlineDeliveryId so each command hits its own TCS — a
@@ -3678,6 +3693,12 @@ public class ConsoleWorker
                 w.WriteNumber("exitCode", r.ExitCode);
                 w.WriteNumber("errorCount", r.ErrorCount);
                 if (r.LastExitCode > 0) w.WriteNumber("lastExitCode", r.LastExitCode);
+                if (r.ErrorMessages is { Count: > 0 } drainedMsgs)
+                {
+                    w.WriteStartArray("errorMessages");
+                    foreach (var m in drainedMsgs) w.WriteStringValue(m);
+                    w.WriteEndArray();
+                }
                 w.WriteStringOrNull("cwd", r.Cwd);
                 w.WriteStringOrNull("command", r.Command);
                 w.WriteStringOrNull("duration", r.Duration);

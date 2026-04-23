@@ -27,6 +27,42 @@ public class ShellTools
     private static string StripAnsi(string s) =>
         string.IsNullOrEmpty(s) ? s : s_sgrPattern.Replace(s, "");
 
+    // Render the structured error-message list as a trailing section
+    // in the tool response. Leading "\n\n" so it detaches from the main
+    // output body; empty string when there's nothing to render so
+    // callers can append it unconditionally. Numbered when there's more
+    // than one message, bare when there's exactly one — the count badge
+    // already appears in the status line ("Errors: N") so duplicating
+    // it here is noise on the single-error path.
+    //
+    // This is complementary to the SGR-coloured inline error text in
+    // the main output: the inline path preserves the visible-console
+    // fidelity the user sees, and this section gives the AI a clean
+    // parseable list (especially valuable when strip_ansi=true removed
+    // the SGR span cues the AI would otherwise use to pick error lines
+    // out of stdout).
+    private static string FormatErrorsSection(IReadOnlyList<string>? messages)
+    {
+        if (messages is null || messages.Count == 0) return "";
+        var sb = new StringBuilder();
+        sb.Append("\n\n--- errors (");
+        sb.Append(messages.Count);
+        sb.Append(") ---\n");
+        if (messages.Count == 1)
+        {
+            sb.Append(messages[0]);
+        }
+        else
+        {
+            for (int i = 0; i < messages.Count; i++)
+            {
+                sb.Append('[').Append(i + 1).Append("] ").Append(messages[i]);
+                if (i < messages.Count - 1) sb.Append('\n');
+            }
+        }
+        return sb.ToString();
+    }
+
     [McpServerTool]
     [Description("Open a visible terminal window. The user can see and type in this terminal; AI commands sent via execute_command will also appear here in real time. If a standby console of the requested shell already exists it is reused unless `reason` is provided. Multiple shell types can be active simultaneously. Every response also reports the busy / finished / closed state of any other consoles you have open so background work stays visible.")]
     public static async Task<string> StartConsole(
@@ -106,7 +142,7 @@ public class ShellTools
             var body = string.IsNullOrEmpty(result.Output) ? "(no output)"
                      : strip_ansi ? StripAnsi(result.Output)
                      : result.Output;
-            response = $"{statusLine}\n\n{body}";
+            response = $"{statusLine}\n\n{body}{FormatErrorsSection(result.ErrorMessages)}";
         }
 
         // A routing notice (e.g. "source console was moved by user, your
@@ -147,6 +183,8 @@ public class ShellTools
                      : strip_ansi ? StripAnsi(r.Output)
                      : r.Output;
             sb.AppendLine(body);
+            var errSection = FormatErrorsSection(r.ErrorMessages);
+            if (errSection.Length > 0) sb.Append(errSection);
             sb.AppendLine();
         }
 
