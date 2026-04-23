@@ -133,12 +133,12 @@ public class ShellTools
     }
 
     [McpServerTool]
-    [Description("Send raw keystrokes to a busy console's PTY input. ONLY works when the target console is busy (idle consoles are rejected — use execute_command instead). Use this to: respond to an interactive prompt (Read-Host, password, y/n confirmation); send Ctrl+C (\\x03) to interrupt a stuck or runaway command; exit a watch-mode TUI (q, Ctrl+C); send Enter (\\r) to dismiss a 'Press Enter to continue' pause; send arrow keys (\\x1b[A/B/C/D) to navigate a TUI menu. Always peek_console first to verify what the console is waiting for, then send_input with the appropriate response. Input is sent as-is — include \\r for Enter, \\x03 for Ctrl+C, \\x1b[A for arrow-up, etc. Max 256 chars per call.")]
+    [Description("Send raw keystrokes to a busy console's PTY input. ONLY works when the target console is busy (idle consoles are rejected — use execute_command instead). Use this to: respond to an interactive prompt (Read-Host, password, y/n confirmation); send Ctrl+C (\\u0003) to interrupt a stuck or runaway command; exit a watch-mode TUI (q, Ctrl+C); send Enter (\\r) to dismiss a 'Press Enter to continue' pause; send arrow keys (\\u001b[A/B/C/D) to navigate a TUI menu. Always peek_console first to verify what the console is waiting for, then send_input with the appropriate response. Input is sent as-is — include \\r for Enter, \\u0003 for Ctrl+C, \\u001b[A for arrow-up, etc. JSON does not support \\xNN escapes; use \\uNNNN. Max 256 chars per call.")]
     public static async Task<string> SendInput(
         ConsoleManager consoleManager,
         [Description("Which console to send input to. Accepts a PID number or a display-name substring (e.g. \"Poseidon\" matches \"#10612 Poseidon\"). Required — you must specify the target.")]
         string console,
-        [Description("The raw input to send to the PTY. Sent as-is. Use \\r for Enter, \\x03 for Ctrl+C, \\x1b[A for arrow up, etc. Max 256 chars.")]
+        [Description("The raw input to send to the PTY. Sent as-is. Use \\r for Enter, \\u0003 for Ctrl+C, \\u001b[A for arrow up, etc. JSON does not support \\xNN escapes — use \\uNNNN. Max 256 chars.")]
         string input,
         [Description("Agent ID for sub-agent console isolation.")]
         string? agent_id = null,
