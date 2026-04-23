@@ -61,6 +61,73 @@ $global:__rp_ai_pipeline_lec = $null
 # bypassing any Write-Warning proxy), so only errors are counted.
 $global:__rp_err_count_at_cmd_start = 0
 
+# Resolve the OSC D exit code and the OSC L payload in one pass, from
+# the five signals the prompt fn has in hand at command finish:
+#
+#   $ok         — $? captured on the prompt fn's very first line
+#                 (single-line AI commands + user-typed commands).
+#   $lec        — $global:LASTEXITCODE at prompt fn time.
+#   $lecAtStart — snapshot from PreCommandLookupAction (before the
+#                 pipeline ran). Comparing the two tells us whether
+#                 $LASTEXITCODE was UPDATED BY this pipeline or is
+#                 stale from an earlier native exe.
+#   $aiOk       — $? stashed INSIDE a multi-line AI tempfile (set by
+#                 BuildMultiLineTempfileBody). $null for single-line
+#                 AI commands and all user-typed commands, because
+#                 only the multi-line wrapper needs the stash (its
+#                 outer `Remove-Item` would otherwise clobber $? before
+#                 the prompt fn ran).
+#   $aiLec      — matching $LASTEXITCODE stash for the multi-line
+#                 tempfile.
+#
+# Returns a hashtable with:
+#   ExitCode       — value for OSC D
+#   LastExitReport — value for OSC L; 0 when L should be silent
+#                    (either the pipeline failed — D already carries
+#                    the non-zero value — or no native ran, or the
+#                    native returned 0).
+#
+# Collapsing both outputs into one function removes the duplicate
+# branching the prompt fn used to have (the $overallOk / $lecChanged
+# calc for L was a second pass over the same signals the D calc had
+# already considered) and gives the resolver a single obvious place
+# to evolve.
+function global:__rp_resolve_exit_code([bool]$ok, $lec, $lecAtStart, $aiOk, $aiLec) {
+    $lecChanged = $lec -ne $lecAtStart
+    if ($null -ne $aiOk) {
+        # Multi-line AI path: the tempfile stash captured the user's
+        # body outcome before the outer `. 'tmp'; Remove-Item '...'`
+        # wrapper reset $?. Use $aiOk / $aiLec verbatim.
+        $ec = if ($aiOk) { 0 }
+              elseif ($null -ne $aiLec -and $aiLec -ne 0) { $aiLec }
+              else { 1 }
+        $overallOk = $aiOk
+    } else {
+        # Single-line + user-typed path: $? and $LASTEXITCODE are
+        # authoritative. $LASTEXITCODE only consulted when $? is false
+        # AND the value was written by this pipeline (otherwise a
+        # stale value from an earlier `cmd /c exit 7` would leak).
+        $ec = if ($ok) { 0 }
+              elseif ($lecChanged -and $null -ne $lec -and $lec -ne 0) { $lec }
+              else { 1 }
+        $overallOk = $ok
+    }
+
+    # OSC L is emitted ONLY when the pipeline overall succeeded (so D
+    # is 0) AND a native exe returned non-zero mid-pipeline. In every
+    # other case either D already carries the non-zero exit (pipeline
+    # failed) or there is nothing to report (no native ran, or it
+    # returned 0). Encoding "do not emit" as 0 lets the prompt fn call
+    # site use a plain `-gt 0` gate with no extra null checks.
+    $emitL = $overallOk -and $lecChanged -and $null -ne $lec -and $lec -ne 0
+    $lastExitReport = if ($emitL) { $lec } else { 0 }
+
+    return @{
+        ExitCode       = $ec
+        LastExitReport = $lastExitReport
+    }
+}
+
 function global:prompt {
     # CRITICAL: $? must be captured on the very first line — any statement
     # below (including simple assignments) can reset it. $? is the
@@ -93,30 +160,12 @@ function global:prompt {
         # CommandFinished with exit code. OSC C is emitted from
         # PreCommandLookupAction before the command runs, so by the time
         # we're in the prompt function it has already fired.
-        #
-        # Exit code resolution, in order:
-        #   (1) Multi-line AI stash is set → use it verbatim. The
-        #       tempfile's own last statement captured $? / $LASTEXITCODE
-        #       before Remove-Item ran and reset them.
-        #   (2) $ok is true → pipeline succeeded → 0.
-        #   (3) $ok is false AND $LASTEXITCODE was updated by this
-        #       pipeline AND the value is non-zero → use it (native exe
-        #       really did fail with that code).
-        #   (4) $ok is false otherwise → generic failure → 1. Using 1
-        #       rather than leaking a stale $LASTEXITCODE keeps the AI's
-        #       mental model honest: "the pipeline failed, exit code not
-        #       meaningful as a native exit".
-        if ($null -ne $aiOk) {
-            $ec = if ($aiOk) { 0 }
-                  elseif ($null -ne $aiLec -and $aiLec -ne 0) { $aiLec }
-                  else { 1 }
-        } else {
-            $lecChanged = $lec -ne $lecAtStart
-            $ec = if ($ok) { 0 }
-                  elseif ($lecChanged -and $null -ne $lec -and $lec -ne 0) { $lec }
-                  else { 1 }
-        }
-        $prefix += (__rp_osc_str "D;$ec")
+        # Exit-code + OSC L payload are resolved in one pass by
+        # __rp_resolve_exit_code so D and L never disagree on what
+        # "this pipeline succeeded" means (see that function for the
+        # resolution rules).
+        $__rp_res = __rp_resolve_exit_code $ok $lec $lecAtStart $aiOk $aiLec
+        $prefix += (__rp_osc_str "D;$($__rp_res.ExitCode)")
 
         # Errors-this-pipeline count via $Error.Count delta. Floor at 0
         # so a user `$Error.Clear()` mid-command can't produce a negative
@@ -183,26 +232,12 @@ function global:prompt {
             }
         }
 
-        # OSC L: raw $LASTEXITCODE at command end, emitted ONLY when a
-        # native exe returned non-zero inside this pipeline AND the
-        # pipeline overall succeeded ($? True on the last statement).
-        # D has already been emitted as 0 in that case (PS semantics —
-        # pipeline concept is success of the last statement, not any
-        # native exit along the way); L exists so the AI can still see
-        # "a native returned N mid-pipeline" instead of a silent green ✓
-        # Completed. The proxy renders it as `| LastExit: N`.
-        #
-        # Gates:
-        #   $overallOk true   → the pipeline succeeded overall (D == 0)
-        #   $lecChanged       → $LASTEXITCODE was written BY this pipeline
-        #                       (not a stale value from a prior session)
-        #   $lec non-null & ≠0 → a native actually returned non-zero
-        # When $overallOk is false, D already carries the non-zero exit
-        # value (the elseif branch above), so L would be redundant.
-        $overallOk = if ($null -ne $aiOk) { $aiOk } else { $ok }
-        $lecChangedForTag = $lec -ne $lecAtStart
-        if ($overallOk -and $lecChangedForTag -and $null -ne $lec -and $lec -ne 0) {
-            $prefix += (__rp_osc_str "L;$lec")
+        # OSC L: __rp_resolve_exit_code encoded "do not emit" as 0, so
+        # the prompt fn just gates on > 0 — all the pipeline-overall-ok
+        # / lecChanged / native-actually-non-zero logic lives in the
+        # resolver with the D decision it is paired with.
+        if ($__rp_res.LastExitReport -gt 0) {
+            $prefix += (__rp_osc_str "L;$($__rp_res.LastExitReport)")
         }
     }
 
