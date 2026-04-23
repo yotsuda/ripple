@@ -1534,7 +1534,10 @@ public class ConsoleWorker
                     Log($"Resized PTY to {cols}x{rows}");
                 }
             }
-            catch { }
+            catch { /* best-effort: Console.WindowWidth/Height throw on
+                       redirected streams, _pty.Resize can fail if the
+                       handle closed mid-tick. Next poll re-tries with
+                       fresh state. */ }
         }
     }
 
@@ -1905,7 +1908,11 @@ public class ConsoleWorker
             _stdoutStream.Write(outBytes, 0, outBytes.Length);
             _stdoutStream.Flush();
         }
-        catch { }
+        catch { /* best-effort: visible-console mirroring must never
+                   take down the worker. Redirected stdout, closed
+                   console window, encoding surrogates — any failure
+                   here degrades the human view but the MCP stdio
+                   channel (which the AI reads) is untouched. */ }
     }
 
     /// <summary>
