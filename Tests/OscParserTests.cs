@@ -17,6 +17,26 @@ public class OscParserTests
 
         Console.WriteLine("=== OscParser Tests ===");
 
+        // Compact one-liner for the OSC 633 extension payloads
+        // (E / L / R / T). Each of those events is parsed identically
+        // at the top level (the `\x1b]633;` prefix + BEL terminator)
+        // and differs only in payload letter + per-event field. Before
+        // this helper each test was 6 lines of boilerplate; now it's
+        // one call with a validator lambda.
+        //
+        // Uses BEL-terminated sequences to exercise the complete OSC
+        // path (parse → payload dispatch → event construction).
+        void AssertOscExt(string payload, OscParser.OscEventType expectedType,
+                          Func<OscParser.OscEvent, bool> validator, string label)
+        {
+            var p = new OscParser();
+            var r = p.Parse("\x1b]633;" + payload + "\x07");
+            Assert(r.Events.Count == 1, $"{label}: event count");
+            if (r.Events.Count != 1) return;  // avoid IndexOutOfRangeException cascade
+            Assert(r.Events[0].Type == expectedType, $"{label}: type");
+            Assert(validator(r.Events[0]), $"{label}: value");
+        }
+
         // Test 1: Basic PromptStart
         {
             var parser = new OscParser();
@@ -44,100 +64,22 @@ public class OscParserTests
             Assert(result.Events[0].Cwd == "/home/user", "Cwd value");
         }
 
-        // Test 3b: ErrorCount (OSC 633;E;{N}) — ripple's PowerShell-only
-        // extension that lets the proxy render `Errors: N` in the status
-        // line. Parsed identically to D's exit code; the count flows
-        // through OscEvent.ErrorCount.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("\x1b]633;E;3");
-            Assert(result.Events.Count == 1, "ErrorCount event count");
-            Assert(result.Events[0].Type == OscParser.OscEventType.ErrorCount, "ErrorCount type");
-            Assert(result.Events[0].ErrorCount == 3, "ErrorCount value");
-        }
-
-        // Test 3c: ErrorCount with zero — still emitted, downstream
-        // formatter gates on > 0.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("\x1b]633;E;0");
-            Assert(result.Events.Count == 1, "ErrorCount-zero event count");
-            Assert(result.Events[0].ErrorCount == 0, "ErrorCount-zero value");
-        }
-
-        // Test 3d: ErrorCount with malformed payload defaults to 0.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("\x1b]633;E;not-a-number");
-            Assert(result.Events.Count == 1, "ErrorCount-bad event count");
-            Assert(result.Events[0].ErrorCount == 0, "ErrorCount-bad defaults to 0");
-        }
-
-        // Test 3e: LastExitCode (OSC 633;L;{N}) — ripple's PowerShell-only
-        // extension. Integration script emits it only when a native exe
-        // returned non-zero mid-pipeline AND the overall pipeline succeeded,
-        // but the parser treats any well-formed payload as a valid event
-        // (gating lives in integration.ps1).
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("\x1b]633;L;7");
-            Assert(result.Events.Count == 1, "LastExitCode event count");
-            Assert(result.Events[0].Type == OscParser.OscEventType.LastExitCode, "LastExitCode type");
-            Assert(result.Events[0].LastExitCode == 7, "LastExitCode value");
-        }
-
-        // Test 3f: LastExitCode with malformed payload defaults to 0.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("\x1b]633;L;not-a-number");
-            Assert(result.Events.Count == 1, "LastExitCode-bad event count");
-            Assert(result.Events[0].LastExitCode == 0, "LastExitCode-bad defaults to 0");
-        }
-
-        // Test 3g: ErrorMessage (OSC 633;R;{base64}) — ripple's
-        // PowerShell-only extension. One event per new $Error entry;
-        // payload is base64(UTF-8) of the error's ToString().
-        {
-            var parser = new OscParser();
-            // "boom" base64-encoded is "Ym9vbQ=="
-            var result = parser.Parse("]633;R;Ym9vbQ==");
-            Assert(result.Events.Count == 1, "ErrorMessage event count");
-            Assert(result.Events[0].Type == OscParser.OscEventType.ErrorMessage, "ErrorMessage type");
-            Assert(result.Events[0].ErrorMessage == "boom", "ErrorMessage decoded value");
-        }
-
-        // Test 3h: ErrorMessage with malformed base64 keeps the event
-        // but leaves ErrorMessage null — tracker filters nulls before
-        // appending, so a corrupted payload is lost but the pipeline
-        // continues.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("]633;R;!!!not-valid-base64!!!");
-            Assert(result.Events.Count == 1, "ErrorMessage-bad event count");
-            Assert(result.Events[0].ErrorMessage == null, "ErrorMessage-bad value is null");
-        }
-
-        // Test 3i: TruncatedErrorCount (OSC 633;T;{N}) — emitted by
-        // the integration script when its R cap was hit. Distinct
-        // from R so the proxy can render truncation as list metadata
-        // instead of as a phantom error entry.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("]633;T;5");
-            Assert(result.Events.Count == 1, "TruncatedErrorCount event count");
-            Assert(result.Events[0].Type == OscParser.OscEventType.TruncatedErrorCount, "TruncatedErrorCount type");
-            Assert(result.Events[0].TruncatedErrorCount == 5, "TruncatedErrorCount value");
-        }
-
-        // Test 3j: TruncatedErrorCount with malformed payload defaults to 0.
-        {
-            var parser = new OscParser();
-            var result = parser.Parse("]633;T;not-a-number");
-            Assert(result.Events.Count == 1, "TruncatedErrorCount-bad event count");
-            Assert(result.Events[0].TruncatedErrorCount == 0, "TruncatedErrorCount-bad defaults to 0");
-        }
-
-
+        // Tests 3b-3j: OSC 633 extension payloads (E / L / R / T) —
+        // ripple's PowerShell-only extensions. The parser handles each
+        // identically at the framing level; the per-event field is
+        // populated from the payload. Driven through AssertOscExt so
+        // the shape (event-count + type + value assertion) is declared
+        // once and each case fits on a single line. "boom" base64-
+        // encoded is "Ym9vbQ==" (used for the R positive case).
+        AssertOscExt("E;3",               OscParser.OscEventType.ErrorCount,          e => e.ErrorCount == 3,          "ErrorCount");
+        AssertOscExt("E;0",               OscParser.OscEventType.ErrorCount,          e => e.ErrorCount == 0,          "ErrorCount-zero");
+        AssertOscExt("E;not-a-number",    OscParser.OscEventType.ErrorCount,          e => e.ErrorCount == 0,          "ErrorCount-bad");
+        AssertOscExt("L;7",               OscParser.OscEventType.LastExitCode,        e => e.LastExitCode == 7,        "LastExitCode");
+        AssertOscExt("L;not-a-number",    OscParser.OscEventType.LastExitCode,        e => e.LastExitCode == 0,        "LastExitCode-bad");
+        AssertOscExt("R;Ym9vbQ==",        OscParser.OscEventType.ErrorMessage,        e => e.ErrorMessage == "boom",   "ErrorMessage");
+        AssertOscExt("R;!!!invalid!!!",   OscParser.OscEventType.ErrorMessage,        e => e.ErrorMessage == null,     "ErrorMessage-bad");
+        AssertOscExt("T;5",               OscParser.OscEventType.TruncatedErrorCount, e => e.TruncatedErrorCount == 5, "TruncatedErrorCount");
+        AssertOscExt("T;not-a-number",    OscParser.OscEventType.TruncatedErrorCount, e => e.TruncatedErrorCount == 0, "TruncatedErrorCount-bad");
 
         // Test 4: Mixed output + OSC
         {
