@@ -192,7 +192,7 @@ public static class AdapterDeclaredTestsRunner
         }
 
         // Use the adapter's canonical name as the shell argument; the
-        // worker resolves it via ResolveShellPath (PATH lookup) and
+        // worker resolves it via ShellPathResolver.Resolve (PATH lookup) and
         // looks the adapter up via AdapterRegistry.Default.Find, which
         // matches on the same name.
         var shell = adapter.Name;

@@ -341,7 +341,7 @@ public class ConsoleWorker
             foreach (var raw in candidates)
             {
                 var expanded = Environment.ExpandEnvironmentVariables(raw);
-                var resolved = ConsoleManager.ResolveShellPath(expanded);
+                var resolved = ShellPathResolver.Resolve(expanded);
                 if (File.Exists(resolved))
                 {
                     pickedRaw = raw;
@@ -363,7 +363,7 @@ public class ConsoleWorker
         else if (!string.IsNullOrEmpty(_adapter?.Process.Executable))
         {
             var expanded = Environment.ExpandEnvironmentVariables(_adapter.Process.Executable);
-            var resolved = ConsoleManager.ResolveShellPath(expanded);
+            var resolved = ShellPathResolver.Resolve(expanded);
             Log($"Executable override: '{_adapter.Process.Executable}' → {resolved}");
             _shell = resolved;
         }

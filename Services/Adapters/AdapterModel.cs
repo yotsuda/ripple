@@ -77,7 +77,7 @@ public class Adapter
             {
                 attempted.Add(raw);
                 var expanded = Environment.ExpandEnvironmentVariables(raw);
-                var resolved = ConsoleManager.ResolveShellPath(expanded);
+                var resolved = ShellPathResolver.Resolve(expanded);
                 if (File.Exists(resolved))
                     return new LaunchResolution(resolved, raw, attempted, Path.IsPathRooted(raw) ? "executable_candidates_rooted" : "executable_candidates_path");
             }
@@ -88,7 +88,7 @@ public class Adapter
         {
             attempted.Add(Process.Executable);
             var expanded = Environment.ExpandEnvironmentVariables(Process.Executable);
-            var resolved = ConsoleManager.ResolveShellPath(expanded);
+            var resolved = ShellPathResolver.Resolve(expanded);
             if (File.Exists(resolved))
                 return new LaunchResolution(resolved, Process.Executable, attempted, "executable");
         }
@@ -97,7 +97,7 @@ public class Adapter
         // code path when neither Executable nor ExecutableCandidates are
         // set.
         attempted.Add(Name);
-        var nameResolved = ConsoleManager.ResolveShellPath(Name);
+        var nameResolved = ShellPathResolver.Resolve(Name);
         if (Path.IsPathRooted(nameResolved) && File.Exists(nameResolved))
             return new LaunchResolution(nameResolved, Name, attempted, "name");
 
@@ -154,7 +154,7 @@ public class ProcessSpec
     /// Windows-style <c>%VAR%</c> references (e.g. <c>%JAVA_HOME%\bin\jdb.exe</c>)
     /// resolve against the process environment before path search.
     /// Bare names (like <c>perl</c>) are resolved via
-    /// <see cref="ConsoleManager.ResolveShellPath"/>, which searches
+    /// <see cref="ShellPathResolver.Resolve"/>, which searches
     /// the registry PATH + PATHEXT on Windows. Rooted paths are used
     /// as-is after env-var expansion.
     ///

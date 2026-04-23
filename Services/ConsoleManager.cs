@@ -286,7 +286,7 @@ public class ConsoleManager
                 $"Shell parameter must be a shell name or path, not a command line. Got: '{rawShell}'");
 
         // Resolve to full path via PATH search (e.g., "pwsh" → "C:\Program Files\PowerShell\7\pwsh.exe")
-        var resolvedShell = ResolveShellPath(rawShell);
+        var resolvedShell = ShellPathResolver.Resolve(rawShell);
         var shellFamily = NormalizeShellFamily(resolvedShell);
         bool forceNew = !string.IsNullOrEmpty(reason);
 
@@ -470,7 +470,7 @@ public class ConsoleManager
     private async Task<ExecutionPlan> PlanExecutionAsync(string command, string agentId, string? shell)
     {
         // Resolve shell to full path for consistent matching
-        var resolvedShell = shell != null ? ResolveShellPath(shell) : null;
+        var resolvedShell = shell != null ? ShellPathResolver.Resolve(shell) : null;
 
         int initialActivePid;
         int consolePid;
@@ -2217,7 +2217,7 @@ public class ConsoleManager
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             // Prefer pwsh (PowerShell 7); fall back to Windows PowerShell 5.1 if absent.
-            var pwshResolved = ResolveShellPath("pwsh.exe");
+            var pwshResolved = ShellPathResolver.Resolve("pwsh.exe");
             if (File.Exists(pwshResolved)) return "pwsh.exe";
             return "powershell.exe";
         }
@@ -2372,105 +2372,6 @@ public class ConsoleManager
     /// </summary>
     internal static string NormalizeShellFamily(string shell)
         => Path.GetFileNameWithoutExtension(shell).ToLowerInvariant();
-
-    /// <summary>
-    /// Resolve a shell name to its full path. If already rooted, returns as-is.
-    /// Otherwise searches PATH directories (with PATHEXT on Windows).
-    /// Returns the original string if resolution fails (let CreateProcess handle it).
-    /// </summary>
-    internal static string ResolveShellPath(string shell)
-    {
-        if (Path.IsPathRooted(shell))
-            return Path.GetFullPath(shell);
-
-        // Use the system-registered PATH (registry), not the current process PATH.
-        // The worker is launched with CreateEnvironmentBlock(bInherit=false) which
-        // constructs PATH from registry, so we must resolve against the same source.
-        var pathDirs = GetRegistryPath();
-
-        // On Windows, try extensions from PATHEXT registry value
-        var extensions = OperatingSystem.IsWindows()
-            ? GetRegistryPathExt()
-            : [""];
-
-        var hasExtension = Path.HasExtension(shell);
-
-        foreach (var dir in pathDirs)
-        {
-            if (hasExtension)
-            {
-                var fullPath = Path.Combine(dir, shell);
-                if (File.Exists(fullPath))
-                    return Path.GetFullPath(fullPath);
-            }
-
-            foreach (var ext in extensions)
-            {
-                var fullPath = Path.Combine(dir, shell + ext);
-                if (File.Exists(fullPath))
-                    return Path.GetFullPath(fullPath);
-            }
-        }
-
-        // Resolution failed — return as-is
-        return shell;
-    }
-
-    /// <summary>
-    /// Read PATH from Windows registry (System + User), matching what
-    /// CreateEnvironmentBlock produces for child processes.
-    /// Falls back to Environment.GetEnvironmentVariable on non-Windows.
-    /// </summary>
-    private static string[] GetRegistryPath()
-    {
-        if (!OperatingSystem.IsWindows())
-            return Environment.GetEnvironmentVariable("PATH")
-                ?.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries) ?? [];
-
-        try
-        {
-            var systemPath = Microsoft.Win32.Registry.GetValue(
-                @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-                "Path", "") as string ?? "";
-            var userPath = Microsoft.Win32.Registry.GetValue(
-                @"HKEY_CURRENT_USER\Environment",
-                "Path", "") as string ?? "";
-
-            return $"{systemPath};{userPath}"
-                .Split(';', StringSplitOptions.RemoveEmptyEntries);
-        }
-        catch
-        {
-            return Environment.GetEnvironmentVariable("PATH")
-                ?.Split(';', StringSplitOptions.RemoveEmptyEntries) ?? [];
-        }
-    }
-
-    /// <summary>
-    /// Read PATHEXT from registry (System environment). Windows-only
-    /// by construction — the caller (ResolveShellPath) already branches
-    /// on OperatingSystem.IsWindows() before invoking this, but the
-    /// early-return keeps the CA1416 analyzer happy without relying on
-    /// inter-method flow analysis.
-    /// </summary>
-    private static string[] GetRegistryPathExt()
-    {
-        if (!OperatingSystem.IsWindows())
-            return [".exe", ".cmd", ".bat"];
-
-        try
-        {
-            var pathExt = Microsoft.Win32.Registry.GetValue(
-                @"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-                "PATHEXT", "") as string ?? "";
-            var result = pathExt.Split(';', StringSplitOptions.RemoveEmptyEntries);
-            return result.Length > 0 ? result : [".exe", ".cmd", ".bat"];
-        }
-        catch
-        {
-            return [".exe", ".cmd", ".bat"];
-        }
-    }
 
     public record StartConsoleResult(string Status, int Pid, string DisplayName, string? ShellFamily = null, string? Cwd = null);
 
