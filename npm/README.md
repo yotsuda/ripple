@@ -69,7 +69,7 @@ ripple opens a **real, visible terminal window**. You see every AI command as it
 
 ### Language REPLs and debuggers, not just shells
 
-ripple isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **eleven language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — plus **three interactive debuggers**: **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **groovysh** REPL for a Spring Boot codebase exploration, a **sqlite3** session for ad-hoc data shaping, a **perldb** breakpoint loop to chase a bug in a live Perl program — all with the same `execute_command` and the same shared-terminal transparency as the shells.
+ripple isn't limited to the four shells (pwsh/powershell, bash, zsh, cmd) — it also hosts **twelve language REPLs**: **python**, **node**, **racket**, **ccl** / **abcl** / **sbcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — plus **three interactive debuggers**: **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Same AI affordances apply: load a heavy setup once, pipe results through follow-ups, keep state, step through a multi-line investigation. Tell the AI to drive a **groovysh** REPL for a Spring Boot codebase exploration, a **sqlite3** session for ad-hoc data shaping, a **perldb** breakpoint loop to chase a bug in a live Perl program — all with the same `execute_command` and the same shared-terminal transparency as the shells.
 
 Debuggers expose a structured `commands.debugger` vocabulary (step_in / step_over / continue / print / backtrace / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s`, `step`, or something else.
 
@@ -77,7 +77,8 @@ Debuggers expose a structured `commands.debugger` vocabulary (step_in / step_ove
 
 | Tool | Description |
 |------|-------------|
-| `start_console` | Open a visible terminal. Pick a shell (bash, pwsh, powershell, cmd). Reuses an existing standby of the same shell unless `reason` is provided. |
+| `list_shells` | Enumerate every adapter this ripple build accepts as the `shell` argument — shells, REPLs, and debuggers — with their resolved executable paths and any startup load issues. Use before `start_console` to see what's available, or to diagnose an unrecognized shell name. |
+| `start_console` | Open a visible terminal. Pick a shell (bash, pwsh, powershell, cmd) or any registered REPL / debugger adapter. Reuses an existing standby of the same adapter unless `reason` is provided. |
 | `execute_command` | Run a pipeline. Optionally target a specific `shell`. Times out cleanly with output cached for `wait_for_completion`; timeout responses include a `partialOutput` snapshot for immediate diagnosis. |
 | `wait_for_completion` | Block until busy consoles finish and retrieve cached output. |
 | `peek_console` | Read-only snapshot of what a console is displaying. Windows reads the screen buffer directly; Linux/macOS uses a VT interpreter. Reports busy/idle state, running command, and elapsed time. |

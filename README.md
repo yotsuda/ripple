@@ -82,7 +82,8 @@ This is impossible with stdin-piped MCP shells, where the AI must somehow supply
 
 | Tool | Description |
 |------|-------------|
-| `start_console` | Open a visible terminal window. Pick any adapter — shells (bash, pwsh, zsh, cmd), REPLs (python, node, racket, ccl, abcl, fsi, jshell, groovysh, lua, deno, sqlite3), or debuggers (perldb, jdb, pdb). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same adapter unless `reason` is provided. |
+| `list_shells` | Enumerate every adapter this ripple build accepts as the `shell` argument — shells, REPLs, and debuggers. Each entry reports name, aliases, description, family (`shell` / `repl` / `debugger`), source (embedded vs. external YAML from `~/.ripple/adapters`), and the resolved absolute executable path `start_console` would launch (or a `not found in PATH` note). Also surfaces startup load issues (parse errors, collisions, overrides) so an adapter YAML that silently failed to register is discoverable at runtime. Use before `start_console` to check what is actually available, or when diagnosing why an expected shell name is unrecognized. |
+| `start_console` | Open a visible terminal window. Pick any adapter — shells (bash, pwsh, zsh, cmd), REPLs (python, node, racket, ccl, abcl, sbcl, fsi, jshell, groovysh, lua, deno, sqlite3), or debuggers (perldb, jdb, pdb). Optional `cwd`, `banner`, and `reason` parameters. Reuses an existing standby of the same adapter unless `reason` is provided. |
 | `execute_command` | Run a pipeline. Optionally specify `shell` to target a specific shell type — finds an existing console of that shell, or auto-starts one. Times out cleanly with output cached for `wait_for_completion`. On timeout, includes a `partialOutput` snapshot so the AI can diagnose stuck commands immediately. |
 | `wait_for_completion` | Block until busy consoles finish and retrieve cached output (use after a command times out). |
 | `peek_console` | Read-only snapshot of what a console is currently displaying. On Windows, reads the console screen buffer directly (exact match with the visible terminal). On Linux/macOS, uses a built-in VT terminal interpreter as fallback. Specify a console by display name or PID, or omit to peek at the active console. Reports busy/idle state, running command, and elapsed time. |
@@ -100,11 +101,11 @@ Claude Code–compatible file primitives (`read_file`, `write_file`, `edit_file`
 
 ## REPL support
 
-On top of the four shells (pwsh/powershell, bash, zsh, cmd), ripple ships adapters for eleven REPLs — **python**, **node**, **racket**, **ccl** / **abcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
+On top of the four shells (pwsh/powershell, bash, zsh, cmd), ripple ships adapters for twelve REPLs — **python**, **node**, **racket**, **ccl** / **abcl** / **sbcl** (Common Lisp), **fsi** (F# Interactive), **jshell** (Java), **groovysh** (Apache Groovy Shell), **sqlite3**, **lua**, and **deno** — and for three debuggers — **perldb** (Perl's `perl -d`), **jdb** (Java Debugger), and **pdb** (Python debugger). Start any of them with `start_console shell=python` (or `node`, `sqlite3`, `perldb`, etc.), and the same OSC 633 command-lifecycle tracking, session persistence, cache-on-timeout, and auto-routing that the shell adapters get applies unchanged.
 
 Debugger adapters are a new `family: debugger` class: they expose the regular session contract *plus* a structured `commands.debugger` vocabulary (step_in / step_over / step_out / continue / print / dump / backtrace / source_list / locals / breakpoint_set / ...) so AI agents can drive any debugger using the same operation names, regardless of whether the underlying syntax is `s` (perldb), `step` (jdb), or `s` (pdb).
 
-All eighteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.ripple/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
+All nineteen adapters are defined by declarative YAML files in `adapters/` and driven by a shared worker runtime — see [adapters/SCHEMA.md](adapters/SCHEMA.md) for the framework. External adapters can be dropped into `~/.ripple/adapters/*.yaml`, but the schema is still iterating toward a v1 freeze, so for now upstreaming additions is the safer path than carrying local YAMLs.
 
 ## Multi-shell behavior
 
@@ -139,7 +140,7 @@ graph TB
 
     subgraph Proxy["ripple proxy (stdio MCP server)"]
         CM["Console Manager<br/>(cwd tracking, re-claim,<br/>cache drain, switching)"]
-        Tools["start_console<br/>execute_command<br/>wait_for_completion<br/>peek_console / send_input<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
+        Tools["list_shells<br/>start_console<br/>execute_command<br/>wait_for_completion<br/>peek_console / send_input<br/>read_file / write_file / edit_file<br/>search_files / find_files"]
     end
 
     subgraph Consoles["Visible Console Windows (each runs ripple --console)"]

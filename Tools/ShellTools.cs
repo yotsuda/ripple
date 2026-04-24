@@ -89,7 +89,7 @@ public class ShellTools
     [Description("Open a visible terminal window. The user can see and type in this terminal; AI commands sent via execute_command will also appear here in real time. If a standby console of the requested shell already exists it is reused unless `reason` is provided. Multiple shell types can be active simultaneously. Every response also reports the busy / finished / closed state of any other consoles you have open so background work stays visible.")]
     public static async Task<string> StartConsole(
         ConsoleManager consoleManager,
-        [Description("Shell to use. Name (bash, pwsh, zsh, cmd) or full path. Default: platform default.")]
+        [Description("Shell, REPL, or debugger to use. Name of any registered adapter (e.g. bash, pwsh, zsh, cmd, python, node, sqlite3, pdb, perldb, ...) or a full executable path. Call list_shells to see everything this ripple build accepts. Default: platform default shell.")]
         string? shell = null,
         [Description("Working directory. Default: home directory.")]
         string? cwd = null,
