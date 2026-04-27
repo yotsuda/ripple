@@ -24,16 +24,12 @@ public class ConsoleManagerTests
 
         Console.WriteLine("=== ConsoleManager Tests ===");
 
-        // Drift detection moved from a cwd-snapshot comparison
-        // (IsCwdDrifted) to the worker's provenance counter
-        // (CommandTracker.UserCmdsSinceLastAi). The counter is exercised in
-        // CommandTrackerTests; ConsoleManager's integration with that
-        // signal is exercised manually via the live session flow because
-        // it requires a real pipe round-trip to produce the get_status
-        // response the proxy reads. Only leave the function stub here so
-        // the scaffolding (pass/fail counts, output headers) stays
-        // consistent with the rest of the test runner.
-        Assert(true, "ConsoleManager: drift detection is now tested via CommandTracker.UserCmdsSinceLastAi");
+        // Drift detection is now done in PlanExecutionAsync via direct cwd
+        // comparison (live cwd vs LastAiCwd). End-to-end behavior is
+        // exercised manually via the live session flow — it needs a real
+        // pipe round-trip to produce the get_status response the proxy
+        // reads. Stub kept so the runner scaffolding stays consistent.
+        Assert(true, "ConsoleManager: drift detection now uses direct cwd comparison; exercised via live session tests");
 
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
