@@ -860,20 +860,26 @@ public class ConsoleManager
             }
 
             // First-use refuse: no stored cwd means this is the agent's
-            // first interaction with this logical shell. Surface the full
-            // shell_path so the AI can confirm the resolution before any
-            // destructive pipeline runs at the shell's natural home.
+            // first interaction with this logical shell. Surface the live
+            // cwd and shell path so the AI can confirm both before any
+            // destructive pipeline runs at the shell's natural home —
+            // without the live cwd, the AI has no way to tell whether
+            // re-sending the same pipeline is safe and ends up issuing a
+            // wasted round-trip just to learn what `pwd` would have shown.
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-            var shellPathNotice = !string.IsNullOrEmpty(targetShellPath)
-                ? $"\nResolved shell: {targetShellPath}"
-                : "";
+            var contextLines = new List<string>();
+            if (!string.IsNullOrEmpty(sourceCwd))
+                contextLines.Add($"Live cwd: '{sourceCwd}'");
+            if (!string.IsNullOrEmpty(targetShellPath))
+                contextLines.Add($"Resolved shell: {targetShellPath}");
+            var contextBlock = contextLines.Count > 0 ? "\n" + string.Join("\n", contextLines) : "";
             return new ExecutionPlan(consolePid, pipeName, cdCommand, expectedCwdAfterCd, routingNotice,
                 EarlyResult: new ExecuteResult
                 {
                     Pid = consolePid,
                     Switched = true,
                     DisplayName = displayName,
-                    Output = $"Switched to console {displayName}. Pipeline NOT executed — first execute_command for this logical shell. Re-send to run at the console's current cwd, or call start_console(shell=..., cwd=...) to target a specific directory.{shellPathNotice}",
+                    Output = $"Switched to console {displayName}. Pipeline NOT executed — first execute_command for this logical shell.{contextBlock}\nRe-send to run at this cwd, or call start_console(shell=..., cwd=...) to target a different directory.",
                 });
         }
         else
