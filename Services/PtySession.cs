@@ -25,9 +25,37 @@ public static class PtyFactory
         bool inheritEnvironment = false,
         IReadOnlyDictionary<string, string>? envOverrides = null)
     {
-        if (OperatingSystem.IsWindows())
-            return ConPty.Start(commandLine, workingDirectory, cols, rows, inheritEnvironment, envOverrides);
+        var merged = MergePagerDefaults(envOverrides);
 
-        return UnixPty.Start(commandLine, workingDirectory, cols, rows, envOverrides);
+        if (OperatingSystem.IsWindows())
+            return ConPty.Start(commandLine, workingDirectory, cols, rows, inheritEnvironment, merged);
+
+        return UnixPty.Start(commandLine, workingDirectory, cols, rows, merged);
+    }
+
+    // Pager-suppression env defaults for every console ripple launches.
+    // External CLIs that probe isatty (git, less, man, kubectl, etc.) start
+    // an interactive pager when stdout is a real TTY — which ripple's
+    // ConPTY / forkpty always is. The pager freezes the visible console
+    // until someone sends `q`, which produces no human-UX win on a
+    // shared AI+human console where output already streams freely. A few
+    // tools recognize different env names (GIT_PAGER, MANPAGER), so cover
+    // the common ones at once. Adapter YAML `process.env` still wins —
+    // an adapter that genuinely needs a pager can re-declare PAGER.
+    private static IReadOnlyDictionary<string, string> MergePagerDefaults(
+        IReadOnlyDictionary<string, string>? envOverrides)
+    {
+        var merged = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["PAGER"] = "cat",
+            ["GIT_PAGER"] = "cat",
+            ["MANPAGER"] = "cat",
+        };
+        if (envOverrides != null)
+        {
+            foreach (var kv in envOverrides)
+                merged[kv.Key] = kv.Value;
+        }
+        return merged;
     }
 }
