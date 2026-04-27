@@ -866,10 +866,26 @@ public class ConsoleManager
             // without the live cwd, the AI has no way to tell whether
             // re-sending the same pipeline is safe and ends up issuing a
             // wasted round-trip just to learn what `pwd` would have shown.
+            //
+            // sourceCwd is the live cwd of the *source* console (only
+            // populated when we're switching from another active console).
+            // The sub-agent boundary and any path that lands here without
+            // a source console reach this branch with sourceCwd == null.
+            // For those cases probe the *target* console's cwd directly so
+            // the refuse message always carries it — the AI's confidence
+            // on the retry shouldn't depend on whether ripple happened to
+            // be switching from a known source.
+            string? liveCwd = sourceCwd;
+            if (string.IsNullOrEmpty(liveCwd))
+            {
+                try { liveCwd = await QueryConsoleCwdAsync(pipeName); }
+                catch { /* probe is best-effort; fall through with no Live cwd line */ }
+            }
+
             var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
             var contextLines = new List<string>();
-            if (!string.IsNullOrEmpty(sourceCwd))
-                contextLines.Add($"Live cwd: '{sourceCwd}'");
+            if (!string.IsNullOrEmpty(liveCwd))
+                contextLines.Add($"Live cwd: '{liveCwd}'");
             if (!string.IsNullOrEmpty(targetShellPath))
                 contextLines.Add($"Resolved shell: {targetShellPath}");
             var contextBlock = contextLines.Count > 0 ? "\n" + string.Join("\n", contextLines) : "";
