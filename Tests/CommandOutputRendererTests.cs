@@ -144,6 +144,137 @@ public static class CommandOutputRendererTests
                 $"slice-by-offset snapshot → clean multi-line output — expected \"a\\nb\\niter 1\\niter 2\\niter 3\", got {Quote(output)}");
         }
 
+        // Soft-wrap continuation detector: ConPTY wraps a long line at
+        // the viewport's right margin by emitting "\r\n + CSI <viewportRow>;<Cols>H"
+        // so the cursor visually lands on the next visible row at the
+        // wrap point. The renderer must recognize this pair as a logical
+        // wrap (not a real cursor move) and append the continuation to
+        // the SAME logical row, otherwise the chars overwrite whatever
+        // happens to live in the next row (a prompt echo, the next
+        // warning line, blanks). See HANDOFF_GARBLING.md for the
+        // dogfood report ("FontSitle.cs", "IDrawuches itxt.cs").
+        {
+            const int rows = 24;
+            const int cols = 10;
+            var grid = BuildBlankGrid(rows, cols);
+            // Seed a stale row at row 22 so we can detect bleed if the
+            // continuation lands there instead of getting joined.
+            WriteLineAt(grid[22], "STALECON");
+            var snapshot = BuildSnapshot(rows, cols, grid, pRow: 23, pCol: 0);
+
+            var r = new CommandOutputRenderer(snapshot);
+            // 10 chars fill the viewport row, then ConPTY's wrap pattern
+            // (\r\n + CUP back to (24,10)), then the continuation, then
+            // a real CRLF that ends the logical line. ConPTY DECAWM
+            // re-emits the wrapping char (`9`) at the start of the
+            // continuation; the renderer redirects to col N-1 so that
+            // duplicate overwrites itself rather than appending.
+            r.Feed("0123456789\r\n\x1b[24;10H9 next part\r\n");
+            var output = r.Render();
+
+            Assert(output == "0123456789 next part",
+                $"single soft-wrap continuation joined onto logical row — expected \"0123456789 next part\", got {Quote(output)}");
+        }
+
+        // Multi-wrap: a line longer than 2× viewport width emits
+        // \r\n + CUP TWICE, and both must redirect back to the same
+        // logical row. Each ConPTY wrap continuation begins by re-emitting
+        // the wrapping char (DECAWM auto-margin), so the second
+        // continuation's first char is `h` (the last char of the first
+        // continuation's `9 abcdefgh`).
+        {
+            const int rows = 24;
+            const int cols = 10;
+            var grid = BuildBlankGrid(rows, cols);
+            var snapshot = BuildSnapshot(rows, cols, grid, pRow: 23, pCol: 0);
+
+            var r = new CommandOutputRenderer(snapshot);
+            r.Feed("0123456789\r\n\x1b[24;10H9 abcdefgh\r\n\x1b[24;10Hh last\r\n");
+            var output = r.Render();
+
+            Assert(output == "0123456789 abcdefgh last",
+                $"multi-wrap soft-wrap chain joined — expected \"0123456789 abcdefghi last\", got {Quote(output)}");
+        }
+
+        // Negative: a CUP that arrives after a full-width line but
+        // targets a column AWAY from the viewport's right margin is a
+        // real cursor move (a TUI repositioning, not ConPTY's wrap),
+        // and must NOT be redirected. Tests the heuristic gate that
+        // prevents false positives.
+        {
+            const int rows = 24;
+            const int cols = 10;
+            var grid = BuildBlankGrid(rows, cols);
+            var snapshot = BuildSnapshot(rows, cols, grid, pRow: 23, pCol: 0);
+
+            var r = new CommandOutputRenderer(snapshot);
+            // Fill row to width, LF, then CUP to (24,1) — col 1 is
+            // nowhere near the wrap margin, so this is a real reposition.
+            r.Feed("0123456789\r\n\x1b[24;1HX");
+            var output = r.Render();
+
+            // The X should land at row 24 col 0 (post-CUP target), not
+            // get redirected back into row 23. Trailing rows are
+            // trimmed so the rendered output ends with the X line.
+            Assert(output == "0123456789\nX",
+                $"non-margin CUP after LF must not trigger soft-wrap redirect — expected \"0123456789\\nX\", got {Quote(output)}");
+        }
+
+        // ConPTY DECAWM auto-margin re-emits the wrapping char on the
+        // continuation line. When a long line fills col 0..N-1 (where
+        // N=Cols), the prefix ends with whatever char landed at col N-1.
+        // ConPTY's wrap continuation does not skip that char — it
+        // re-emits the same char as the FIRST char after the CUP-back-to-
+        // margin. So redirecting to col `_lastLfPreCol` (= N) leaves the
+        // prefix's last char at col N-1 in place, and the continuation's
+        // first char (a duplicate) lands at col N — visible as a doubled
+        // character in the joined logical row. Real-world dogfood report:
+        // a 105-col viewport showed `...CRLLF...` (LL doubled) for a git
+        // CRLF warning whose prefix ended with `L` of `CRL` and whose
+        // continuation began with `LF`. Fix: redirect to `lastLfPreCol-1`
+        // so the continuation's first char OVERWRITES the prefix's last
+        // (with the same char — DECAWM redraws the same byte), absorbing
+        // the duplication.
+        {
+            const int rows = 24;
+            const int cols = 105;
+            var grid = BuildBlankGrid(rows, cols);
+            var snapshot = BuildSnapshot(rows, cols, grid, pRow: 23, pCol: 0);
+
+            var r = new CommandOutputRenderer(snapshot);
+            // 105-char prefix ending with `L` (the L of CRL), wrap, CUP
+            // back to margin (col 105 = 1-indexed), continuation begins
+            // with `L` (DECAWM re-emit) followed by `F the next time...`
+            r.Feed("warning: in the working copy of 'LilySharp.Core/Rendering/IDrawingContext.cs', LF will be replaced by CRL\r\n\x1b[24;105HLF the next time Git touches it\r\n");
+            var output = r.Render();
+
+            const string expected = "warning: in the working copy of 'LilySharp.Core/Rendering/IDrawingContext.cs', LF will be replaced by CRLF the next time Git touches it";
+            Assert(output == expected,
+                $"ConPTY DECAWM duplicate-char wrap: continuation's first char must overwrite prefix's last col — expected {Quote(expected)}, got {Quote(output)}");
+        }
+
+        // Negative: short line followed by CUP-to-margin must not be
+        // treated as soft-wrap, because the LF that precedes it could
+        // not have been emitted by ConPTY's wrap-at-margin path (the
+        // row was nowhere near full).
+        {
+            const int rows = 24;
+            const int cols = 10;
+            var grid = BuildBlankGrid(rows, cols);
+            var snapshot = BuildSnapshot(rows, cols, grid, pRow: 23, pCol: 0);
+
+            var r = new CommandOutputRenderer(snapshot);
+            // Short row "hi", LF, then CUP-to-margin. preLfCol=2 is
+            // well below the viewport's right margin, so armSoftWrap
+            // is false → CUP applies normally.
+            r.Feed("hi\r\n\x1b[24;10HX");
+            var output = r.Render();
+
+            // X lands at (row 24, col 9) — leading 9 cols are spaces.
+            Assert(output == "hi\n         X",
+                $"short LF must not arm soft-wrap detector — expected \"hi\\n         X\", got {Quote(output)}");
+        }
+
         Console.WriteLine($"CommandOutputRenderer: {pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }

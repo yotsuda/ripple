@@ -144,6 +144,44 @@ internal sealed class CommandOutputRenderer
     // hit baseline rows that no longer hold the chars ConPTY expects.
     private int _viewportTop;
 
+    // PTY width frozen at command start (from VtLiteSnapshot.Cols). Used
+    // ONLY by the soft-wrap continuation detector below to recognize
+    // ConPTY's "\r\n + CUP-back-to-margin" pattern that emits when a
+    // long line wraps at the right edge of the visible viewport. Zero
+    // when no baseline was provided (CleanString test path) — wrap
+    // detection is then disabled, matching the existing "no viewport
+    // information" stance of CSI H/f.
+    private readonly int _viewportCols;
+
+    // Soft-wrap continuation state. ConPTY emits a long line that
+    // overflows the viewport's right margin as
+    //
+    //     <chars-up-to-col-Cols> \r\n \e[<bottomRow>;<Cols>H <continuation>
+    //
+    // i.e. it scrolls the visible screen one row (with \r\n), then
+    // positions the cursor BACK to where the wrap visually lands so the
+    // continuation is drawn at the right of the previous visible line.
+    // For an AI-facing logical-row model this is wrong: the wrap is a
+    // PURELY visual artefact of ConPTY's fixed-width viewport, not a
+    // logical line break. Without intervention the continuation lands
+    // on the row below — which already holds whatever was there (a
+    // prompt echo, a previous warning, blanks) — and the AI sees one
+    // logical line spliced into two visual rows with neighbour content
+    // bleeding through. (See HANDOFF_GARBLING.md for the original AI
+    // dogfood report: "FontSitle.cs", "IDrawuches itxt.cs".)
+    //
+    // The detector: right after a LineFeed whose source row was filled
+    // to the viewport's right margin, if the very next CSI H/f targets
+    // (CurRow, viewportCols-1) — exactly where ConPTY would put the
+    // wrap continuation cursor — treat it as a wrap and redirect the
+    // cursor to (lastLfRow, lastLfPreCol). The phantom blank row
+    // created by the spurious LF is left in place; either Render-time
+    // trim removes it (if no further output) or the next real line
+    // overwrites it.
+    private bool _pendingSoftWrap;
+    private int _lastLfRow;
+    private int _lastLfPreCol;
+
     // Alt-screen state. While active, writes are applied to a
     // separate row list — but Render() ignores it; only the placeholder
     // appears in output. On exit we restore main-buffer cursor state
@@ -181,6 +219,7 @@ internal sealed class CommandOutputRenderer
         {
             _rows.Add(new Row());
             _baselineRowCount = 0;
+            _viewportCols = 0;
             return;
         }
 
@@ -204,6 +243,7 @@ internal sealed class CommandOutputRenderer
         _savedCol = baseline.SavedCol;
         _pendingSgr = string.IsNullOrEmpty(baseline.ActiveSgr) ? null : baseline.ActiveSgr;
         _baselineRowCount = grid.Length;
+        _viewportCols = baseline.Cols;
 
         // If the snapshot was taken while alt-screen was active, the
         // renderer starts in alt-screen mode — extremely rare (would
@@ -256,12 +296,13 @@ internal sealed class CommandOutputRenderer
                     // is the same as what the visible terminal shows;
                     // keeping consistency with the human view trumps
                     // legacy "lossier" cleanup.
+                    _pendingSoftWrap = false;
                     SetCol(0);
                     i++;
                 }
             }
-            else if (c == '\b') { if (CurCol > 0) SetCol(CurCol - 1); i++; }
-            else if (c == '\t') { SetCol(Math.Min(((CurCol / 8) + 1) * 8, MaxCol)); i++; }
+            else if (c == '\b') { _pendingSoftWrap = false; if (CurCol > 0) SetCol(CurCol - 1); i++; }
+            else if (c == '\t') { _pendingSoftWrap = false; SetCol(Math.Min(((CurCol / 8) + 1) * 8, MaxCol)); i++; }
             else if (c == '\x1b') { i = ParseEscape(text, i); }
             else if (c >= ' ') { WriteChar(c); i++; }
             else { i++; /* drop other C0 */ }
@@ -473,6 +514,20 @@ internal sealed class CommandOutputRenderer
         // its SgrPrefix — exactly where the user intended. End-of-input
         // SGR resets that never reach a WriteChar are flushed by
         // FlushTrailingSgrAtEnd called from Render().
+
+        // Capture pre-LF cursor for the soft-wrap continuation detector
+        // (see _pendingSoftWrap docs). Only arm the flag when we have a
+        // baseline (so _viewportCols is known) and the source row was
+        // filled close to the viewport's right margin — short rows
+        // followed by CUP are normal application behaviour, not wrap.
+        int preLfRow = CurRow;
+        int preLfCol = CurCol;
+        bool armSoftWrap =
+            !_altActive
+            && _baselineRowCount > 0
+            && _viewportCols > 0
+            && preLfCol >= _viewportCols - 1;
+
         var rows = ActiveRows;
         int newRow;
         if (CurRow + 1 >= MaxRows)
@@ -488,6 +543,17 @@ internal sealed class CommandOutputRenderer
         SetRow(newRow);
         EnsureRow(newRow);
         SetCol(0);
+
+        if (armSoftWrap)
+        {
+            _pendingSoftWrap = true;
+            _lastLfRow = preLfRow;
+            _lastLfPreCol = preLfCol;
+        }
+        else
+        {
+            _pendingSoftWrap = false;
+        }
 
         // An explicit LineFeed (bare LF or CRLF from the command's own
         // output) means we're at the start of a new logical line — the
@@ -517,6 +583,11 @@ internal sealed class CommandOutputRenderer
 
     private void WriteChar(char c)
     {
+        // Any actual cell write breaks the LF→CUP-back wrap pattern,
+        // so the soft-wrap detector must not still trigger on a CUP
+        // that arrives later after intervening content.
+        _pendingSoftWrap = false;
+
         if (CurCol >= MaxCol) return;
         EnsureRow(CurRow);
         var row = ActiveRows[CurRow];
@@ -818,14 +889,22 @@ internal sealed class CommandOutputRenderer
             return payloadEnd + terminatorLen;
         }
         if (next == '(' || next == ')') return Math.Min(i + 2, input.Length);
-        if (next == '7') { _savedRow = _row; _savedCol = _col; return i + 1; }
-        if (next == '8') { _row = _savedRow; _col = _savedCol; EnsureRow(_row); return i + 1; }
+        if (next == '7') { _pendingSoftWrap = false; _savedRow = _row; _savedCol = _col; return i + 1; }
+        if (next == '8') { _pendingSoftWrap = false; _row = _savedRow; _col = _savedCol; EnsureRow(_row); return i + 1; }
         if (next == '=' || next == '>') return i + 1;
         return i + 1;
     }
 
     private void ApplyCsi(ReadOnlySpan<char> paramsSpan, char final, ReadOnlySpan<char> fullInput, int seqStart, int finalIdx)
     {
+        // The soft-wrap detector requires LF to be IMMEDIATELY followed
+        // by the target CUP — any intervening CSI (color change, line
+        // erase, alt-screen toggle, …) means we're not in the wrap
+        // pattern. Snapshot the flag here, clear it, and let only the
+        // H/f case consult the saved copy.
+        bool wasPendingSoftWrap = _pendingSoftWrap;
+        _pendingSoftWrap = false;
+
         if (paramsSpan.Length > 0 && paramsSpan[0] == '?')
         {
             var modeSpan = paramsSpan.Slice(1);
@@ -890,6 +969,52 @@ internal sealed class CommandOutputRenderer
                         newRow = _viewportTop + wantRow;
                     else
                         newRow = Math.Max(CurRow, wantRow);
+
+                    // Soft-wrap continuation detection: ConPTY emits a
+                    // long line that overflows the right margin as
+                    // \r\n + CSI <bottomRow>;<Cols>H. The LineFeed in
+                    // that pair has already armed _pendingSoftWrap with
+                    // the source row (lastLfRow) and the col we were
+                    // at when the LF arrived (lastLfPreCol, which is
+                    // the visible margin). If this CUP's target is the
+                    // row we just LF'd to AND its target col is the
+                    // viewport's right margin, the pair is a visual
+                    // wrap, not a real cursor move — redirect the
+                    // cursor back to (lastLfRow, lastLfPreCol) so the
+                    // continuation chars append to the SAME logical
+                    // row instead of overwriting whatever happens to
+                    // be in the next row (which is how warning text
+                    // got spliced with prompt echoes pre-fix; see
+                    // HANDOFF_GARBLING.md). The phantom blank row left
+                    // behind by the spurious LF is either trimmed at
+                    // Render time or overwritten by the next real
+                    // line — both are harmless.
+                    if (wasPendingSoftWrap
+                        && _viewportCols > 0
+                        && newRow == CurRow
+                        && newCol >= _viewportCols - 1)
+                    {
+                        // ConPTY DECAWM auto-margin re-emits the wrapping
+                        // char on the continuation line: prefix fills col
+                        // 0..N-1, then the continuation's first char is
+                        // the SAME char that already lives at col N-1
+                        // (bytewise duplicate, not a different glyph).
+                        // Redirecting to col N-1 (margin last) lets the
+                        // continuation's first char overwrite that cell
+                        // with itself — a no-op for content but absorbs
+                        // the duplicate, so the joined logical row carries
+                        // the correct chars without a doubled letter.
+                        // Redirecting to col N (lastLfPreCol unchanged)
+                        // would leave the prefix's last char at N-1 AND
+                        // append the continuation's first char at N,
+                        // producing `...CRLLF...` for a 105-col wrap of
+                        // a git CRLF warning whose prefix ends with `L`.
+                        SetRow(_lastLfRow);
+                        SetCol(Math.Max(0, _lastLfPreCol - 1));
+                        EnsureRow(_lastLfRow);
+                        break;
+                    }
+
                     EnsureRow(newRow);
                     SetCol(newCol);
                 }
