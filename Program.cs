@@ -5,6 +5,7 @@ using ModelContextProtocol;
 using Ripple.Services;
 using Ripple.Services.Adapters;
 using Ripple.Tools;
+using System.Reflection;
 using System.Text;
 
 namespace Ripple;
@@ -13,6 +14,23 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        // Early exits that don't need adapter registry or encoding
+        // setup — kept above the heavy init so `--version` / `--help`
+        // stay dependency-free, instant, and quiet on stderr (the
+        // adapter report would otherwise leak before the version line).
+        if (args.Contains("--version") || args.Contains("-v"))
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+            Console.WriteLine($"ripple {info?.InformationalVersion ?? "unknown"}");
+            return;
+        }
+        if (args.Contains("--help") || args.Contains("-h"))
+        {
+            PrintUsage(Console.Out);
+            return;
+        }
+
         // Register legacy codepages (Shift-JIS, EUC-JP, GBK, Big5, windows-125x, …)
         // so FileTools can read/write non-UTF-8 text files. CodePagesEncodingProvider
         // carries its own tables, so this works under InvariantGlobalization + AOT.
@@ -51,7 +69,19 @@ public class Program
         //     an adapter that failed to load) surface at the point of
         //     use as the MCP tool response error — that's where the
         //     problem actually matters to the caller.
-        bool isSilentMode = args.Length == 0 || args.Contains("--console");
+        // Modes that don't surface adapter status to a human reader:
+        //   - no args / --console → MCP/worker; adapter info goes to
+        //     list_adapters tool callers, not stderr
+        //   - any non-recognized arg combination → falls through to the
+        //     unrecognized-args branch below, where the error message
+        //     is the only useful stderr line
+        bool isCliMode =
+            args.Contains("--test")
+            || args.Contains("--list-adapters")
+            || args.Contains("--probe-adapters")
+            || args.Contains("--adapter-tests")
+            || args.Contains("--spill-tests");
+        bool isSilentMode = !isCliMode;
         if (!isSilentMode)
         {
             var level = adapterReport.HasErrors ? "WARNING" : "info";
@@ -163,6 +193,20 @@ public class Program
             return;
         }
 
+        // No args → MCP stdio server. Any other arg combination that
+        // reaches here is unrecognized; silently entering MCP server
+        // mode would block on stdin waiting for JSON-RPC and look like
+        // a hang to the human typing `ripple --some-typo`. Reject up
+        // front with a clear message + non-zero exit so a typo or an
+        // unknown flag fails fast instead of freezing the terminal.
+        if (args.Length > 0)
+        {
+            Console.Error.WriteLine($"ripple: unrecognized argument(s): {string.Join(" ", args)}");
+            PrintUsage(Console.Error);
+            Environment.Exit(2);
+            return;
+        }
+
         // Default: MCP server mode
         var builder = Host.CreateApplicationBuilder(args);
 
@@ -192,6 +236,24 @@ public class Program
         consoleManager.Initialize();
 
         await host.RunAsync();
+    }
+
+    private static void PrintUsage(TextWriter writer)
+    {
+        writer.WriteLine("Usage: ripple [option]");
+        writer.WriteLine();
+        writer.WriteLine("Modes (mutually exclusive):");
+        writer.WriteLine("  (no args)            run as MCP stdio server (default)");
+        writer.WriteLine("  --console <args>     run as ConPTY console worker (internal use)");
+        writer.WriteLine("  --test [--e2e] [--conpty]");
+        writer.WriteLine("                       run unit / e2e / ConPTY-minimal tests");
+        writer.WriteLine("  --adapter-tests [--only <name>]");
+        writer.WriteLine("                       run each adapter's declared `tests:` block");
+        writer.WriteLine("  --probe-adapters     run each adapter's probe.eval health check");
+        writer.WriteLine("  --spill-tests        run the Windows-only spill integration suite");
+        writer.WriteLine("  --list-adapters      print loaded adapter registry and exit");
+        writer.WriteLine("  --version, -v        print version and exit");
+        writer.WriteLine("  --help, -h           print this usage and exit");
     }
 
     private static void PrintAdapterList(
