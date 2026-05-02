@@ -902,26 +902,32 @@ public class ConsoleManager
         {
             // Same-console branch: staying on the active console. Detect
             // cwd drift via direct comparison of live cwd vs LastAiCwd —
-            // if they differ, the user (or AI's previous command, or a
-            // standby-rotation that left LastAiCwd stale) moved the cwd
-            // since AI last observed it. We restore AI's intended cwd via
-            // a cd preamble before the pipeline runs, keeping the shared
-            // console alive instead of abandoning it.
+            // if they differ, the user (or a standby-rotation) moved the
+            // cwd since AI last observed it. We bail out without executing:
+            // running the AI's command silently at the user's cwd risks
+            // destructive ops at the wrong place (e.g. `rm *.tmp` at a
+            // workspace the user opened to inspect). Update LastAiCwd to
+            // the live cwd so a re-issue of the same command runs at the
+            // user's location with no second bail. The AI keeps full
+            // agency: re-send to accept the new cwd, or prepend a `cd`
+            // back to the previous location.
             string? activeLastAiCwd;
             lock (_lock) activeLastAiCwd = _consoles.GetValueOrDefault(consolePid)?.LastAiCwd;
 
             if (activeLastAiCwd != null && sourceCwd != null
                 && !CwdEquals(sourceCwd, activeLastAiCwd) && !string.IsNullOrEmpty(targetShellFamily))
             {
-                var cdPreamble = BuildCdPreamble(targetShellFamily!, activeLastAiCwd);
-                if (cdPreamble != null)
-                {
-                    cdCommand = cdPreamble.TrimEnd('&', ';', ' ');
-                    expectedCwdAfterCd = activeLastAiCwd;
-                    var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
-                    routingNotice = routingNotice
-                        ?? $"Note: {displayName} was at '{sourceCwd}'; restored cwd to your last known '{activeLastAiCwd}'.";
-                }
+                RecordShellCwd(consolePid, sourceCwd);
+                var displayName = _consoles.GetValueOrDefault(consolePid)?.DisplayName ?? $"#{consolePid}";
+                var revertHint = BuildCdPreamble(targetShellFamily!, activeLastAiCwd)?.TrimEnd('&', ';', ' ');
+                var revertSuffix = revertHint != null ? $", or prepend `{revertHint}` to revert." : ".";
+                return new ExecutionPlan(consolePid, pipeName, CdCommand: null, PreambleCwd: null, RoutingNotice: null,
+                    EarlyResult: new ExecuteResult
+                    {
+                        Pid = consolePid,
+                        DisplayName = displayName,
+                        Output = $"ℹ️ User changed cwd in console {displayName} from '{activeLastAiCwd}' to '{sourceCwd}'.\nPipeline NOT executed. Re-issue to run at '{sourceCwd}'{revertSuffix}",
+                    });
             }
         }
 
