@@ -636,15 +636,25 @@ public class FileTools
     private static readonly ConcurrentDictionary<string, Regex> _globRegexCache = new();
     private static readonly ConcurrentDictionary<string, Regex> _searchRegexCache = new();
 
+    // Per-match runtime cap for both caches. SearchFiles' `pattern` is
+    // user-supplied and could be pathological ((a+)+b -shape on a long
+    // line); a timeout converts that into a clean RegexMatchTimeoutException
+    // surfaced as an MCP error rather than a hung tool call. Glob patterns
+    // are structurally unable to trigger catastrophic backtracking after
+    // the Escape + canned-replacement transform, but applying the same cap
+    // there keeps every cached regex in this file on a single policy.
+    private static readonly TimeSpan RegexMatchTimeout = TimeSpan.FromSeconds(1);
+
     private static Regex GetGlobRegex(string globPattern) =>
         _globRegexCache.GetOrAdd(globPattern, p => new Regex(
             "^" + Regex.Escape(p)
                 .Replace(@"\*\*", ".*")
                 .Replace(@"\*", @"[^/\\]*")
                 .Replace(@"\?", ".") + "$",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled));
+            RegexOptions.IgnoreCase | RegexOptions.Compiled,
+            RegexMatchTimeout));
 
     private static Regex GetSearchRegex(string pattern) =>
         _searchRegexCache.GetOrAdd(pattern, p => new Regex(
-            p, RegexOptions.IgnoreCase | RegexOptions.Compiled));
+            p, RegexOptions.IgnoreCase | RegexOptions.Compiled, RegexMatchTimeout));
 }
