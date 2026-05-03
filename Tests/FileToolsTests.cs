@@ -382,6 +382,46 @@ public static class FileToolsTests
                     $"ReadFile accepts limit=0 ({zeroLimit})");
             }
 
+            // --- FindFiles glob semantics (Microsoft.Extensions.FileSystemGlobbing) ---
+            {
+                var globRoot = Path.Combine(tmpRoot, "glob-root");
+                Directory.CreateDirectory(Path.Combine(globRoot, "src"));
+                Directory.CreateDirectory(Path.Combine(globRoot, "src", "sub"));
+                Directory.CreateDirectory(Path.Combine(globRoot, "src", "sub", "deep"));
+                Directory.CreateDirectory(Path.Combine(globRoot, "other"));
+                Directory.CreateDirectory(Path.Combine(globRoot, "node_modules"));
+                File.WriteAllText(Path.Combine(globRoot, "src", "top.cs"), "");
+                File.WriteAllText(Path.Combine(globRoot, "src", "sub", "mid.cs"), "");
+                File.WriteAllText(Path.Combine(globRoot, "src", "sub", "deep", "low.cs"), "");
+                File.WriteAllText(Path.Combine(globRoot, "other", "side.cs"), "");
+                File.WriteAllText(Path.Combine(globRoot, "node_modules", "skip.cs"), "");
+
+                // Path-segment glob with globstar: `src/**/*.cs` must match
+                // top-level `src/top.cs` AND every depth below, but exclude
+                // siblings outside `src/`.
+                var srcOnly = FileTools.FindFiles("src/**/*.cs", path: globRoot).GetAwaiter().GetResult();
+                Assert(srcOnly.Contains("top.cs"), $"glob src/**/*.cs: matches top-level (src/top.cs) — {srcOnly}");
+                Assert(srcOnly.Contains("mid.cs"), $"glob src/**/*.cs: matches one level (src/sub/mid.cs) — {srcOnly}");
+                Assert(srcOnly.Contains("low.cs"), $"glob src/**/*.cs: matches multi level (src/sub/deep/low.cs) — {srcOnly}");
+                Assert(!srcOnly.Contains("side.cs"), $"glob src/**/*.cs: excludes other/ ({srcOnly})");
+
+                // Bare basename glob without separators: matches by file name
+                // at any depth (legacy MatchGlob ergonomics — `*.cs` finds
+                // nested files, not just root-level ones).
+                var allCs = FileTools.FindFiles("*.cs", path: globRoot).GetAwaiter().GetResult();
+                Assert(allCs.Contains("top.cs"), $"glob *.cs: finds nested file ({allCs})");
+                Assert(allCs.Contains("low.cs"), $"glob *.cs: finds deeply nested file ({allCs})");
+
+                // SkipDirs prune still active — node_modules entries never
+                // reach the matcher.
+                Assert(!allCs.Contains(Path.Combine("node_modules", "skip.cs")),
+                    $"glob *.cs: node_modules pruned ({allCs})");
+
+                // Non-matching extension yields the empty-result message.
+                var none = FileTools.FindFiles("*.kt", path: globRoot).GetAwaiter().GetResult();
+                Assert(none == "No files found.", $"glob *.kt: empty result ({none})");
+            }
+
         }
         finally
         {

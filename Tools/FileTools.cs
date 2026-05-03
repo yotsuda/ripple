@@ -1,3 +1,4 @@
+using Microsoft.Extensions.FileSystemGlobbing;
 using ModelContextProtocol.Server;
 using System.Collections.Concurrent;
 using System.ComponentModel;
@@ -436,7 +437,8 @@ public class FileTools
         }
         else if (Directory.Exists(basePath))
         {
-            await WalkAndSearchAsync(basePath, regex, results, max_results, glob, NewVisitedSet(), cancellationToken);
+            var matcher = glob != null ? BuildMatcher(glob) : null;
+            await WalkAndSearchAsync(basePath, basePath, regex, results, max_results, matcher, NewVisitedSet(), cancellationToken);
         }
         else
         {
@@ -458,8 +460,11 @@ public class FileTools
         CancellationToken cancellationToken = default)
     {
         var dir = path ?? Directory.GetCurrentDirectory();
+        if (!Directory.Exists(dir)) return Task.FromResult($"Error: directory not found: {dir}");
+
+        var matcher = BuildMatcher(pattern);
         var results = new List<string>();
-        FindFilesRecursive(dir, pattern, results, max_results, NewVisitedSet());
+        FindFilesRecursive(dir, dir, matcher, results, max_results, NewVisitedSet(), cancellationToken);
 
         if (results.Count == 0) return Task.FromResult("No files found.");
         return Task.FromResult(string.Join('\n', results));
@@ -513,12 +518,12 @@ public class FileTools
         }
     }
 
-    private static async Task WalkAndSearchAsync(string dir, Regex regex, List<string> results, int maxResults, string? globPattern, HashSet<string> visited, CancellationToken ct)
+    private static async Task WalkAndSearchAsync(string baseDir, string currentDir, Regex regex, List<string> results, int maxResults, Matcher? matcher, HashSet<string> visited, CancellationToken ct)
     {
-        if (!visited.Add(ResolveRealPath(dir))) return;
+        if (!visited.Add(ResolveRealPath(currentDir))) return;
 
         string[] entries;
-        try { entries = Directory.GetFileSystemEntries(dir); }
+        try { entries = Directory.GetFileSystemEntries(currentDir); }
         catch { return; }
 
         foreach (var entry in entries)
@@ -530,38 +535,38 @@ public class FileTools
             {
                 var name = Path.GetFileName(entry);
                 if (SkipDirs.Contains(name)) continue;
-                await WalkAndSearchAsync(entry, regex, results, maxResults, globPattern, visited, ct);
+                await WalkAndSearchAsync(baseDir, entry, regex, results, maxResults, matcher, visited, ct);
             }
             else if (File.Exists(entry))
             {
-                if (globPattern != null && !MatchGlob(Path.GetFileName(entry), globPattern)) continue;
+                if (matcher != null && !matcher.Match(ToBaseRelative(baseDir, entry)).HasMatches) continue;
                 await SearchInFileAsync(entry, regex, results, maxResults, ct);
             }
         }
     }
 
-    private static void FindFilesRecursive(string dir, string pattern, List<string> results, int maxResults, HashSet<string> visited)
+    private static void FindFilesRecursive(string baseDir, string currentDir, Matcher matcher, List<string> results, int maxResults, HashSet<string> visited, CancellationToken ct)
     {
-        if (!visited.Add(ResolveRealPath(dir))) return;
+        if (!visited.Add(ResolveRealPath(currentDir))) return;
 
         string[] entries;
-        try { entries = Directory.GetFileSystemEntries(dir); }
+        try { entries = Directory.GetFileSystemEntries(currentDir); }
         catch { return; }
 
         foreach (var entry in entries)
         {
             if (results.Count >= maxResults) return;
+            ct.ThrowIfCancellationRequested();
 
             if (Directory.Exists(entry))
             {
                 var name = Path.GetFileName(entry);
                 if (SkipDirs.Contains(name)) continue;
-                FindFilesRecursive(entry, pattern, results, maxResults, visited);
+                FindFilesRecursive(baseDir, entry, matcher, results, maxResults, visited, ct);
             }
             else if (File.Exists(entry))
             {
-                var name = Path.GetFileName(entry);
-                if (MatchGlob(name, pattern) || MatchGlob(entry, pattern))
+                if (matcher.Match(ToBaseRelative(baseDir, entry)).HasMatches)
                     results.Add(entry);
             }
         }
@@ -617,25 +622,41 @@ public class FileTools
         catch { return false; }
     }
 
-    private static bool MatchGlob(string str, string pattern)
+    // Glob handling is delegated to Microsoft.Extensions.FileSystemGlobbing.Matcher
+    // (transitive dep via Microsoft.Extensions.Hosting; AOT-safe under .NET 8+).
+    // We get correct globstar / cross-platform separator / root-relative-path
+    // semantics for free. The previous regex-from-scratch path could only
+    // match basenames or absolute paths, never root-relative, and hard-coded
+    // `/` as separator so Windows full paths slipped through. We keep our
+    // own recursive walker because Matcher's built-in walker doesn't honour
+    // SkipDirs prune, max_results short-circuit, symlink-cycle visited
+    // tracking, or CancellationToken.
+    private static Matcher BuildMatcher(string pattern)
     {
-        return GetGlobRegex(pattern).IsMatch(str);
+        var m = new Matcher(StringComparison.OrdinalIgnoreCase);
+        // Patterns without an explicit path segment match by file name at any
+        // depth (`*.cs` finds `.cs` files anywhere) — preserves the search
+        // ergonomics the legacy MatchGlob path provided when it tried the
+        // basename of each entry as an early match candidate. Patterns that
+        // already contain a separator are passed through verbatim, so
+        // `src/**/*.cs` still anchors at `src/`.
+        var include = (pattern.Contains('/') || pattern.Contains('\\'))
+            ? pattern
+            : "**/" + pattern;
+        m.AddInclude(include);
+        return m;
     }
 
-    // Compile-once-reuse caches for the two regex hot paths in this file.
-    // - `MatchGlob` runs per file entry inside the recursive walk; with N
-    //   files in a tree, an AI doing a repo-wide find_files / search_files
-    //   round-trip would otherwise call `Regex.Escape` + chained Replace +
-    //   `Regex.IsMatch` (whose static cache caps at 15 patterns) once per
-    //   entry. Caching here turns N compilations into 1 per glob.
-    // - `SearchFiles`'s `pattern` parameter is constant for the duration of
-    //   one tool call but is often reused across calls in the same session
-    //   (an AI that greps for the same symbol while iterating on an edit).
-    // The caches are unbounded by design: in practice the cardinality of
-    // distinct patterns in one MCP session is small (tens at most), and
-    // each compiled Regex is on the order of KB. If memory ever becomes a
-    // concern, swap for an LRU bound.
-    private static readonly ConcurrentDictionary<string, Regex> _globRegexCache = new();
+    // Convert an absolute entry path under `baseDir` into the forward-slash
+    // root-relative form the Matcher expects.
+    private static string ToBaseRelative(string baseDir, string entry) =>
+        Path.GetRelativePath(baseDir, entry).Replace('\\', '/');
+
+    // Compile-once-reuse cache for the search regex. SearchFiles' `pattern`
+    // parameter is constant per call but is often reused across calls in
+    // the same session (an AI grepping for the same symbol while iterating
+    // on an edit). Cardinality of distinct patterns in one MCP session is
+    // small; if memory pressure ever shows up, swap for an LRU.
     private static readonly ConcurrentDictionary<string, Regex> _searchRegexCache = new();
 
     // Retry shim for the moments right after we close our own handle
@@ -662,39 +683,11 @@ public class FileTools
         }
     }
 
-    // Per-match runtime cap for both caches. SearchFiles' `pattern` is
+    // Per-match runtime cap on the search regex. SearchFiles' `pattern` is
     // user-supplied and could be pathological ((a+)+b -shape on a long
-    // line); a timeout converts that into a clean RegexMatchTimeoutException
-    // surfaced as an MCP error rather than a hung tool call. Glob patterns
-    // are structurally unable to trigger catastrophic backtracking after
-    // the Escape + canned-replacement transform, but applying the same cap
-    // there keeps every cached regex in this file on a single policy.
+    // line); the timeout converts that into a clean RegexMatchTimeoutException
+    // surfaced as an MCP error instead of a hung tool call.
     private static readonly TimeSpan RegexMatchTimeout = TimeSpan.FromSeconds(1);
-
-    private static Regex GetGlobRegex(string globPattern) =>
-        _globRegexCache.GetOrAdd(globPattern, p => new Regex(
-            "^" + Regex.Escape(p)
-                // `/**/` collapses zero or more path segments — `src/**/test.js`
-                // must match `src/test.js` AND `src/a/test.js` AND
-                // `src/a/b/test.js`, matching Bash globstar / npm minimatch
-                // semantics. Without this special case the post-Escape
-                // pattern `src/.*/test\.js` requires at least the slashes
-                // around `.*` and rejects the top-level `src/test.js`.
-                // NOTE: MatchGlob is wired up by FindFiles to match either
-                // the basename or the full absolute path of each entry,
-                // and uses literal `/` as the separator. That means glob
-                // patterns containing path segments (e.g. `src/**/*.cs`)
-                // don't engage usefully on Windows full paths (which use
-                // `\\`) and never engage on the basename. Fixing those
-                // requires matching against root-relative paths with a
-                // platform-aware separator class, which is outside the
-                // scope of this regex-semantics fix.
-                .Replace(@"/\*\*/", "/(?:.*/)?")
-                .Replace(@"\*\*", ".*")
-                .Replace(@"\*", @"[^/\\]*")
-                .Replace(@"\?", ".") + "$",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled,
-            RegexMatchTimeout));
 
     private static Regex GetSearchRegex(string pattern) =>
         _searchRegexCache.GetOrAdd(pattern, p => new Regex(
