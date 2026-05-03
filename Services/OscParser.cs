@@ -40,6 +40,16 @@ public class OscParser
     private const char OscEndBel = '\x07';
     private const string OscEndSt = "\x1b\\";
 
+    // Hard cap on the inter-chunk carry buffer for an in-flight OSC
+    // sequence that hasn't seen its terminator yet. Legitimate OSC 633
+    // payloads emitted by ripple integration scripts cap well under 4 KB
+    // (worst case: OSC R = 1000-char error message base64-encoded
+    // → ~1.4 KB); 256 KB leaves a ~60× margin over normal traffic so a
+    // multi-chunk straddle of even a verbose payload still parses, while
+    // stopping a torn frame (OSC start with no terminator ever arriving)
+    // from growing `_buffer` unboundedly across chunks.
+    private const int MaxBufferLength = 256 * 1024;
+
     private string _buffer = "";
 
     /// <summary>
@@ -149,8 +159,24 @@ public class OscParser
             }
             else
             {
-                // Incomplete sequence — buffer from OSC start
-                _buffer = input[oscIdx..];
+                // Incomplete sequence — buffer from OSC start. If the
+                // pending fragment is larger than `MaxBufferLength`, the
+                // terminator is almost certainly never coming (a torn
+                // frame, a malformed PTY emitter, etc.); give up parsing
+                // it and flush the bytes as cleaned text rather than
+                // letting the carry grow without bound across chunks.
+                // The visible console may show a brief `\x1b]633;...`
+                // smear, but the parser stays healthy for the next OSC.
+                var pendingLen = input.Length - oscIdx;
+                if (pendingLen > MaxBufferLength)
+                {
+                    cleaned.Append(input, oscIdx, pendingLen);
+                    _buffer = "";
+                }
+                else
+                {
+                    _buffer = input[oscIdx..];
+                }
                 return new ParseResult(cleaned.ToString(), events);
             }
 

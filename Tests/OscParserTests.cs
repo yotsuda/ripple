@@ -145,6 +145,39 @@ public class OscParserTests
             Assert(result.Cleaned == "", "Unknown code: cleaned empty");
         }
 
+        // Test 11: Large but under-cap OSC parses normally (the cap must
+        // not nuke legitimate big payloads — cwd values on Windows long-
+        // path systems can run to multiple KB).
+        {
+            var parser = new OscParser();
+            var bigCwd = new string('a', 16 * 1024); // 16 KB cwd, well under the 256 KB cap
+            var result = parser.Parse("\x1b]633;P;Cwd=" + bigCwd + "");
+            Assert(result.Events.Count == 1, "Under-cap OSC: parsed");
+            Assert(result.Events[0].Type == OscParser.OscEventType.Cwd, "Under-cap OSC: type");
+            Assert(result.Events[0].Cwd == bigCwd, "Under-cap OSC: payload intact");
+        }
+
+        // Test 12: Torn frame (OSC start with no terminator ever arriving)
+        // doesn't grow the inter-chunk carry buffer unboundedly. The cap
+        // bails by flushing the buffered bytes as cleaned text — the
+        // visible console may show some `\x1b]633;` smear, but no events
+        // are synthesized and the parser recovers on the next valid OSC.
+        {
+            var parser = new OscParser();
+            // 300 KB of garbage after an OSC start — exceeds the 256 KB cap.
+            var huge = new string('x', 300 * 1024);
+            var r1 = parser.Parse("before\x1b]633;" + huge);
+            Assert(r1.Events.Count == 0, "Torn-frame cap: no events from incomplete OSC");
+            Assert(r1.Cleaned.StartsWith("before"), "Torn-frame cap: pre-OSC text preserved");
+            Assert(r1.Cleaned.Contains("\x1b]633;"), "Torn-frame cap: bailed bytes flushed (not silently dropped)");
+
+            // Buffer reset → next valid OSC parses cleanly.
+            var r2 = parser.Parse("\x1b]633;Aafter");
+            Assert(r2.Events.Count == 1, "Torn-frame cap: parser recovers on next valid OSC");
+            Assert(r2.Events[0].Type == OscParser.OscEventType.PromptStart, "Torn-frame cap: recovered event type");
+            Assert(r2.Cleaned == "after", "Torn-frame cap: recovered cleaned text");
+        }
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
