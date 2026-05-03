@@ -182,7 +182,7 @@ init:
 | `shell_integration` | pwsh, bash, zsh | `script_resource` or inline `script`, `hook_type`, `delivery` |
 | `prompt_variable` | cmd | `process.prompt_template` |
 | `marker` | python, node, ghci, sbcl, iex | `marker.primary`, optional `marker.continuation`, optional `script` |
-| `regex` | REPLs where PS1 can't be replaced | `prompt.primary_regex` |
+| `regex` | REPLs where PS1 can't be replaced | `prompt.primary` |
 | `none` | trivial processes with no setup | — |
 
 **`hook_type`** documents *when* the OSC C marker (or equivalent

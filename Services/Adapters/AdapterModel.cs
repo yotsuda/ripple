@@ -262,7 +262,6 @@ public class PromptSpec
     public string Strategy { get; set; } = "shell_integration";  // shell_integration | marker | regex
     public ShellIntegrationSpec? ShellIntegration { get; set; }
     public string? Primary { get; set; }                         // regex for marker / regex strategies
-    public string? PrimaryRegex { get; set; }
     public string? Continuation { get; set; }
     // Bytes written to the PTY when `Continuation` matches during an AI command.
     // Forces the REPL out of its incomplete-statement state back to the primary

@@ -375,7 +375,7 @@ public class ConsoleWorker
         // boundaries and synthesize PromptStart events for the tracker.
         if (_adapter?.Prompt.Strategy == "regex")
         {
-            var pattern = _adapter.Prompt.Primary ?? _adapter.Prompt.PrimaryRegex;
+            var pattern = _adapter.Prompt.Primary;
             if (!string.IsNullOrEmpty(pattern))
             {
                 _regexPromptDetector = new RegexPromptDetector(pattern);
@@ -383,7 +383,7 @@ public class ConsoleWorker
             }
             else
             {
-                Log("WARNING: prompt.strategy == regex but no prompt.primary / prompt.primary_regex set");
+                Log("WARNING: prompt.strategy == regex but no prompt.primary set");
             }
 
             // Optional continuation-prompt detector. Paired with
