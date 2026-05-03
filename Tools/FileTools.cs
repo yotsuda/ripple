@@ -97,7 +97,7 @@ public class FileTools
             output = content;
         }
 
-        File.WriteAllText(path, output, enc);
+        WithIORetry(() => File.WriteAllText(path, output, enc));
         var lines = content.Count(c => c == '\n') + 1;
         return Task.FromResult($"Written {lines} lines to {path}");
     }
@@ -272,7 +272,7 @@ public class FileTools
                 return $"Error: old_string found {matchCount} times. It must be unique. Add more context or use replace_all.";
             }
 
-            File.Move(tempFile, path, overwrite: true);
+            WithIORetry(() => File.Move(tempFile, path, overwrite: true));
 
             var summary = $"Replaced {matchCount} occurrence{(matchCount != 1 ? "s" : "")} in {path}";
             return contextOut.Length == 0
@@ -338,7 +338,7 @@ public class FileTools
         }
 
         var finalContent = FromLf(resultLf, meta.NewlineSequence);
-        File.WriteAllText(path, finalContent, meta.Encoding);
+        WithIORetry(() => File.WriteAllText(path, finalContent, meta.Encoding));
 
         var ctx = BuildMultilineContext(resultLf, firstIdx, newNorm.Length);
         var summary = $"Replaced {replacedCount} occurrence{(replacedCount != 1 ? "s" : "")} in {path}";
@@ -635,6 +635,30 @@ public class FileTools
     // concern, swap for an LRU bound.
     private static readonly ConcurrentDictionary<string, Regex> _globRegexCache = new();
     private static readonly ConcurrentDictionary<string, Regex> _searchRegexCache = new();
+
+    // Retry shim for the moments right after we close our own handle
+    // on a file: on Windows, antivirus / Defender / indexing services
+    // routinely open the file for an on-access scan in that window, and
+    // any concurrent File.Move / File.WriteAllText against the same path
+    // can land while the scanner still holds the handle and surface as
+    // either UnauthorizedAccessException ("Access to the path is denied")
+    // or IOException with ERROR_SHARING_VIOLATION (HRESULT 0x80070020).
+    // Real permission errors raise the same exception types, but they
+    // don't go away on retry — the bounded backoff burns at most ~750ms
+    // on a genuinely-locked file before re-throwing.
+    private static void WithIORetry(Action action)
+    {
+        const int maxAttempts = 5;
+        int delayMs = 50;
+        for (int attempt = 1; ; attempt++)
+        {
+            try { action(); return; }
+            catch (IOException) when (attempt < maxAttempts) { }
+            catch (UnauthorizedAccessException) when (attempt < maxAttempts) { }
+            Thread.Sleep(delayMs);
+            delayMs *= 2;
+        }
+    }
 
     // Per-match runtime cap for both caches. SearchFiles' `pattern` is
     // user-supplied and could be pathological ((a+)+b -shape on a long
