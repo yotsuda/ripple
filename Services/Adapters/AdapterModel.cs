@@ -175,6 +175,17 @@ public class ReadySpec
 {
     public string WaitForEvent { get; set; } = "prompt_start";
     public string? WaitFor { get; set; }              // regex fallback
+
+    /// <summary>
+    /// RESERVED — parsed from YAML but deliberately not consumed.
+    /// <see cref="ConsoleWorker.WaitForReady"/> waits for the first
+    /// prompt signal indefinitely by design (cold-start / slow corporate
+    /// UNC PSModulePath can legitimately take many seconds; a startup
+    /// timeout would mis-fire on exactly that population — see issue #9
+    /// and adapters/SCHEMA.md §4). Redundant with
+    /// <see cref="LifecycleSpec.ReadyTimeoutMs"/>; if ever wired, only
+    /// one of the two survives. A non-zero value is silently ignored.
+    /// </summary>
     public int TimeoutMs { get; set; }
     public int SettleBeforeInjectMs { get; set; }
     public bool SuppressMirrorDuringInject { get; set; }
@@ -552,6 +563,13 @@ public class SignalsSpec
 
 public class LifecycleSpec
 {
+    /// <summary>
+    /// RESERVED — parsed but not consumed, and redundant with
+    /// <see cref="ReadySpec.TimeoutMs"/>. See that field and
+    /// adapters/SCHEMA.md §12. If a startup-timeout is ever wired,
+    /// one of the two becomes canonical and the other is removed
+    /// under a schema major bump.
+    /// </summary>
     public int ReadyTimeoutMs { get; set; }
     public ShutdownSpec Shutdown { get; set; } = new();
     public List<string>? RestartOn { get; set; }

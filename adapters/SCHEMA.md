@@ -126,9 +126,18 @@ ready:
 - **`wait_for_event`** — `prompt_start` | `marker` | `regex` | `custom`. For
   shell-integration adapters this is always `prompt_start` (the first OSC A
   event). For REPL adapters it's typically `marker`.
-- **`timeout_ms`** — `0` means wait indefinitely. Recommended for interpreters
-  with cold-start costs (pwsh + PSReadLine + Defender first-scan can take
-  several seconds).
+- **`timeout_ms`** — **Reserved / not consumed by the runtime** (as of
+  v0.14.0). `WaitForReady` (`Services/ConsoleWorker.cs`) waits on the first
+  prompt signal *indefinitely* by design — interpreters with cold-start costs
+  (pwsh + PSReadLine + Defender first-scan, slow corporate UNC `PSModulePath`)
+  can legitimately take many seconds, and a startup timeout would mis-fire on
+  exactly that slow-host population (see
+  [issue #9](https://github.com/yotsuda/ripple/issues/9): a reporter set
+  `ready.timeout_ms: 100` believing it was a fix — it does nothing). A
+  non-zero value is silently ignored; `0` is the only meaningful value.
+  Kept in the schema as a forward-compat placeholder; if a real
+  startup-timeout is ever wired, decide canonical-vs-`lifecycle.ready_timeout_ms`
+  at that time (the two are redundant — see §12).
 - **`settle_before_inject_ms`** — quiet period before injecting the integration
   script. Only meaningful when `init.delivery: pty_inject`.
 - **`suppress_mirror_during_inject`** — hide the `source` echo from the visible
@@ -560,6 +569,15 @@ lifecycle:
     force_signal: kill
   restart_on: [crash]        # or [crash, idle_timeout]
 ```
+
+- **`ready_timeout_ms`** — **Reserved / not consumed by the runtime** (as of
+  v0.14.0), and redundant with `ready.timeout_ms` (§4): both nominally express
+  "how long to wait for first-prompt before giving up", neither is read. Same
+  rationale for non-consumption as `ready.timeout_ms`. If a startup-timeout is
+  ever implemented, one of the two fields becomes canonical and the other is
+  removed under a `schema` major bump — they must not both stay live.
+- **`shutdown`** / **`restart_on`** — consumed normally; only the timeout
+  field above is the reserved one.
 
 ---
 
