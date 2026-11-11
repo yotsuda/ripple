@@ -550,11 +550,30 @@ public static class CommandOutputFinalizerTests
                 $"osc8-mix: OSC 0 and OSC 7 stay dropped, only OSC 8 projected — got '{cleaned}'");
         }
 
-        // ---- Tempfile path leak from multi-line AI command delivery ----
-        // Multi-line AI commands wrap the user's body into a temp file and
-        // dot-source it. PowerShell's ConciseView prefixes the error
-        // summary with `{Cmdlet}: {TempfilePath}:{Line}`, exposing ripple's
-        // implementation detail. Strip any line referencing a tempfile.
+        // Tempfile-shaped paths are command data, not proof that a line is
+        // implementation noise. Preserve JSON and surrounding text verbatim.
+        {
+            const string raw = """{"Marker":"probe","Path":"C:\\Temp\\.ripple-exec-123-abcdef.ps1","Value":22}""";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == raw,
+                $"tempfile-content-json: JSON containing a generated-script path is preserved — got '{cleaned}'");
+        }
+        {
+            const string raw = "before\nsome text C:\\Temp\\.ripple-exec-123-abcdef.ps1 is data\nafter";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == raw,
+                $"tempfile-content-windows: Windows path and surrounding lines are preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+        {
+            const string raw = "before\nsome text /tmp/.ripple-exec-123-abcdef.sh is data\nafter";
+            var cleaned = CommandOutputFinalizer.CleanString(raw);
+            Assert(cleaned == raw,
+                $"tempfile-content-posix: POSIX path and surrounding lines are preserved — got '{cleaned.Replace("\n", "\\n")}'");
+        }
+
+        // ---- Generated script paths are part of command output ----
+        // Preserve filename-bearing diagnostics as well as ordinary data.
+        // Bash and cmd may put their only error message on the matching line.
 
         // PowerShell ConciseView with Windows-native tempfile path.
         {
@@ -564,56 +583,50 @@ public static class CommandOutputFinalizerTests
                    + "     | ~~~~~~~~~~~~~~~~\n"
                    + "     | Cannot find path 'C:\\nope' because it does not exist.";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
-            Assert(!cleaned.Contains("ripple-exec-"),
-                $"tempfile-strip-pwsh: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned == raw,
+                $"tempfile-preserve-pwsh: path and complete line preserved — got '{cleaned.Replace("\n", "\\n")}'");
             Assert(cleaned.Contains("Cannot find path"),
-                $"tempfile-strip-pwsh: error message preserved — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-pwsh: error message preserved — got '{cleaned.Replace("\n", "\\n")}'");
             Assert(cleaned.Contains("Line |") && cleaned.Contains("   5 |"),
-                $"tempfile-strip-pwsh: Line block preserved — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-pwsh: Line block preserved — got '{cleaned.Replace("\n", "\\n")}'");
         }
 
         // bash (WSL) — POSIX path + .sh extension.
         {
             var raw = "bash: /tmp/ripple-exec-12345-abcdef0123.sh: line 3: nope: command not found\nreal tail line";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
-            Assert(!cleaned.Contains("ripple-exec-"),
-                $"tempfile-strip-bash: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned == raw,
+                $"tempfile-preserve-bash: path and complete line preserved — got '{cleaned.Replace("\n", "\\n")}'");
             Assert(cleaned.Contains("real tail line"),
-                $"tempfile-strip-bash: other content preserved — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-bash: other content preserved — got '{cleaned.Replace("\n", "\\n")}'");
         }
 
         // cmd.exe — .cmd extension + Windows-native path.
         {
             var raw = "C:\\Temp\\ripple-exec-12345-abcdef.cmd was not expected at this time.\nafter";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
-            Assert(!cleaned.Contains("ripple-exec-"),
-                $"tempfile-strip-cmd: .cmd path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned == raw,
+                $"tempfile-preserve-cmd: .cmd path and complete line preserved — got '{cleaned.Replace("\n", "\\n")}'");
             Assert(cleaned.Contains("after"),
-                $"tempfile-strip-cmd: subsequent line preserved — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-cmd: subsequent line preserved — got '{cleaned.Replace("\n", "\\n")}'");
         }
 
-        // Benign mention in user content — if the AI's own command text
-        // prints a string literally containing `ripple-exec-<N>-<hex>.ps1`,
-        // we still strip. Acceptable false-positive: rare in practice, and
-        // the strip is scoped to one line so surrounding context stays
-        // intact. Tradeoff: keep the filter trivial and predictable
-        // rather than trying to distinguish real usage from accidental
-        // mentions.
+        // A benign filename mention must not disappear from user output.
         {
             var raw = "line before\nsome text C:\\tmp\\ripple-exec-1-abc.ps1:7 in middle\nline after";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
-            Assert(!cleaned.Contains("ripple-exec-"),
-                $"tempfile-strip-middle: path reference removed — got '{cleaned.Replace("\n", "\\n")}'");
+            Assert(cleaned == raw,
+                $"tempfile-preserve-middle: path and complete line preserved — got '{cleaned.Replace("\n", "\\n")}'");
             Assert(cleaned.Contains("line before") && cleaned.Contains("line after"),
-                $"tempfile-strip-middle: surrounding lines preserved — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-middle: surrounding lines preserved — got '{cleaned.Replace("\n", "\\n")}'");
         }
 
-        // Non-tempfile paths are untouched — we only strip our own.
+        // Other script paths are preserved as well.
         {
             var raw = "error at C:\\Users\\alice\\app.ps1:42\nother content";
             var cleaned = CommandOutputFinalizer.CleanString(raw);
             Assert(cleaned.Contains("C:\\Users\\alice\\app.ps1:42"),
-                $"tempfile-strip-nontemp: unrelated paths untouched — got '{cleaned.Replace("\n", "\\n")}'");
+                $"tempfile-preserve-nontemp: unrelated paths untouched — got '{cleaned.Replace("\n", "\\n")}'");
         }
 
         // ---- Dangling SGR reset handling ----

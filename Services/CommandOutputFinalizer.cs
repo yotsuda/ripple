@@ -101,16 +101,8 @@ internal static class CommandOutputFinalizer
         var renderer = new CommandOutputRenderer(vtBaseline);
         renderer.Feed(raw.AsSpan());
         var rendered = renderer.Render();
-        // Strip any line that references a ripple-created tempfile
-        // (ripple-exec-<pid>-<guid>.ps1/.cmd/.sh). These paths only appear
-        // when the multi-line AI command delivery wraps the user's body
-        // into a temp file and dot-sources it; PowerShell's ConciseView
-        // error renderer prefixes the summary line with the path + line
-        // number, exposing ripple's implementation detail. Single-line AI
-        // commands never wrap so they never produce this leakage.
-        // Stripping the whole offending line keeps the `Line | N | <source>`
-        // block below, which carries the real diagnostic content.
-        rendered = TempfileReferenceLine.Replace(rendered, "");
+        // Generated-script paths can be ordinary output or part of a useful
+        // diagnostic. Preserve those lines instead of guessing their origin.
         // Strip leading SGR resets — they're no-ops at the MCP boundary
         // (the consumer hasn't applied any SGR before this output, so
         // resetting to default state changes nothing). Common source:
@@ -133,15 +125,6 @@ internal static class CommandOutputFinalizer
             rendered += "\x1b[0m";
         return rendered;
     }
-
-    // Windows: `C:\path\to\ripple-exec-<pid>-<guid>.ps1` (optionally `:N`).
-    // POSIX:   `/path/to/ripple-exec-<pid>-<guid>.sh`     (optionally `:N`).
-    // Match the whole line that contains such a reference (any prefix /
-    // suffix on the same line — typically `<Cmdlet>: <path>:<N>`).
-    // Multiline + non-greedy body keep the match scoped to a single line.
-    private static readonly Regex TempfileReferenceLine = new(
-        @"^[^\n]*(?:[A-Za-z]:[\\/]|/)[^\s:]*?ripple-exec-\d+-[0-9a-fA-F]+\.(?:ps1|cmd|sh)[^\n]*(?:\n|$)",
-        RegexOptions.Multiline | RegexOptions.Compiled);
 
     // SGR reset variants: `\e[m` (omitted parameter), `\e[0m`,
     // `\e[0;0m`, `\e[00m`, `\e[0;0;0m` — anything whose parameters
