@@ -368,7 +368,7 @@ public class ConsoleManager
         var pipeName = GetPipeName(agentId, pid);
         lock (_lock)
         {
-            _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily, resolvedShell);
+            _consoles[pid] = new ConsoleInfo(pipeName, displayName, shellFamily, resolvedShell, agentId);
             TouchActivePid(GetOrCreateAgentState(agentId), resolvedShell, pid);
         }
 
@@ -1509,7 +1509,7 @@ public class ConsoleManager
                 {
                     var claimShellFamily = response.TryGetProperty("shellFamily", out var sfClaim) ? sfClaim.GetString() ?? "unknown" : "unknown";
                     var claimShellPath = response.TryGetProperty("shellPath", out var spClaim) ? spClaim.GetString() ?? "" : "";
-                    _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayNameNew, claimShellFamily, claimShellPath);
+                    _consoles[pid.Value] = new ConsoleInfo(newPipeName, displayNameNew, claimShellFamily, claimShellPath, agentId);
                 }
 
                 return (pid.Value, displayNameNew);
@@ -1570,22 +1570,26 @@ public class ConsoleManager
     /// Returns null if nothing matches, or if the match is ambiguous
     /// across multiple consoles. Caller must hold _lock.
     /// </summary>
-    private int? ResolveConsoleSelector(string selector)
+    internal int? ResolveConsoleSelector(string agentId, string selector)
     {
         // Numeric → PID
-        if (int.TryParse(selector, out var pid) && _consoles.ContainsKey(pid))
+        if (int.TryParse(selector, out var pid)
+            && _consoles.TryGetValue(pid, out var byPid)
+            && byPid.OwnerAgentId == agentId)
             return pid;
 
         // Exact display-name match
         foreach (var kv in _consoles)
         {
-            if (string.Equals(kv.Value.DisplayName, selector, StringComparison.OrdinalIgnoreCase))
+            if (kv.Value.OwnerAgentId == agentId
+                && string.Equals(kv.Value.DisplayName, selector, StringComparison.OrdinalIgnoreCase))
                 return kv.Key;
         }
 
         // Substring match
         var matches = _consoles
-            .Where(kv => kv.Value.DisplayName.Contains(selector, StringComparison.OrdinalIgnoreCase))
+            .Where(kv => kv.Value.OwnerAgentId == agentId
+                && kv.Value.DisplayName.Contains(selector, StringComparison.OrdinalIgnoreCase))
             .Select(kv => (int?)kv.Key)
             .ToList();
 
@@ -1643,10 +1647,10 @@ public class ConsoleManager
             }
             else
             {
-                pid = ResolveConsoleSelector(console);
+                pid = ResolveConsoleSelector(agentId, console);
             }
 
-            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info))
+            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info) || info.OwnerAgentId != agentId)
                 return null;
 
             pipeName = info.PipePath;
@@ -1692,8 +1696,8 @@ public class ConsoleManager
 
         lock (_lock)
         {
-            pid = ResolveConsoleSelector(console);
-            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info))
+            pid = ResolveConsoleSelector(agentId, console);
+            if (pid == null || !_consoles.TryGetValue(pid.Value, out var info) || info.OwnerAgentId != agentId)
                 return null;
             pipeName = info.PipePath;
             displayName = info.DisplayName;
@@ -2375,7 +2379,15 @@ public class ConsoleManager
 
     // --- Types ---
 
-    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily, string ShellPath)
+    internal void TestRegisterConsole(int pid, string pipePath, string displayName, string shellFamily, string shellPath, string ownerAgentId)
+    {
+        lock (_lock)
+        {
+            _consoles[pid] = new ConsoleInfo(pipePath, displayName, shellFamily, shellPath, ownerAgentId);
+        }
+    }
+
+    private record ConsoleInfo(string PipePath, string DisplayName, string ShellFamily, string ShellPath, string OwnerAgentId)
     {
         // Cwd as of the most recent AI command. Used to detect manual user cd
         // and to skip the "NOT executed" warning when cwd is consistent.
