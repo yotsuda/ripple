@@ -31,6 +31,17 @@ public class ConsoleManagerTests
         // reads. Stub kept so the runner scaffolding stays consistent.
         Assert(true, "ConsoleManager: drift detection now uses direct cwd comparison; exercised via live session tests");
 
+        var manager = new ConsoleManager(new ProcessLauncher());
+        manager.TestRegisterConsole(4242, "pipe-a", "Sapphire", "pwsh", "pwsh", "A");
+        Assert(manager.ResolveConsoleSelector("A", "Sapphire") == 4242,
+            "console owner resolves its own console by name");
+        Assert(manager.ResolveConsoleSelector("B", "Sapphire") is null,
+            "a foreign agent cannot resolve another agent's console by name");
+        Assert(manager.ResolveConsoleSelector("B", "4242") is null,
+            "a foreign agent cannot resolve another agent's console by pid");
+        Assert(manager.ResolveConsoleSelector("A", "4242") == 4242,
+            "the owner can still resolve by pid");
+
         Console.WriteLine($"\n{pass} passed, {fail} failed");
         if (fail > 0) Environment.Exit(1);
     }
