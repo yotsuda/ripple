@@ -1815,31 +1815,7 @@ public class ConsoleWorkerTests
 
         await client.ConnectAsync(cts.Token);
 
-        var msgBytes = PipeJson.BuildObjectBytes(writeBody);
-        var lenBytes = BitConverter.GetBytes(msgBytes.Length);
-
-        await client.WriteAsync(lenBytes, cts.Token);
-        await client.WriteAsync(msgBytes, cts.Token);
-        await client.FlushAsync(cts.Token);
-
-        var recvLenBytes = new byte[4];
-        await ReadExactAsync(client, recvLenBytes, cts.Token);
-        var recvLen = BitConverter.ToInt32(recvLenBytes);
-
-        var recvBytes = new byte[recvLen];
-        await ReadExactAsync(client, recvBytes, cts.Token);
-
-        return PipeJson.ParseElement(recvBytes);
-    }
-
-    private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
-    {
-        int offset = 0;
-        while (offset < buffer.Length)
-        {
-            int read = await stream.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), ct);
-            if (read == 0) throw new IOException("Pipe closed");
-            offset += read;
-        }
+        await PipeProtocol.WriteMessageAsync(client, PipeJson.BuildObjectElement(writeBody), cts.Token);
+        return await PipeProtocol.ReadMessageAsync(client, cts.Token);
     }
 }

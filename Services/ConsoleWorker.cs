@@ -2423,9 +2423,9 @@ public class ConsoleWorker
 
             try
             {
-                var request = await ReadMessageAsync(server, ct);
+                var request = await PipeProtocol.ReadMessageAsync(server, ct);
                 var response = await HandleRequestAsync(request, ct);
-                await WriteMessageAsync(server, response, ct);
+                await PipeProtocol.WriteMessageAsync(server, response, ct);
             }
             catch (IOException)
             {
@@ -4278,47 +4278,6 @@ public class ConsoleWorker
         // RP.{proxyPid}.{agentId}.{consolePid}
         var parts = pipeName.Split('.');
         return parts.Length >= 2 && int.TryParse(parts[1], out var pid) ? pid : 0;
-    }
-
-    // --- Pipe protocol (length-prefixed JSON) ---
-
-    // Sanity ceiling for an inbound pipe frame. Real messages are
-    // request/response JSON capped well under this; a length prefix
-    // outside [0, MaxPipeFrameBytes] is either a torn frame or a buggy
-    // proxy, and unconditionally allocating `new byte[len]` from a
-    // negative or multi-GiB length would just OOM the worker.
-    private const int MaxPipeFrameBytes = 64 * 1024 * 1024;
-
-    private static async Task<JsonElement> ReadMessageAsync(Stream stream, CancellationToken ct)
-    {
-        var lenBuf = new byte[4];
-        await ReadExactAsync(stream, lenBuf, ct);
-        var len = BitConverter.ToInt32(lenBuf);
-        if ((uint)len > MaxPipeFrameBytes)
-            throw new IOException($"Pipe frame length {len} out of range (0..{MaxPipeFrameBytes})");
-        var msgBuf = new byte[len];
-        await ReadExactAsync(stream, msgBuf, ct);
-        return PipeJson.ParseElement(msgBuf);
-    }
-
-    private static async Task WriteMessageAsync(Stream stream, JsonElement message, CancellationToken ct)
-    {
-        var msgBytes = PipeJson.ElementToBytes(message);
-        var lenBytes = BitConverter.GetBytes(msgBytes.Length);
-        await stream.WriteAsync(lenBytes, ct);
-        await stream.WriteAsync(msgBytes, ct);
-        await stream.FlushAsync(ct);
-    }
-
-    private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
-    {
-        int offset = 0;
-        while (offset < buffer.Length)
-        {
-            int read = await stream.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), ct);
-            if (read == 0) throw new IOException("Pipe closed");
-            offset += read;
-        }
     }
 
     private static string EscapeForLog(string s)

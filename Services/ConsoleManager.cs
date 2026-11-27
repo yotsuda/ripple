@@ -1170,22 +1170,8 @@ public class ConsoleManager
 
         await client.ConnectAsync(cts.Token);
 
-        var msgBytes = PipeJson.BuildObjectBytes(writeBody);
-        var lenBytes = BitConverter.GetBytes(msgBytes.Length);
-
-        await client.WriteAsync(lenBytes, cts.Token);
-        await client.WriteAsync(msgBytes, cts.Token);
-        await client.FlushAsync(cts.Token);
-
-        // Read response
-        var recvLenBytes = new byte[4];
-        await ReadExactAsync(client, recvLenBytes, cts.Token);
-        var recvLen = BitConverter.ToInt32(recvLenBytes);
-
-        var recvBytes = new byte[recvLen];
-        await ReadExactAsync(client, recvBytes, cts.Token);
-
-        return PipeJson.ParseElement(recvBytes);
+        await PipeProtocol.WriteMessageAsync(client, PipeJson.BuildObjectElement(writeBody), cts.Token);
+        return await PipeProtocol.ReadMessageAsync(client, cts.Token);
     }
 
     // Deserialize the optional "errorMessages" string array the worker
@@ -1233,41 +1219,31 @@ public class ConsoleManager
             && tec.ValueKind == JsonValueKind.Number ? tec.GetInt32() : 0;
     }
 
-    private static async Task ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
-    {
-        int offset = 0;
-        while (offset < buffer.Length)
-        {
-            int read = await stream.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), ct);
-            if (read == 0) throw new IOException("Pipe closed");
-            offset += read;
-        }
-    }
-
     // --- Pipe readiness ---
 
-    private static async Task WaitForPipeReadyAsync(string pipeName, TimeSpan timeout)
+    internal static async Task WaitForPipeReadyAsync(string pipeName, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero) break;
+            var attempt = remaining < TimeSpan.FromSeconds(2) ? remaining : TimeSpan.FromSeconds(2);
             try
             {
                 using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                using var cts = new CancellationTokenSource(attempt);
                 await client.ConnectAsync(cts.Token);
 
-                // Send a ping to verify the worker is fully ready
-                var msgBytes = PipeJson.BuildObjectBytes(w => w.WriteString("type", "ping"));
-                var lenBytes = BitConverter.GetBytes(msgBytes.Length);
-                await client.WriteAsync(lenBytes);
-                await client.WriteAsync(msgBytes);
-                await client.FlushAsync();
-
-                // Read response
-                var recvLenBytes = new byte[4];
-                await ReadExactAsync(client, recvLenBytes, CancellationToken.None);
-                // If we got here, pipe is ready
+                var ping = PipeJson.BuildObjectElement(w => w.WriteString("type", "ping"));
+                await PipeProtocol.WriteMessageAsync(client, ping, cts.Token);
+                var response = await PipeProtocol.ReadMessageAsync(client, cts.Token);
+                if (response.ValueKind != JsonValueKind.Object
+                    || !response.TryGetProperty("status", out var status)
+                    || status.GetString() != "ok")
+                {
+                    throw new IOException("Unexpected ping response");
+                }
                 return;
             }
             catch

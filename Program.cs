@@ -175,6 +175,7 @@ public class Program
             Tests.CommandOutputFinalizerTests.Run();
             Tests.FileToolsTests.Run();
             Tests.ShellToolsTests.Run();
+            await Tests.PipeProtocolTests.RunAsync();
             Tests.AdapterLoaderTests.Run(registry, adapterReport);
             if (args.Contains("--e2e"))
             {
